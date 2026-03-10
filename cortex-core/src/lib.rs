@@ -1,6 +1,7 @@
 pub mod belief;
 pub mod consolidation;
 pub mod context;
+pub mod embedder;
 pub mod episode;
 pub mod people;
 pub mod procedural;
@@ -51,6 +52,8 @@ pub struct Cortex {
     index: MemoryIndex,
     working: WorkingMemory,
     ingest_counter: AtomicU64,
+    #[cfg(feature = "embeddings")]
+    embedder: Option<crate::embedder::Embedder>,
 }
 
 impl Cortex {
@@ -70,11 +73,26 @@ impl Cortex {
             }
         }
 
+        // Try to initialize local embedder if feature enabled
+        #[cfg(feature = "embeddings")]
+        let embedder = match crate::embedder::Embedder::new() {
+            Ok(e) => {
+                tracing::info!("Local embedder initialized");
+                Some(e)
+            }
+            Err(e) => {
+                tracing::warn!("Local embedder unavailable: {}", e);
+                None
+            }
+        };
+
         Ok(Self {
             storage,
             index,
             working: WorkingMemory::default(),
             ingest_counter: AtomicU64::new(0),
+            #[cfg(feature = "embeddings")]
+            embedder,
         })
     }
 
@@ -86,7 +104,38 @@ impl Cortex {
             index: MemoryIndex::new(),
             working: WorkingMemory::default(),
             ingest_counter: AtomicU64::new(0),
+            #[cfg(feature = "embeddings")]
+            embedder: None, // skip embedder for in-memory (test) usage
         })
+    }
+
+    /// Create an in-memory Cortex with local embedding enabled.
+    #[cfg(feature = "embeddings")]
+    pub fn in_memory_with_embeddings() -> Result<Self, CortexError> {
+        let storage = SqliteStorage::open_in_memory()?;
+        let embedder = crate::embedder::Embedder::new().ok();
+        Ok(Self {
+            storage,
+            index: MemoryIndex::new(),
+            working: WorkingMemory::default(),
+            ingest_counter: AtomicU64::new(0),
+            embedder,
+        })
+    }
+
+    /// Auto-generate embedding if embedder is available and none provided.
+    fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
+        if embedding.is_some() {
+            return embedding;
+        }
+        #[cfg(feature = "embeddings")]
+        if let Some(ref embedder) = self.embedder {
+            match embedder.embed(text) {
+                Ok(emb) => return Some(emb),
+                Err(e) => tracing::warn!("Auto-embed failed: {}", e),
+            }
+        }
+        None
     }
 
     /// Ingest a new memory from any channel.
@@ -99,6 +148,7 @@ impl Cortex {
         embedding: Option<Vec<f32>>,
     ) -> Result<MemObject, CortexError> {
         let mut source = MemSource::new(channel);
+        let embedding = self.auto_embed(text, embedding);
 
         // Resolve person identity if user_id provided
         if let Some(uid) = user_id {
@@ -137,6 +187,8 @@ impl Cortex {
         person_id: Option<Uuid>,
         embedding: Option<Vec<f32>>,
     ) -> Result<Vec<RetrievalResult>, CortexError> {
+        let embedding = self.auto_embed(query, embedding);
+
         let mut q = RetrievalQuery::new(query, limit);
         if let Some(ch) = channel {
             q = q.with_channel(ch);
@@ -227,6 +279,9 @@ impl Cortex {
         channel: &str,
         embedding: Option<Vec<f32>>,
     ) -> Result<MemObject, CortexError> {
+        let fact_text = format!("{} {} {}", subject, predicate, object);
+        let embedding = self.auto_embed(&fact_text, embedding);
+
         let semantic = SemanticStore::new(&self.storage, &self.index);
         semantic.add_fact(
             subject,
