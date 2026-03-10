@@ -26,7 +26,7 @@ impl Default for ContextConfig {
             max_tokens: 2000,
             include_people: true,
             include_preferences: true,
-            include_recent_episodes: 5,
+            include_recent_episodes: 10,
             include_patterns: true,
             channel: None,
             person_id: None,
@@ -90,6 +90,22 @@ pub fn generate_context(
                 }
             }
             sections.push(pref_section);
+        }
+    }
+
+    // Semantic facts (structured knowledge) — reuse the list already fetched for preferences
+    if config.include_preferences {
+        let semantic = SemanticStore::new(storage, index);
+        let facts = semantic.query_facts("")?;
+        if !facts.is_empty() {
+            let mut fact_section = String::from("\n## Known Facts\n");
+            for mem in facts.iter().take(15) {
+                if let MemContent::Fact { subject, predicate, object } = &mem.content {
+                    fact_section.push_str(&format!("- {} {} {} (confidence: {:.0}%)\n",
+                        subject, predicate, object, mem.salience.base_score * 100.0));
+                }
+            }
+            sections.push(fact_section);
         }
     }
 
@@ -206,8 +222,8 @@ pub fn generate_context(
 fn summarize_content(content: &MemContent) -> String {
     match content {
         MemContent::Text(t) => {
-            if t.len() > 100 {
-                format!("{}...", &t[..100])
+            if t.len() > 300 {
+                format!("{}...", &t[..300])
             } else {
                 t.clone()
             }

@@ -53,7 +53,7 @@ pub struct Cortex {
     working: WorkingMemory,
     ingest_counter: AtomicU64,
     #[cfg(feature = "embeddings")]
-    embedder: Option<crate::embedder::Embedder>,
+    embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
 
 impl Cortex {
@@ -73,26 +73,13 @@ impl Cortex {
             }
         }
 
-        // Try to initialize local embedder if feature enabled
-        #[cfg(feature = "embeddings")]
-        let embedder = match crate::embedder::Embedder::new() {
-            Ok(e) => {
-                tracing::info!("Local embedder initialized");
-                Some(e)
-            }
-            Err(e) => {
-                tracing::warn!("Local embedder unavailable: {}", e);
-                None
-            }
-        };
-
         Ok(Self {
             storage,
             index,
             working: WorkingMemory::default(),
             ingest_counter: AtomicU64::new(0),
             #[cfg(feature = "embeddings")]
-            embedder,
+            embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
     }
 
@@ -105,34 +92,35 @@ impl Cortex {
             working: WorkingMemory::default(),
             ingest_counter: AtomicU64::new(0),
             #[cfg(feature = "embeddings")]
-            embedder: None, // skip embedder for in-memory (test) usage
-        })
-    }
-
-    /// Create an in-memory Cortex with local embedding enabled.
-    #[cfg(feature = "embeddings")]
-    pub fn in_memory_with_embeddings() -> Result<Self, CortexError> {
-        let storage = SqliteStorage::open_in_memory()?;
-        let embedder = crate::embedder::Embedder::new().ok();
-        Ok(Self {
-            storage,
-            index: MemoryIndex::new(),
-            working: WorkingMemory::default(),
-            ingest_counter: AtomicU64::new(0),
-            embedder,
+            embedder: parking_lot::Mutex::new(None),
         })
     }
 
     /// Auto-generate embedding if embedder is available and none provided.
+    /// Lazily initializes the embedding model on first call.
     fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
         if embedding.is_some() {
             return embedding;
         }
         #[cfg(feature = "embeddings")]
-        if let Some(ref embedder) = self.embedder {
-            match embedder.embed(text) {
-                Ok(emb) => return Some(emb),
-                Err(e) => tracing::warn!("Auto-embed failed: {}", e),
+        {
+            let mut guard = self.embedder.lock();
+            // None = not yet initialized, Some(None) = init failed, Some(Some(e)) = ready
+            if guard.is_none() {
+                tracing::info!("Initializing local embedding model (first use)...");
+                match crate::embedder::Embedder::new() {
+                    Ok(e) => *guard = Some(Some(e)),
+                    Err(e) => {
+                        tracing::warn!("Local embedder unavailable: {}", e);
+                        *guard = Some(None);
+                    }
+                }
+            }
+            if let Some(Some(ref embedder)) = *guard {
+                match embedder.embed(text) {
+                    Ok(emb) => return Some(emb),
+                    Err(e) => tracing::warn!("Auto-embed failed: {}", e),
+                }
             }
         }
         None
