@@ -1,0 +1,776 @@
+use crate::belief::Belief;
+use crate::people::{ChannelIdentity, Person};
+use crate::procedural::Pattern;
+use crate::storage::traits::StorageBackend;
+use crate::types::*;
+use crate::CortexError;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::sync::Mutex;
+use uuid::Uuid;
+
+/// SQLite-backed storage for Cortex. Local-first, zero-config.
+pub struct SqliteStorage {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteStorage {
+    pub fn open(path: &str) -> Result<Self, CortexError> {
+        let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let storage = Self {
+            conn: Mutex::new(conn),
+        };
+        storage.init()?;
+        Ok(storage)
+    }
+
+    pub fn open_in_memory() -> Result<Self, CortexError> {
+        let conn =
+            Connection::open_in_memory().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let storage = Self {
+            conn: Mutex::new(conn),
+        };
+        storage.init()?;
+        Ok(storage)
+    }
+
+    fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
+        let id_str: String = row.get(0)?;
+        let tier_str: String = row.get(1)?;
+        let content_json: String = row.get(2)?;
+        let embedding_blob: Option<Vec<u8>> = row.get(3)?;
+        let temporal_json: String = row.get(4)?;
+        let source_json: String = row.get(5)?;
+        let salience_json: String = row.get(6)?;
+        let privacy_json: String = row.get(7)?;
+        let tags_json: String = row.get(8)?;
+        let metadata_json: String = row.get(9)?;
+        let links_json: String = row.get(10)?;
+
+        let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
+        let tier = MemoryTier::from_str(&tier_str).unwrap_or(MemoryTier::Episodic);
+        let content: MemContent = serde_json::from_str(&content_json).unwrap();
+        let embedding = embedding_blob.map(|b| bytes_to_f32_vec(&b));
+        let temporal: TemporalInfo = serde_json::from_str(&temporal_json).unwrap();
+        let source: MemSource = serde_json::from_str(&source_json).unwrap();
+        let salience: Salience = serde_json::from_str(&salience_json).unwrap();
+        let privacy: PrivacyLevel = serde_json::from_str(&privacy_json).unwrap();
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap();
+        let metadata: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&metadata_json).unwrap();
+        let links: Vec<MemLink> = serde_json::from_str(&links_json).unwrap();
+
+        Ok(MemObject {
+            id,
+            tier,
+            content,
+            embedding,
+            temporal,
+            source,
+            salience,
+            privacy,
+            links,
+            tags,
+            metadata,
+        })
+    }
+}
+
+fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+impl StorageBackend for SqliteStorage {
+    fn init(&self) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                tier TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                embedding_blob BLOB,
+                temporal_json TEXT NOT NULL,
+                source_json TEXT NOT NULL,
+                salience_json TEXT NOT NULL,
+                privacy_json TEXT NOT NULL DEFAULT '\"Private\"',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                links_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
+            CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+
+            CREATE TABLE IF NOT EXISTS links (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                strength REAL NOT NULL,
+                PRIMARY KEY (source_id, target_id, relation)
+            );
+
+            CREATE TABLE IF NOT EXISTS people (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                relationship TEXT NOT NULL DEFAULT '',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                interaction_count INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                notes_json TEXT NOT NULL DEFAULT '[]',
+                communication_style_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_identities (
+                person_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                channel_user_id TEXT NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                PRIMARY KEY (channel, channel_user_id),
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS beliefs (
+                id TEXT PRIMARY KEY,
+                key TEXT NOT NULL UNIQUE,
+                probability REAL NOT NULL,
+                observations_json TEXT NOT NULL DEFAULT '[]',
+                last_updated TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_beliefs_key ON beliefs(key);
+
+            CREATE TABLE IF NOT EXISTS patterns (
+                id TEXT PRIMARY KEY,
+                trigger TEXT NOT NULL,
+                actions_json TEXT NOT NULL,
+                frequency INTEGER NOT NULL DEFAULT 1,
+                last_seen TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_patterns_trigger ON patterns(trigger);
+            ",
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn store_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+        conn.execute(
+            "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                mem.id.to_string(),
+                mem.tier.as_str(),
+                serde_json::to_string(&mem.content).unwrap(),
+                embedding_blob,
+                serde_json::to_string(&mem.temporal).unwrap(),
+                serde_json::to_string(&mem.source).unwrap(),
+                serde_json::to_string(&mem.salience).unwrap(),
+                serde_json::to_string(&mem.privacy).unwrap(),
+                serde_json::to_string(&mem.tags).unwrap(),
+                serde_json::to_string(&mem.metadata).unwrap(),
+                serde_json::to_string(&mem.links).unwrap(),
+                now,
+                now,
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_memory(&self, id: Uuid) -> Result<Option<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let result = conn
+            .query_row(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE id = ?1",
+                params![id.to_string()],
+                Self::parse_mem_row,
+            )
+            .optional()
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    fn update_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+        conn.execute(
+            "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, updated_at=?12 WHERE id=?1",
+            params![
+                mem.id.to_string(),
+                mem.tier.as_str(),
+                serde_json::to_string(&mem.content).unwrap(),
+                embedding_blob,
+                serde_json::to_string(&mem.temporal).unwrap(),
+                serde_json::to_string(&mem.source).unwrap(),
+                serde_json::to_string(&mem.salience).unwrap(),
+                serde_json::to_string(&mem.privacy).unwrap(),
+                serde_json::to_string(&mem.tags).unwrap(),
+                serde_json::to_string(&mem.metadata).unwrap(),
+                serde_json::to_string(&mem.links).unwrap(),
+                now,
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM memories WHERE id = ?1", params![id.to_string()])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_by_tier(
+        &self,
+        tier: MemoryTier,
+        limit: usize,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![tier.as_str(), limit as i64], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn list_by_tier_ordered_by_ingestion(
+        &self,
+        tier: MemoryTier,
+        limit: usize,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        self.list_by_tier(tier, limit)
+    }
+
+    fn list_by_channel(
+        &self,
+        channel: &str,
+        limit: usize,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE json_extract(source_json, '$.channel') = ?1 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![channel, limit as i64], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn list_by_salience_below(
+        &self,
+        tier: MemoryTier,
+        threshold: f32,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 AND json_extract(salience_json, '$.effective_score') < ?2",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![tier.as_str(), threshold], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn list_in_time_range(
+        &self,
+        tier: MemoryTier,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 AND created_at >= ?2 AND created_at <= ?3 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                params![tier.as_str(), start.to_rfc3339(), end.to_rfc3339()],
+                Self::parse_mem_row,
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn store_link(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: LinkRelation,
+        strength: f32,
+    ) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)",
+            params![source_id.to_string(), target_id.to_string(), relation.as_str(), strength],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_links(
+        &self,
+        source_id: Uuid,
+    ) -> Result<Vec<(Uuid, LinkRelation, f32)>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT target_id, relation, strength FROM links WHERE source_id = ?1")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![source_id.to_string()], |row| {
+                let target_str: String = row.get(0)?;
+                let rel_str: String = row.get(1)?;
+                let strength: f32 = row.get(2)?;
+                Ok((target_str, rel_str, strength))
+            })
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (target_str, rel_str, strength) =
+                row.map_err(|e| CortexError::Storage(e.to_string()))?;
+            let target = Uuid::parse_str(&target_str)
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            let relation =
+                LinkRelation::from_str(&rel_str).unwrap_or(LinkRelation::RelatedTo);
+            results.push((target, relation, strength));
+        }
+        Ok(results)
+    }
+
+    // People
+    fn store_person(&self, person: &Person) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO people (id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                person.id.to_string(),
+                person.display_name,
+                person.relationship_to_user,
+                person.first_seen.to_rfc3339(),
+                person.last_seen.to_rfc3339(),
+                person.interaction_count,
+                serde_json::to_string(&person.tags).unwrap(),
+                serde_json::to_string(&person.notes).unwrap(),
+                serde_json::to_string(&person.communication_style).unwrap(),
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        for identity in &person.identities {
+            conn.execute(
+                "INSERT OR REPLACE INTO channel_identities (person_id, channel, channel_user_id, username, display_name) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    person.id.to_string(),
+                    identity.channel,
+                    identity.channel_user_id,
+                    identity.username,
+                    identity.display_name,
+                ],
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn get_person(&self, id: Uuid) -> Result<Option<Person>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let person = conn
+            .query_row(
+                "SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok(parse_person_row(row))
+                },
+            )
+            .optional()
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        match person {
+            Some(mut p) => {
+                p.identities = self.load_identities(&conn, p.id)?;
+                Ok(Some(p))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn find_person_by_channel_identity(
+        &self,
+        channel: &str,
+        channel_user_id: &str,
+    ) -> Result<Option<Person>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let person_id: Option<String> = conn
+            .query_row(
+                "SELECT person_id FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
+                params![channel, channel_user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        match person_id {
+            Some(pid) => {
+                let id = Uuid::parse_str(&pid).map_err(|e| CortexError::Storage(e.to_string()))?;
+                drop(conn);
+                self.get_person(id)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn update_person(&self, person: &Person) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "UPDATE people SET display_name=?2, relationship=?3, first_seen=?4, last_seen=?5, interaction_count=?6, tags_json=?7, notes_json=?8, communication_style_json=?9 WHERE id=?1",
+            params![
+                person.id.to_string(),
+                person.display_name,
+                person.relationship_to_user,
+                person.first_seen.to_rfc3339(),
+                person.last_seen.to_rfc3339(),
+                person.interaction_count,
+                serde_json::to_string(&person.tags).unwrap(),
+                serde_json::to_string(&person.notes).unwrap(),
+                serde_json::to_string(&person.communication_style).unwrap(),
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Replace identities
+        conn.execute(
+            "DELETE FROM channel_identities WHERE person_id = ?1",
+            params![person.id.to_string()],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        for identity in &person.identities {
+            conn.execute(
+                "INSERT INTO channel_identities (person_id, channel, channel_user_id, username, display_name) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    person.id.to_string(),
+                    identity.channel,
+                    identity.channel_user_id,
+                    identity.username,
+                    identity.display_name,
+                ],
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn delete_person(&self, id: Uuid) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute("DELETE FROM people WHERE id = ?1", params![id.to_string()])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_people(&self) -> Result<Vec<Person>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people ORDER BY last_seen DESC")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| Ok(parse_person_row(row)))
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            let mut p = row.map_err(|e| CortexError::Storage(e.to_string()))?;
+            p.identities = self.load_identities(&conn, p.id)?;
+            results.push(p);
+        }
+        Ok(results)
+    }
+
+    // Beliefs
+    fn store_belief(&self, belief: &Belief) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO beliefs (id, key, probability, observations_json, last_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                belief.id.to_string(),
+                belief.key,
+                belief.probability,
+                serde_json::to_string(&belief.observations).unwrap(),
+                belief.last_updated.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_belief(&self, key: &str) -> Result<Option<Belief>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let result = conn
+            .query_row(
+                "SELECT id, key, probability, observations_json, last_updated FROM beliefs WHERE key = ?1",
+                params![key],
+                parse_belief_row,
+            )
+            .optional()
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    fn update_belief(&self, belief: &Belief) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "UPDATE beliefs SET probability=?2, observations_json=?3, last_updated=?4 WHERE id=?1",
+            params![
+                belief.id.to_string(),
+                belief.probability,
+                serde_json::to_string(&belief.observations).unwrap(),
+                belief.last_updated.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_beliefs_above(&self, threshold: f32) -> Result<Vec<Belief>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id, key, probability, observations_json, last_updated FROM beliefs WHERE probability >= ?1 ORDER BY probability DESC")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![threshold], parse_belief_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    // Patterns
+    fn store_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO patterns (id, trigger, actions_json, frequency, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                pattern.id.to_string(),
+                pattern.trigger,
+                serde_json::to_string(&pattern.actions).unwrap(),
+                pattern.frequency,
+                pattern.last_seen.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_pattern(&self, trigger: &str) -> Result<Option<Pattern>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let result = conn
+            .query_row(
+                "SELECT id, trigger, actions_json, frequency, last_seen FROM patterns WHERE trigger = ?1",
+                params![trigger],
+                parse_pattern_row,
+            )
+            .optional()
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    fn update_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute(
+            "UPDATE patterns SET trigger=?2, actions_json=?3, frequency=?4, last_seen=?5 WHERE id=?1",
+            params![
+                pattern.id.to_string(),
+                pattern.trigger,
+                serde_json::to_string(&pattern.actions).unwrap(),
+                pattern.frequency,
+                pattern.last_seen.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn list_patterns(&self, min_frequency: u32) -> Result<Vec<Pattern>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id, trigger, actions_json, frequency, last_seen FROM patterns WHERE frequency >= ?1 ORDER BY frequency DESC")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![min_frequency], parse_pattern_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE tier = ?1",
+                params![tier.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(count as usize)
+    }
+
+    fn list_memories_by_source_identity(
+        &self,
+        identity_id: Uuid,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let id_str = format!("\"{}\"", identity_id);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE json_extract(source_json, '$.identity_id') = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![id_str], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+}
+
+impl SqliteStorage {
+    fn load_identities(
+        &self,
+        conn: &Connection,
+        person_id: Uuid,
+    ) -> Result<Vec<ChannelIdentity>, CortexError> {
+        let mut stmt = conn
+            .prepare("SELECT channel, channel_user_id, username, display_name FROM channel_identities WHERE person_id = ?1")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![person_id.to_string()], |row| {
+                Ok(ChannelIdentity {
+                    channel: row.get(0)?,
+                    channel_user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    display_name: row.get(3)?,
+                })
+            })
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+}
+
+fn parse_person_row(row: &rusqlite::Row) -> Person {
+    let id_str: String = row.get(0).unwrap();
+    let display_name: String = row.get(1).unwrap();
+    let relationship: String = row.get(2).unwrap();
+    let first_seen_str: String = row.get(3).unwrap();
+    let last_seen_str: String = row.get(4).unwrap();
+    let interaction_count: u32 = row.get(5).unwrap();
+    let tags_json: String = row.get(6).unwrap();
+    let notes_json: String = row.get(7).unwrap();
+    let style_json: String = row.get(8).unwrap();
+
+    Person {
+        id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+        identities: Vec::new(), // loaded separately
+        display_name,
+        relationship_to_user: relationship,
+        first_seen: DateTime::parse_from_rfc3339(&first_seen_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        last_seen: DateTime::parse_from_rfc3339(&last_seen_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        interaction_count,
+        communication_style: serde_json::from_str(&style_json).unwrap_or_default(),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        notes: serde_json::from_str(&notes_json).unwrap_or_default(),
+    }
+}
+
+fn parse_belief_row(row: &rusqlite::Row) -> Result<Belief, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let key: String = row.get(1)?;
+    let probability: f32 = row.get(2)?;
+    let obs_json: String = row.get(3)?;
+    let updated_str: String = row.get(4)?;
+
+    Ok(Belief {
+        id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+        key,
+        probability,
+        observations: serde_json::from_str(&obs_json).unwrap_or_default(),
+        last_updated: DateTime::parse_from_rfc3339(&updated_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn parse_pattern_row(row: &rusqlite::Row) -> Result<Pattern, rusqlite::Error> {
+    let id_str: String = row.get(0)?;
+    let trigger: String = row.get(1)?;
+    let actions_json: String = row.get(2)?;
+    let frequency: u32 = row.get(3)?;
+    let last_seen_str: String = row.get(4)?;
+
+    Ok(Pattern {
+        id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+        trigger,
+        actions: serde_json::from_str(&actions_json).unwrap_or_default(),
+        frequency,
+        last_seen: DateTime::parse_from_rfc3339(&last_seen_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
