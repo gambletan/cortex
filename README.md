@@ -152,19 +152,119 @@ Calendar ─┘                          └─ Response
 
 Cortex ships as an MCP server — works with any MCP-compatible client.
 
+### Setup
+
+**1. Build & install the binary:**
+
+```bash
+cargo build --release -p cortex-mcp-server
+cp target/release/cortex-mcp-server ~/.local/bin/
+```
+
+**2. Register as MCP server:**
+
+Claude Code (CLI):
+```bash
+# Global (all projects)
+claude mcp add cortex --scope user -- ~/.local/bin/cortex-mcp-server ~/.cortex/memory.db
+
+# Or per-project
+claude mcp add cortex -- ~/.local/bin/cortex-mcp-server ~/.cortex/memory.db
+```
+
+Claude Desktop — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
-// ~/.claude/.mcp.json
 {
   "mcpServers": {
     "cortex": {
-      "command": "cortex-mcp-server",
-      "args": ["~/.cortex/memory.db"]
+      "command": "/Users/you/.local/bin/cortex-mcp-server",
+      "args": ["/Users/you/.cortex/memory.db"]
     }
   }
 }
 ```
 
-**8 tools available:** `memory_ingest`, `memory_search`, `memory_context`, `belief_observe`, `belief_list`, `person_resolve`, `fact_add`, `preference_set`
+**3. Allow tools in "don't ask" mode** (if using `defaultMode: "dontAsk"`):
+
+Add to `~/.claude/settings.json` → `permissions.allow`:
+```json
+"mcp__cortex__memory_ingest",
+"mcp__cortex__memory_search",
+"mcp__cortex__memory_context",
+"mcp__cortex__memory_consolidate",
+"mcp__cortex__belief_observe",
+"mcp__cortex__belief_list",
+"mcp__cortex__person_resolve",
+"mcp__cortex__fact_add",
+"mcp__cortex__preference_set"
+```
+
+**4. Make it automatic** — add to your `CLAUDE.md` (project or global `~/.claude/CLAUDE.md`):
+
+```markdown
+# Memory (Cortex)
+You have persistent memory via Cortex MCP tools. Use them automatically:
+- Start of conversation: call `memory_context` to load what you know about the user
+- When the user shares a preference, fact, or personal info: call `memory_ingest` to store it
+- When you learn a structured fact: call `fact_add` (e.g. "User works_at Google")
+- When you detect a preference: call `preference_set` (e.g. editor=neovim)
+- When evidence supports or contradicts a belief: call `belief_observe`
+- When talking to someone new: call `person_resolve` to track identity
+- Periodically: call `memory_consolidate` to clean up stale memories
+```
+
+**5. Auto-inject memory on session start** (Claude Code hooks — fully automatic):
+
+Create `~/.claude/hooks/cortex-memory-inject.sh`:
+```bash
+#!/bin/bash
+CORTEX_BIN="${CORTEX_BIN:-$HOME/.local/bin/cortex-mcp-server}"
+CORTEX_DB="${CORTEX_DB:-$HOME/.cortex/memory.db}"
+[ -x "$CORTEX_BIN" ] || exit 0
+
+printf '%s\n%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"hook","version":"1.0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_context","arguments":{"max_tokens":1500}}}' \
+  | "$CORTEX_BIN" "$CORTEX_DB" 2>/dev/null \
+  | grep '"id":2' \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['result']['content'][0]['text'])" 2>/dev/null
+```
+
+Add to `~/.claude/settings.json`:
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cortex-memory-inject.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Now every new Claude Code session automatically loads your memory context — **zero manual effort**. Claude learns as you work and remembers across sessions.
+
+### 9 Tools
+
+| Tool | Purpose |
+|------|---------|
+| `memory_ingest` | Store a memory (text, channel, person context) |
+| `memory_search` | Semantic search across all memory tiers |
+| `memory_context` | Generate LLM-ready context summary (token-budgeted) |
+| `memory_consolidate` | Run decay + promotion + sweep cycle |
+| `belief_observe` | Update a Bayesian belief with evidence |
+| `belief_list` | Query beliefs above confidence threshold |
+| `fact_add` | Store structured knowledge (subject-predicate-object) |
+| `preference_set` | Store user preference with confidence |
+| `person_resolve` | Cross-channel identity resolution |
 
 ## OpenClaw Plugin
 
@@ -197,7 +297,7 @@ cortex/
 
 ## Roadmap
 
-- **v0.2** — Local embedding integration (gte-small/ONNX), batch queries (N+1 elimination), memory decay + auto-consolidation
+- **v0.2** ✅ — Local embedding integration (all-MiniLM-L6-v2/ONNX), batch queries (N+1 elimination), importance-aware memory decay + auto-consolidation
 - **v0.3** — Proactive inference (auto-extract facts from conversations), temporal awareness (temporary vs permanent), contradiction detection
 - **v0.4** — Conversation compression, relationship inference, multi-modal memory, cross-device sync (CRDTs)
 - **v1.0** — Memory-as-a-Service HTTP API, import/export (ChatGPT, Claude, Mem0), plugin marketplace
