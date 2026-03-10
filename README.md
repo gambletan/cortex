@@ -1,12 +1,16 @@
 # Cortex
 
-### AI that knows you — not AI with a notepad.
+[中文文档](README_CN.md)
 
-**Persistent memory engine for personal AI assistants.** Pure Rust. Local-first. 3.8MB. Zero cloud.
+### Memory for fully decentralized AI agents.
 
-LLMs start blank every session. Your assistant forgets your name, your preferences, the conversation you had yesterday, the decision you made last week. Current "memory" solutions are flat text files, keyword grep, or cloud APIs that add 200-500ms latency and charge you for the privilege.
+**Persistent memory engine that runs entirely on your hardware.** Pure Rust. Local-first. 3.8MB. Zero cloud.
 
-Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-term memory that persists across sessions, channels, and contexts — with Bayesian beliefs that self-correct, a people graph that resolves identities across platforms, and sub-millisecond performance on everything.
+> **Philosophy:** We build for a future where AI agents are fully decentralized — running on your device, owning your data, answering only to you. No cloud middleman. No vendor lock-in. No one else sees your memories. Cortex is the memory layer for sovereign AI agents that need to remember, learn, and evolve — without ever phoning home.
+
+LLMs start blank every session. Your assistant forgets your name, your preferences, the conversation you had yesterday, the decision you made last week. Current "memory" solutions are flat text files, keyword grep, or cloud APIs that add 200-500ms latency, charge you for the privilege, and send your personal data to someone else's server.
+
+Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-term memory that persists across sessions, channels, and contexts — with Bayesian beliefs that self-correct, a people graph that resolves identities across platforms, and sub-millisecond performance on everything. All running locally, all yours.
 
 ### Benchmarks
 
@@ -278,6 +282,7 @@ cortex/
 │   ├── src/
 │   │   ├── lib.rs              # Cortex entry point
 │   │   ├── types.rs            # MemObject, MemoryTier, etc.
+│   │   ├── inference.rs        # Proactive inference (EN + CN)
 │   │   ├── episode.rs          # Episodic memory store
 │   │   ├── semantic.rs         # Semantic facts + preferences
 │   │   ├── working.rs          # Working memory (session scratch pad)
@@ -289,18 +294,76 @@ cortex/
 │   │   ├── context.rs          # LLM context generation
 │   │   └── storage/            # SQLite + in-memory vector index
 │   └── benches/                # Performance benchmarks
+├── cortex-http/          # HTTP REST API (axum, local-only)
 ├── cortex-mcp-server/    # MCP server binary (3.8MB)
 ├── cortex-python/        # Python bindings (PyO3, WIP)
 ├── openclaw-plugin/      # OpenClaw memory plugin
+├── Dockerfile            # Self-hosted Docker image
 └── Cargo.toml            # Workspace root
+```
+
+## HTTP API
+
+Cortex ships a lightweight HTTP server for integration with any language or framework. Binds to `127.0.0.1` by default — your data never leaves your machine.
+
+```bash
+# Build & run
+cargo build --release -p cortex-http
+./target/release/cortex-http --port 3315 --db ~/.cortex/memory.db
+
+# Or via Docker (self-hosted)
+docker build -t cortex .
+docker run -v ~/.cortex:/data -p 3315:3315 cortex
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| POST | `/v1/memories` | Ingest a memory |
+| POST | `/v1/memories/search` | Semantic search |
+| GET | `/v1/memories/context` | Generate LLM context |
+| POST | `/v1/memories/consolidate` | Run consolidation cycle |
+| POST | `/v1/memories/infer` | Preview inference (no store) |
+| POST | `/v1/facts` | Add a semantic fact |
+| POST | `/v1/facts/contradictions` | Check for contradictions |
+| POST | `/v1/preferences` | Set a preference |
+| GET | `/v1/beliefs` | List beliefs |
+| POST | `/v1/beliefs/observe` | Update belief with evidence |
+| POST | `/v1/people` | Resolve person identity |
+| GET | `/v1/export` | Export all data (JSON backup) |
+| POST | `/v1/import` | Import data from backup |
+
+### Examples
+
+```bash
+# Store a memory
+curl -X POST http://localhost:3315/v1/memories \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "I prefer dark mode", "channel": "cli"}'
+
+# Search
+curl -X POST http://localhost:3315/v1/memories/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "preferences", "limit": 5}'
+
+# Export all data (backup to iCloud, NAS, etc.)
+curl http://localhost:3315/v1/export > ~/iCloud/cortex-backup.json
+
+# Import from backup
+curl -X POST http://localhost:3315/v1/import \
+  -H 'Content-Type: application/json' \
+  -d @~/iCloud/cortex-backup.json
 ```
 
 ## Roadmap
 
-- **v0.2** ✅ — Local embedding integration (all-MiniLM-L6-v2/ONNX), batch queries (N+1 elimination), importance-aware memory decay + auto-consolidation
-- **v0.3** — Proactive inference (auto-extract facts from conversations), temporal awareness (temporary vs permanent), contradiction detection
-- **v0.4** — Conversation compression, relationship inference, multi-modal memory, cross-device sync (CRDTs)
-- **v1.0** — Memory-as-a-Service HTTP API, import/export (ChatGPT, Claude, Mem0), plugin marketplace
+- **v0.2** ✅ — Local embedding integration (all-MiniLM-L6-v2/ONNX), batch queries, importance-aware decay + auto-consolidation
+- **v0.3** ✅ — Proactive inference (auto-extract facts), temporal awareness, contradiction detection, Chinese NLP
+- **v0.4** ✅ — HTTP REST API (axum), import/export (JSON backup), Docker packaging
+- **v0.5** — Conversation compression, relationship inference, multi-modal memory
+- **v1.0** — Cross-device sync (CRDTs, no cloud), plugin system
 
 ## License
 

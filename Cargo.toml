@@ -1,3 +1,3 @@
 [workspace]
-members = ["cortex-core", "cortex-mcp-server", "cortex-python"]
+members = ["cortex-core", "cortex-mcp-server", "cortex-http", "cortex-python"]
 resolver = "2"
