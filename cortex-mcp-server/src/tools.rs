@@ -207,6 +207,42 @@ pub fn list_tools() -> Value {
                 "type": "object",
                 "properties": {}
             }
+        },
+        {
+            "name": "memory_infer",
+            "description": "Run proactive inference on text without storing it. Returns extracted facts, preferences, and temporal classification (temporary/permanent/unknown). Useful for previewing what would be auto-extracted on ingest.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to analyze"
+                    }
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "contradiction_check",
+            "description": "Check if a potential fact contradicts existing knowledge. Returns conflicting facts if any. Useful before adding facts to see if they would supersede existing information.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "Subject of the fact"
+                    },
+                    "predicate": {
+                        "type": "string",
+                        "description": "Relationship"
+                    },
+                    "object": {
+                        "type": "string",
+                        "description": "Object of the fact"
+                    }
+                },
+                "required": ["subject", "predicate", "object"]
+            }
         }
     ])
 }
@@ -218,6 +254,8 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_search" => tool_memory_search(cortex, args),
         "memory_context" => tool_memory_context(cortex, args),
         "memory_consolidate" => tool_memory_consolidate(cortex),
+        "memory_infer" => tool_memory_infer(cortex, args),
+        "contradiction_check" => tool_contradiction_check(cortex, args),
         "belief_observe" => tool_belief_observe(cortex, args),
         "belief_list" => tool_belief_list(cortex, args),
         "person_resolve" => tool_person_resolve(cortex, args),
@@ -451,4 +489,69 @@ fn tool_preference_set(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Str
         "status": "stored"
     })
     .to_string())
+}
+
+fn tool_memory_infer(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let text = get_str(args, "text").ok_or("missing 'text'")?;
+    let knowledge = cortex.infer(text);
+
+    let facts: Vec<Value> = knowledge.facts.iter().map(|f| {
+        json!({
+            "subject": f.subject,
+            "predicate": f.predicate,
+            "object": f.object,
+            "confidence": f.confidence,
+        })
+    }).collect();
+
+    let prefs: Vec<Value> = knowledge.preferences.iter().map(|p| {
+        json!({
+            "key": p.key,
+            "value": p.value,
+            "confidence": p.confidence,
+        })
+    }).collect();
+
+    let temporal = match knowledge.temporal_hint {
+        cortex_core::inference::TemporalHint::Temporary => "temporary",
+        cortex_core::inference::TemporalHint::Permanent => "permanent",
+        cortex_core::inference::TemporalHint::Unknown => "unknown",
+    };
+
+    Ok(json!({
+        "facts": facts,
+        "preferences": prefs,
+        "temporal_hint": temporal,
+        "total_extracted": facts.len() + prefs.len(),
+    }).to_string())
+}
+
+fn tool_contradiction_check(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let subject = get_str(args, "subject").ok_or("missing 'subject'")?;
+    let predicate = get_str(args, "predicate").ok_or("missing 'predicate'")?;
+    let object = get_str(args, "object").ok_or("missing 'object'")?;
+
+    let contradictions = cortex
+        .check_contradictions(subject, predicate, object)
+        .map_err(|e| e.to_string())?;
+
+    let items: Vec<Value> = contradictions.iter().map(|(mem, score)| {
+        let existing = match &mem.content {
+            cortex_core::types::MemContent::Fact { subject, predicate, object } => {
+                format!("{} {} {}", subject, predicate, object)
+            }
+            _ => format!("{:?}", mem.content),
+        };
+        json!({
+            "id": mem.id.to_string(),
+            "existing_fact": existing,
+            "conflict_score": score,
+        })
+    }).collect();
+
+    Ok(json!({
+        "proposed": format!("{} {} {}", subject, predicate, object),
+        "contradictions": items,
+        "has_conflict": !items.is_empty(),
+    }).to_string())
 }

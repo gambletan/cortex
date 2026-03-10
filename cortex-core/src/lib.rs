@@ -3,6 +3,7 @@ pub mod consolidation;
 pub mod context;
 pub mod embedder;
 pub mod episode;
+pub mod inference;
 pub mod people;
 pub mod procedural;
 pub mod retrieval;
@@ -127,6 +128,8 @@ impl Cortex {
     }
 
     /// Ingest a new memory from any channel.
+    /// Automatically runs proactive inference to extract facts, preferences,
+    /// and temporal hints. Also checks for contradictions with existing knowledge.
     pub fn ingest(
         &self,
         text: &str,
@@ -146,13 +149,75 @@ impl Cortex {
             people.record_interaction(person.id)?;
         }
 
-        let episodes = EpisodeStore::new(&self.storage, &self.index);
-        let result = episodes.add(
+        // ── Proactive inference ──────────────────────────────────────────
+        let inferred = inference::extract(text);
+
+        // Set durability based on temporal hint
+        let durability = match inferred.temporal_hint {
+            inference::TemporalHint::Temporary => MemoryDurability::Temporary,
+            inference::TemporalHint::Permanent => MemoryDurability::Permanent,
+            inference::TemporalHint::Unknown => MemoryDurability::Normal,
+        };
+
+        let mut builder = crate::types::MemObjectBuilder::new(
+            MemoryTier::Episodic,
             MemContent::Text(text.to_string()),
             source,
-            salience_hint,
-            embedding,
-        )?;
+        )
+        .salience(crate::types::Salience::new(salience_hint.unwrap_or(0.5)))
+        .durability(durability);
+
+        if let Some(emb) = embedding.clone() {
+            builder = builder.embedding(emb);
+        }
+
+        let mem = builder.build();
+        self.storage.store_memory(&mem)?;
+        if let Some(emb) = embedding {
+            self.index.insert(mem.id, emb);
+        }
+        let result = mem;
+
+        // ── Auto-extract facts ───────────────────────────────────────────
+        let semantic = SemanticStore::new(&self.storage, &self.index);
+        for fact in &inferred.facts {
+            // Check for contradictions before storing
+            let contradictions = semantic.find_contradictions(
+                &fact.subject, &fact.predicate, &fact.object,
+            )?;
+
+            if !contradictions.is_empty() {
+                // New fact contradicts existing — supersede the old ones
+                let new_fact = semantic.add_fact(
+                    &fact.subject, &fact.predicate, &fact.object,
+                    fact.confidence,
+                    MemSource::new(channel),
+                    None,
+                )?;
+                for (old, _score) in &contradictions {
+                    semantic.merge_facts(old.id, new_fact.id)?;
+                    tracing::info!(
+                        subject = %fact.subject,
+                        predicate = %fact.predicate,
+                        new = %fact.object,
+                        "Contradiction resolved: superseded old fact"
+                    );
+                }
+            } else {
+                // No contradiction — store normally
+                let _ = semantic.add_fact(
+                    &fact.subject, &fact.predicate, &fact.object,
+                    fact.confidence,
+                    MemSource::new(channel),
+                    None,
+                );
+            }
+        }
+
+        // ── Auto-extract preferences ─────────────────────────────────────
+        for pref in &inferred.preferences {
+            let _ = semantic.add_preference(&pref.key, &pref.value, pref.confidence);
+        }
 
         // Auto-consolidation: run every N ingests
         let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -290,6 +355,24 @@ impl Cortex {
     ) -> Result<MemObject, CortexError> {
         let semantic = SemanticStore::new(&self.storage, &self.index);
         semantic.add_preference(key, value, confidence)
+    }
+
+    /// Check for contradictions with a potential new fact.
+    /// Returns existing facts that conflict (same subject+predicate, different object).
+    pub fn check_contradictions(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Vec<(MemObject, f32)>, CortexError> {
+        let semantic = SemanticStore::new(&self.storage, &self.index);
+        semantic.find_contradictions(subject, predicate, object)
+    }
+
+    /// Run proactive inference on text without ingesting.
+    /// Returns extracted facts, preferences, and temporal classification.
+    pub fn infer(&self, text: &str) -> inference::InferredKnowledge {
+        inference::extract(text)
     }
 
     /// Access to working memory.

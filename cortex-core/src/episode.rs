@@ -113,15 +113,28 @@ impl<'a> EpisodeStore<'a> {
         let mut updated = 0;
 
         for mut mem in mems {
+            // Permanent memories never decay below a floor
+            if mem.temporal.durability == MemoryDurability::Permanent {
+                if mem.salience.decay_factor < 0.8 {
+                    mem.salience.decay_factor = 0.8;
+                    mem.salience.recompute();
+                    self.storage.update_memory(&mem)?;
+                    updated += 1;
+                }
+                continue;
+            }
+
             let hours_since_access = (now - mem.temporal.last_accessed)
                 .num_hours()
                 .max(0) as f32;
 
-            // Importance-aware half-life:
-            //   base_score 0.5 → 72h half-life (default)
-            //   base_score 0.8 → 144h half-life (important memories decay 2x slower)
-            //   base_score 1.0 → 216h half-life (critical memories persist 3x longer)
-            let half_life_hours = 72.0 + (mem.salience.base_score * 144.0);
+            // Durability-aware half-life:
+            //   Temporary: 12h base (aggressive decay)
+            //   Normal: 72h + importance scaling
+            let half_life_hours = match mem.temporal.durability {
+                MemoryDurability::Temporary => 12.0 + (mem.salience.base_score * 24.0),
+                _ => 72.0 + (mem.salience.base_score * 144.0),
+            };
 
             // Exponential decay: salience halves every half_life_hours of non-access
             let decay = (-hours_since_access * 0.693 / half_life_hours).exp();

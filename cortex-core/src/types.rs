@@ -3,6 +3,41 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Whether a memory is temporary (will decay fast) or permanent (should persist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryDurability {
+    /// Default — decay follows normal importance-aware curve.
+    Normal,
+    /// Temporary — aggressive decay (e.g., "debugging X right now").
+    Temporary,
+    /// Permanent — never decay below a floor (e.g., "I live in Shanghai").
+    Permanent,
+}
+
+impl Default for MemoryDurability {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl MemoryDurability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Temporary => "temporary",
+            Self::Permanent => "permanent",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "temporary" => Self::Temporary,
+            "permanent" => Self::Permanent,
+            _ => Self::Normal,
+        }
+    }
+}
+
 /// A memory object — the atomic unit of Cortex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemObject {
@@ -55,6 +90,9 @@ pub struct TemporalInfo {
     pub last_accessed: DateTime<Utc>,
     pub access_count: u32,
     pub relevance_schedule: Option<String>,
+    /// Whether this memory is temporary or permanent.
+    #[serde(default)]
+    pub durability: MemoryDurability,
 }
 
 impl TemporalInfo {
@@ -66,6 +104,7 @@ impl TemporalInfo {
             last_accessed: now,
             access_count: 0,
             relevance_schedule: None,
+            durability: MemoryDurability::default(),
         }
     }
 }
@@ -222,6 +261,7 @@ pub struct MemObjectBuilder {
     tags: Vec<String>,
     metadata: HashMap<String, serde_json::Value>,
     event_time: Option<DateTime<Utc>>,
+    durability: MemoryDurability,
 }
 
 impl MemObjectBuilder {
@@ -236,6 +276,7 @@ impl MemObjectBuilder {
             tags: Vec::new(),
             metadata: HashMap::new(),
             event_time: None,
+            durability: MemoryDurability::default(),
         }
     }
 
@@ -264,6 +305,11 @@ impl MemObjectBuilder {
         self
     }
 
+    pub fn durability(mut self, durability: MemoryDurability) -> Self {
+        self.durability = durability;
+        self
+    }
+
     pub fn meta(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata.insert(key.into(), value);
         self
@@ -282,6 +328,7 @@ impl MemObjectBuilder {
                 last_accessed: now,
                 access_count: 0,
                 relevance_schedule: None,
+                durability: self.durability,
             },
             source: self.source,
             salience: self.salience,
