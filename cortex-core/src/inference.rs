@@ -51,19 +51,22 @@ impl Default for TemporalHint {
 }
 
 /// Extract structured knowledge from raw text.
+/// Supports both English and Chinese.
 /// Designed to be fast (<1ms) — runs on every ingest.
 pub fn extract(text: &str) -> InferredKnowledge {
     let mut knowledge = InferredKnowledge::default();
     let lower = text.to_lowercase();
 
-    // Extract preferences
+    // English extraction
     extract_preferences(text, &lower, &mut knowledge);
-
-    // Extract facts
     extract_facts(text, &lower, &mut knowledge);
 
-    // Determine temporal hint
-    knowledge.temporal_hint = classify_temporal(&lower);
+    // Chinese extraction
+    extract_chinese_facts(text, &mut knowledge);
+    extract_chinese_preferences(text, &mut knowledge);
+
+    // Determine temporal hint (both languages)
+    knowledge.temporal_hint = classify_temporal_multilingual(text, &lower);
 
     knowledge
 }
@@ -255,11 +258,178 @@ fn extract_facts(text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
     }
 }
 
-// ── Temporal classification ──────────────────────────────────────────────────
+// ── Chinese fact extraction ──────────────────────────────────────────────────
 
-fn classify_temporal(lower: &str) -> TemporalHint {
-    // Temporary signals
-    let temporary_signals = [
+/// Extract facts from Chinese text using pattern matching.
+/// Chinese patterns: "我住在X", "我在X工作", "我是X", "我叫X", etc.
+fn extract_chinese_facts(text: &str, knowledge: &mut InferredKnowledge) {
+    // Location: "我住在X", "我在X住", "我来自X", "我搬到了X"
+    for (prefix, suffix, predicate) in &[
+        ("我住在", "", "lives_in"),
+        ("我居住在", "", "lives_in"),
+        ("我来自", "", "from"),
+        ("我老家是", "", "from"),
+        ("我老家在", "", "from"),
+        ("我搬到了", "", "lives_in"),
+        ("我搬到", "", "lives_in"),
+        ("我在", "住", "lives_in"),
+        ("我在", "生活", "lives_in"),
+    ] {
+        if let Some(obj) = extract_zh_pattern(text, prefix, suffix) {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: predicate.to_string(),
+                object: obj,
+                confidence: 0.85,
+            });
+        }
+    }
+
+    // Work: "我在X工作", "我在X上班"
+    for (prefix, suffix, predicate) in &[
+        ("我在", "工作", "works_at"),
+        ("我在", "上班", "works_at"),
+        ("我在", "做", "works_on"),
+    ] {
+        if let Some(obj) = extract_zh_pattern(text, prefix, suffix) {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: predicate.to_string(),
+                object: obj,
+                confidence: 0.85,
+            });
+        }
+    }
+
+    // Identity: "我是X", "我是一个X", "我是一名X"
+    for prefix in &["我是一名", "我是一个", "我是个", "我是"] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            // Skip if it's a location/name pattern (handled separately)
+            if !obj.is_empty() && obj.len() < 80 && !obj.starts_with('在') {
+                knowledge.facts.push(InferredFact {
+                    subject: "User".into(),
+                    predicate: "is_a".into(),
+                    object: obj,
+                    confidence: 0.80,
+                });
+                break; // Only match most specific prefix
+            }
+        }
+    }
+
+    // Name: "我叫X", "我的名字是X"
+    for prefix in &["我叫", "我的名字是", "叫我", "我名字叫"] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            if !obj.is_empty() && obj.chars().count() <= 10 {
+                knowledge.facts.push(InferredFact {
+                    subject: "User".into(),
+                    predicate: "name".into(),
+                    object: obj,
+                    confidence: 0.90,
+                });
+                break;
+            }
+        }
+    }
+
+    // Age: "我今年X岁", "我X岁"
+    if let Some(obj) = extract_zh_pattern(text, "我今年", "岁") {
+        knowledge.facts.push(InferredFact {
+            subject: "User".into(),
+            predicate: "age".into(),
+            object: format!("{}岁", obj),
+            confidence: 0.85,
+        });
+    }
+
+    // Experience: "我有X年经验", "我做了X年"
+    if let Some(obj) = extract_zh_pattern(text, "我有", "年经验") {
+        knowledge.facts.push(InferredFact {
+            subject: "User".into(),
+            predicate: "experience".into(),
+            object: format!("{}年", obj),
+            confidence: 0.80,
+        });
+    }
+}
+
+// ── Chinese preference extraction ────────────────────────────────────────────
+
+fn extract_chinese_preferences(text: &str, knowledge: &mut InferredKnowledge) {
+    // "我喜欢X", "我爱X", "我偏好X"
+    for (prefix, key, conf) in &[
+        ("我喜欢用", "preference", 0.85_f32),
+        ("我喜欢", "likes", 0.75),
+        ("我爱用", "preference", 0.85),
+        ("我爱", "likes", 0.75),
+        ("我偏好", "preference", 0.85),
+        ("我习惯用", "preference", 0.80),
+        ("我常用", "preference", 0.80),
+    ] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            if !obj.is_empty() && obj.len() < 100 {
+                knowledge.preferences.push(InferredPreference {
+                    key: key.to_string(),
+                    value: obj,
+                    confidence: *conf,
+                });
+                break; // Only match most specific prefix
+            }
+        }
+    }
+
+    // "我最喜欢的X是Y"
+    if let Some(rest) = text.strip_prefix("我最喜欢的") {
+        if let Some((key_part, value_part)) = rest.split_once('是') {
+            let key = clean_zh_value(key_part);
+            let value = clean_zh_value(value_part);
+            if !key.is_empty() && !value.is_empty() {
+                knowledge.preferences.push(InferredPreference {
+                    key,
+                    value,
+                    confidence: 0.90,
+                });
+            }
+        }
+    }
+
+    // "我用X写代码" / "我用X开发"
+    if let Some(rest) = text.strip_prefix("我用") {
+        for suffix in &["写代码", "开发", "编程", "写程序"] {
+            if let Some(pos) = rest.find(suffix) {
+                let tool = clean_zh_value(&rest[..pos]);
+                if !tool.is_empty() && tool.len() < 50 {
+                    knowledge.preferences.push(InferredPreference {
+                        key: "programming_tool".into(),
+                        value: tool,
+                        confidence: 0.80,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    // Language: "我会说X", "我说X"
+    for prefix in &["我会说", "我说", "我会讲"] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            if !obj.is_empty() && obj.len() < 50 {
+                knowledge.preferences.push(InferredPreference {
+                    key: "language".into(),
+                    value: obj,
+                    confidence: 0.85,
+                });
+                break;
+            }
+        }
+    }
+}
+
+// ── Temporal classification (multilingual) ───────────────────────────────────
+
+fn classify_temporal_multilingual(text: &str, lower: &str) -> TemporalHint {
+    // English temporary signals
+    let en_temporary = [
         "right now", "currently", "at the moment", "today",
         "this week", "this morning", "this afternoon", "this evening",
         "working on", "debugging", "trying to", "about to",
@@ -267,19 +437,40 @@ fn classify_temporal(lower: &str) -> TemporalHint {
         "temporarily", "for now",
     ];
 
-    // Permanent signals
-    let permanent_signals = [
+    // English permanent signals
+    let en_permanent = [
         "always", "i am a", "i'm a", "i live", "i work at",
         "my name is", "i speak", "i prefer", "my favorite",
         "i was born", "i have been", "for years", "since",
         "i never", "i hate", "i love",
     ];
 
-    let temp_score: f32 = temporary_signals.iter()
+    // Chinese temporary signals
+    let zh_temporary = [
+        "现在", "目前", "正在", "今天", "这周", "这个星期",
+        "今早", "今晚", "刚刚", "刚才", "马上",
+        "暂时", "临时", "先", "在调试", "在修",
+    ];
+
+    // Chinese permanent signals
+    let zh_permanent = [
+        "我住在", "我在", "工作", "我叫", "我是",
+        "我喜欢", "我偏好", "一直", "总是", "从来",
+        "我来自", "永远", "多年", "我会说",
+    ];
+
+    let temp_score: f32 = en_temporary.iter()
         .filter(|s| lower.contains(**s))
+        .count() as f32
+        + zh_temporary.iter()
+        .filter(|s| text.contains(**s))
         .count() as f32;
-    let perm_score: f32 = permanent_signals.iter()
+
+    let perm_score: f32 = en_permanent.iter()
         .filter(|s| lower.contains(**s))
+        .count() as f32
+        + zh_permanent.iter()
+        .filter(|s| text.contains(**s))
         .count() as f32;
 
     if temp_score > perm_score && temp_score >= 1.0 {
@@ -319,6 +510,77 @@ fn first_clause(text: &str) -> &str {
 fn clean_value(s: &str) -> String {
     s.trim()
         .trim_end_matches(&['.', ',', '!', '?', ';'][..])
+        .trim()
+        .to_string()
+}
+
+/// Extract value between a Chinese prefix and suffix.
+/// e.g., extract_zh_pattern("我在上海住", "我在", "住") -> Some("上海")
+fn extract_zh_pattern(text: &str, prefix: &str, suffix: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix(prefix) {
+        if suffix.is_empty() {
+            let val = clean_zh_value(first_zh_clause(rest));
+            if !val.is_empty() {
+                return Some(val);
+            }
+        } else if let Some(pos) = rest.find(suffix) {
+            let val = clean_zh_value(&rest[..pos]);
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    // Also search mid-sentence
+    if !prefix.is_empty() {
+        if let Some(start) = text.find(prefix) {
+            let after = &text[start + prefix.len()..];
+            if suffix.is_empty() {
+                let val = clean_zh_value(first_zh_clause(after));
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            } else if let Some(pos) = after.find(suffix) {
+                let val = clean_zh_value(&after[..pos]);
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract value after a Chinese prefix up to first clause boundary.
+fn extract_zh_prefix(text: &str, prefix: &str) -> Option<String> {
+    // Try from start
+    if let Some(rest) = text.strip_prefix(prefix) {
+        let val = clean_zh_value(first_zh_clause(rest));
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    // Try mid-sentence
+    if let Some(start) = text.find(prefix) {
+        let after = &text[start + prefix.len()..];
+        let val = clean_zh_value(first_zh_clause(after));
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Get text up to the first Chinese clause boundary.
+fn first_zh_clause(text: &str) -> &str {
+    let boundaries = ['，', '。', '！', '？', '；', '、', '\n', ',', '.', '!', '?'];
+    let end = text.find(&boundaries[..]).unwrap_or(text.len());
+    &text[..end]
+}
+
+/// Clean whitespace and trailing Chinese punctuation.
+fn clean_zh_value(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(&['，', '。', '！', '？', '；', '、', '.', ',', '!', '?', ';', '了', '的', '呢', '啊', '吧'][..])
         .trim()
         .to_string()
 }
@@ -418,5 +680,88 @@ mod tests {
         let k = extract("I use neovim for editing");
         assert!(!k.preferences.is_empty());
         assert!(k.preferences[0].key.contains("tool_for"));
+    }
+
+    // ── Chinese tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_zh_location() {
+        let k = extract("我住在上海");
+        assert_eq!(k.facts.len(), 1);
+        assert_eq!(k.facts[0].predicate, "lives_in");
+        assert_eq!(k.facts[0].object, "上海");
+    }
+
+    #[test]
+    fn test_zh_location_from() {
+        let k = extract("我来自北京");
+        assert_eq!(k.facts.len(), 1);
+        assert_eq!(k.facts[0].predicate, "from");
+        assert_eq!(k.facts[0].object, "北京");
+    }
+
+    #[test]
+    fn test_zh_work() {
+        let k = extract("我在谷歌工作");
+        assert_eq!(k.facts.len(), 1);
+        assert_eq!(k.facts[0].predicate, "works_at");
+        assert_eq!(k.facts[0].object, "谷歌");
+    }
+
+    #[test]
+    fn test_zh_identity() {
+        let k = extract("我是一名软件工程师");
+        assert!(!k.facts.is_empty());
+        let fact = k.facts.iter().find(|f| f.predicate == "is_a").unwrap();
+        assert_eq!(fact.object, "软件工程师");
+    }
+
+    #[test]
+    fn test_zh_name() {
+        let k = extract("我叫小明");
+        assert!(!k.facts.is_empty());
+        let fact = k.facts.iter().find(|f| f.predicate == "name").unwrap();
+        assert_eq!(fact.object, "小明");
+    }
+
+    #[test]
+    fn test_zh_preference() {
+        let k = extract("我喜欢用Rust");
+        assert!(!k.preferences.is_empty());
+        assert_eq!(k.preferences[0].value, "Rust");
+    }
+
+    #[test]
+    fn test_zh_favorite() {
+        let k = extract("我最喜欢的编辑器是neovim");
+        assert!(!k.preferences.is_empty());
+        assert_eq!(k.preferences[0].key, "编辑器");
+        assert_eq!(k.preferences[0].value, "neovim");
+    }
+
+    #[test]
+    fn test_zh_temporal_temporary() {
+        let k = extract("我正在调试一个bug");
+        assert_eq!(k.temporal_hint, TemporalHint::Temporary);
+    }
+
+    #[test]
+    fn test_zh_temporal_permanent() {
+        let k = extract("我住在上海，我是程序员");
+        assert_eq!(k.temporal_hint, TemporalHint::Permanent);
+    }
+
+    #[test]
+    fn test_zh_no_extraction_from_noise() {
+        let k = extract("今天天气不错");
+        assert!(k.facts.is_empty());
+        assert!(k.preferences.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_zh_en() {
+        let k = extract("I live in Shanghai，我喜欢用Rust");
+        assert!(k.facts.len() >= 1); // English: lives_in Shanghai
+        assert!(!k.preferences.is_empty()); // Chinese: likes Rust
     }
 }
