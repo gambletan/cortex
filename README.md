@@ -1,8 +1,25 @@
 # Cortex
 
-**Persistent memory engine for personal AI assistants.**
+### AI that knows you — not AI with a notepad.
 
-LLMs start blank every session. Your assistant forgets your name, your preferences, the conversation you had yesterday, the decision you made last week. Cortex fixes this. It gives your AI a structured, queryable long-term memory that persists across sessions, channels, and contexts.
+**Persistent memory engine for personal AI assistants.** Pure Rust. Local-first. 3.8MB. Zero cloud.
+
+LLMs start blank every session. Your assistant forgets your name, your preferences, the conversation you had yesterday, the decision you made last week. Current "memory" solutions are flat text files, keyword grep, or cloud APIs that add 200-500ms latency and charge you for the privilege.
+
+Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-term memory that persists across sessions, channels, and contexts — with Bayesian beliefs that self-correct, a people graph that resolves identities across platforms, and sub-millisecond performance on everything.
+
+### Benchmarks
+
+| Operation | Cortex | Mem0 (cloud) | File-based |
+|-----------|--------|-------------|------------|
+| Ingest | **7µs** | ~200ms | ~1ms |
+| Search (top-10) | **132µs** | ~300ms | ~10ms |
+| Context generation | **51µs** | ~500ms | manual |
+| Belief update | **27µs** | N/A | N/A |
+| People graph | **13µs** | paid tier | N/A |
+| 1K memories search | **1.2ms** | ~500ms | ~50ms |
+
+**2,266x faster** than Mem0 cloud. With features neither Mem0 nor file-based systems offer.
 
 ## Architecture
 
@@ -131,27 +148,59 @@ Email    ─┤  (ingest)                 │  (retrieve + inject)
 Calendar ─┘                          └─ Response
 ```
 
+## MCP Server (Claude Code / Claude Desktop)
+
+Cortex ships as an MCP server — works with any MCP-compatible client.
+
+```json
+// ~/.claude/.mcp.json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "cortex-mcp-server",
+      "args": ["~/.cortex/memory.db"]
+    }
+  }
+}
+```
+
+**8 tools available:** `memory_ingest`, `memory_search`, `memory_context`, `belief_observe`, `belief_list`, `person_resolve`, `fact_add`, `preference_set`
+
+## OpenClaw Plugin
+
+Also ships as an OpenClaw memory plugin with auto-recall and auto-capture hooks. See `openclaw-plugin/` for the full integration.
+
 ## Project Structure
 
 ```
 cortex/
-├── cortex-core/     # Rust core library
-│   └── src/
-│       ├── lib.rs           # Cortex entry point
-│       ├── types.rs         # MemObject, MemoryTier, etc.
-│       ├── episode.rs       # Episodic memory store
-│       ├── semantic.rs      # Semantic facts + preferences
-│       ├── working.rs       # Working memory (session scratch pad)
-│       ├── procedural.rs    # Learned routines
-│       ├── people.rs        # People graph + identity resolution
-│       ├── belief.rs        # Bayesian belief system
-│       ├── consolidation.rs # Episodic→semantic promotion + decay
-│       ├── retrieval.rs     # Multi-signal retrieval engine
-│       ├── context.rs       # LLM context generation
-│       └── storage/         # SQLite + in-memory vector index
-├── cortex-python/   # Python bindings (PyO3)
-└── Cargo.toml       # Workspace root
+├── cortex-core/          # Rust core library (all memory logic)
+│   ├── src/
+│   │   ├── lib.rs              # Cortex entry point
+│   │   ├── types.rs            # MemObject, MemoryTier, etc.
+│   │   ├── episode.rs          # Episodic memory store
+│   │   ├── semantic.rs         # Semantic facts + preferences
+│   │   ├── working.rs          # Working memory (session scratch pad)
+│   │   ├── procedural.rs       # Learned routines
+│   │   ├── people.rs           # People graph + identity resolution
+│   │   ├── belief.rs           # Bayesian belief system
+│   │   ├── consolidation.rs    # Episodic→semantic promotion + decay
+│   │   ├── retrieval.rs        # Multi-signal retrieval engine
+│   │   ├── context.rs          # LLM context generation
+│   │   └── storage/            # SQLite + in-memory vector index
+│   └── benches/                # Performance benchmarks
+├── cortex-mcp-server/    # MCP server binary (3.8MB)
+├── cortex-python/        # Python bindings (PyO3, WIP)
+├── openclaw-plugin/      # OpenClaw memory plugin
+└── Cargo.toml            # Workspace root
 ```
+
+## Roadmap
+
+- **v0.2** — Local embedding integration (gte-small/ONNX), batch queries (N+1 elimination), memory decay + auto-consolidation
+- **v0.3** — Proactive inference (auto-extract facts from conversations), temporal awareness (temporary vs permanent), contradiction detection
+- **v0.4** — Conversation compression, relationship inference, multi-modal memory, cross-device sync (CRDTs)
+- **v1.0** — Memory-as-a-Service HTTP API, import/export (ChatGPT, Claude, Mem0), plugin marketplace
 
 ## License
 
