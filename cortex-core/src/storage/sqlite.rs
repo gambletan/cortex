@@ -664,6 +664,29 @@ impl StorageBackend for SqliteStorage {
         Ok(results)
     }
 
+    fn get_memories_batch(&self, ids: &[Uuid]) -> Result<Vec<MemObject>, CortexError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = id_strings.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::with_capacity(ids.len());
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let count: i64 = conn

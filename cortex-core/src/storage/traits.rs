@@ -88,6 +88,18 @@ pub trait StorageBackend: Send + Sync {
         min_frequency: u32,
     ) -> Result<Vec<crate::procedural::Pattern>, crate::CortexError>;
 
+    // Batch fetch
+    fn get_memories_batch(&self, ids: &[Uuid]) -> Result<Vec<MemObject>, crate::CortexError> {
+        // Default implementation: N individual queries (override for batch SQL)
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(mem) = self.get_memory(*id)? {
+                results.push(mem);
+            }
+        }
+        Ok(results)
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

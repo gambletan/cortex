@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
 use crate::types::*;
@@ -127,11 +129,16 @@ impl<'a> RetrievalEngine<'a> {
             }
         }
 
+        // Batch fetch all candidates in a single query
+        let all_ids: Vec<Uuid> = candidate_ids.iter().map(|(id, _)| *id).collect();
+        let memories = self.storage.get_memories_batch(&all_ids)?;
+        let mem_map: HashMap<Uuid, MemObject> = memories.into_iter().map(|m| (m.id, m)).collect();
+
         // Score each candidate
         let mut results = Vec::new();
         for (id, sim_score) in &candidate_ids {
-            if let Some(mem) = self.storage.get_memory(*id)? {
-                let breakdown = self.compute_scores(&mem, *sim_score, query);
+            if let Some(mem) = mem_map.get(id) {
+                let breakdown = self.compute_scores(mem, *sim_score, query);
                 let final_score = self.weights.similarity * breakdown.similarity
                     + self.weights.temporal * breakdown.temporal
                     + self.weights.salience * breakdown.salience
@@ -139,7 +146,7 @@ impl<'a> RetrievalEngine<'a> {
                     + self.weights.channel * breakdown.channel;
 
                 results.push(RetrievalResult {
-                    memory: mem,
+                    memory: mem.clone(),
                     score: final_score,
                     score_breakdown: breakdown,
                 });

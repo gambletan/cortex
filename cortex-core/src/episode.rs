@@ -53,9 +53,15 @@ impl<'a> EpisodeStore<'a> {
     ) -> Result<Vec<MemObject>, CortexError> {
         let candidates = self.index.search(query_embedding, limit * 3);
 
+        // Batch fetch all candidate memories in a single query
+        let all_ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
+        let memories = self.storage.get_memories_batch(&all_ids)?;
+        let mem_map: std::collections::HashMap<Uuid, MemObject> =
+            memories.into_iter().map(|m| (m.id, m)).collect();
+
         let mut results = Vec::new();
-        for (id, _score) in candidates {
-            if let Some(mem) = self.storage.get_memory(id)? {
+        for (id, _score) in &candidates {
+            if let Some(mem) = mem_map.get(id) {
                 if mem.tier != MemoryTier::Episodic {
                     continue;
                 }
@@ -64,7 +70,7 @@ impl<'a> EpisodeStore<'a> {
                         continue;
                     }
                 }
-                results.push(mem);
+                results.push(mem.clone());
                 if results.len() >= limit {
                     break;
                 }
