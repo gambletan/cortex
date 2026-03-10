@@ -10,6 +10,7 @@ pub mod storage;
 pub mod types;
 pub mod working;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 use crate::belief::BeliefEngine;
@@ -41,11 +42,15 @@ pub enum CortexError {
     Serialization(String),
 }
 
+/// How often to auto-run consolidation (every N ingests).
+const AUTO_CONSOLIDATION_INTERVAL: u64 = 100;
+
 /// Main Cortex instance — the entry point for all memory operations.
 pub struct Cortex {
     storage: SqliteStorage,
     index: MemoryIndex,
     working: WorkingMemory,
+    ingest_counter: AtomicU64,
 }
 
 impl Cortex {
@@ -69,6 +74,7 @@ impl Cortex {
             storage,
             index,
             working: WorkingMemory::default(),
+            ingest_counter: AtomicU64::new(0),
         })
     }
 
@@ -79,6 +85,7 @@ impl Cortex {
             storage,
             index: MemoryIndex::new(),
             working: WorkingMemory::default(),
+            ingest_counter: AtomicU64::new(0),
         })
     }
 
@@ -102,12 +109,23 @@ impl Cortex {
         }
 
         let episodes = EpisodeStore::new(&self.storage, &self.index);
-        episodes.add(
+        let result = episodes.add(
             MemContent::Text(text.to_string()),
             source,
             salience_hint,
             embedding,
-        )
+        )?;
+
+        // Auto-consolidation: run every N ingests
+        let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % AUTO_CONSOLIDATION_INTERVAL == 0 {
+            tracing::info!("Auto-consolidation triggered at ingest #{}", count);
+            if let Err(e) = self.run_consolidation() {
+                tracing::warn!("Auto-consolidation failed: {}", e);
+            }
+        }
+
+        Ok(result)
     }
 
     /// Multi-signal retrieval.
@@ -162,10 +180,16 @@ impl Cortex {
         people.resolve_identity(channel, channel_user_id, Some(name), None)
     }
 
-    /// Run a consolidation cycle.
+    /// Run a full consolidation cycle (decay + promote + sweep + patterns).
     pub fn run_consolidation(&self) -> Result<ConsolidationReport, CortexError> {
-        let engine = ConsolidationEngine::new(&self.storage);
+        let engine = ConsolidationEngine::new(&self.storage, &self.index);
         engine.run_consolidation_cycle()
+    }
+
+    /// Run only temporal decay on episodic memories.
+    pub fn run_decay(&self) -> Result<usize, CortexError> {
+        let episodes = EpisodeStore::new(&self.storage, &self.index);
+        episodes.decay_tick()
     }
 
     /// Get beliefs above a confidence threshold.

@@ -199,6 +199,14 @@ pub fn list_tools() -> Value {
                 },
                 "required": ["key", "value"]
             }
+        },
+        {
+            "name": "memory_consolidate",
+            "description": "Run a consolidation cycle: apply temporal decay, promote repeated episodes to semantic facts, sweep dead memories, and extract patterns. Automatically runs every 100 ingests, but can be triggered manually.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -209,6 +217,7 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_ingest" => tool_memory_ingest(cortex, args),
         "memory_search" => tool_memory_search(cortex, args),
         "memory_context" => tool_memory_context(cortex, args),
+        "memory_consolidate" => tool_memory_consolidate(cortex),
         "belief_observe" => tool_belief_observe(cortex, args),
         "belief_list" => tool_belief_list(cortex, args),
         "person_resolve" => tool_person_resolve(cortex, args),
@@ -275,6 +284,21 @@ fn content_to_string(content: &cortex_core::types::MemContent) -> String {
         }
         other => format!("{:?}", other),
     }
+}
+
+fn tool_memory_consolidate(cortex: &Arc<Cortex>) -> Result<String, String> {
+    let report = cortex
+        .run_consolidation()
+        .map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "episodes_scanned": report.episodes_scanned,
+        "decayed_updated": report.decayed_updated,
+        "decayed_swept": report.decayed_swept,
+        "promoted_to_semantic": report.promoted_to_semantic,
+        "patterns_detected": report.patterns_detected,
+    })
+    .to_string())
 }
 
 fn tool_memory_search(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {

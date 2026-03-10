@@ -100,11 +100,16 @@ impl<'a> EpisodeStore<'a> {
 
     /// Apply temporal decay to all episodic memories.
     /// Reduces salience based on time since last access.
+    /// Importance-aware: high base_score memories decay slower (longer half-life).
     pub fn decay_tick(&self) -> Result<usize, CortexError> {
+        self.decay_tick_at(Utc::now())
+    }
+
+    /// Apply decay with a specific reference time (useful for testing).
+    pub fn decay_tick_at(&self, now: DateTime<Utc>) -> Result<usize, CortexError> {
         let mems = self
             .storage
             .list_by_tier(MemoryTier::Episodic, 10_000)?;
-        let now = Utc::now();
         let mut updated = 0;
 
         for mut mem in mems {
@@ -112,8 +117,14 @@ impl<'a> EpisodeStore<'a> {
                 .num_hours()
                 .max(0) as f32;
 
-            // Exponential decay: halves every 72 hours of non-access
-            let decay = (-hours_since_access / 72.0_f32.ln()).exp();
+            // Importance-aware half-life:
+            //   base_score 0.5 → 72h half-life (default)
+            //   base_score 0.8 → 144h half-life (important memories decay 2x slower)
+            //   base_score 1.0 → 216h half-life (critical memories persist 3x longer)
+            let half_life_hours = 72.0 + (mem.salience.base_score * 144.0);
+
+            // Exponential decay: salience halves every half_life_hours of non-access
+            let decay = (-hours_since_access * 0.693 / half_life_hours).exp();
             let new_decay = decay.clamp(0.01, 1.0);
 
             if (mem.salience.decay_factor - new_decay).abs() > 0.001 {

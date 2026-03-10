@@ -2,7 +2,9 @@ use chrono::Duration;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::episode::EpisodeStore;
 use crate::procedural::{Pattern, ProceduralStore};
+use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
 use crate::types::*;
 use crate::CortexError;
@@ -12,6 +14,7 @@ use crate::CortexError;
 pub struct ConsolidationReport {
     pub episodes_scanned: usize,
     pub promoted_to_semantic: usize,
+    pub decayed_updated: usize,
     pub decayed_swept: usize,
     pub patterns_detected: usize,
     pub contradictions_found: usize,
@@ -21,32 +24,41 @@ pub struct ConsolidationReport {
 /// Background consolidation engine — like sleep for the brain.
 pub struct ConsolidationEngine<'a> {
     storage: &'a dyn StorageBackend,
+    index: &'a MemoryIndex,
 }
 
 impl<'a> ConsolidationEngine<'a> {
-    pub fn new(storage: &'a dyn StorageBackend) -> Self {
-        Self { storage }
+    pub fn new(storage: &'a dyn StorageBackend, index: &'a MemoryIndex) -> Self {
+        Self { storage, index }
     }
 
-    /// Run a full consolidation cycle.
+    /// Run a full consolidation cycle:
+    /// 1. Apply temporal decay to all episodic memories
+    /// 2. Promote repeated episodes to semantic facts
+    /// 3. Sweep dead memories below threshold
+    /// 4. Extract behavioral patterns
     pub fn run_consolidation_cycle(&self) -> Result<ConsolidationReport, CortexError> {
         let mut report = ConsolidationReport::default();
 
-        // 1. Find repeated episodic facts for promotion
+        // 1. Apply temporal decay first (updates salience scores)
+        let episodes = EpisodeStore::new(self.storage, self.index);
+        report.decayed_updated = episodes.decay_tick()?;
+
+        // 2. Find repeated episodic facts for promotion
         let promoted = self.find_promotion_candidates(3)?;
         for ids in &promoted {
             self.promote_to_semantic(ids.clone())?;
         }
         report.promoted_to_semantic = promoted.len();
 
-        // 2. Decay sweep
+        // 3. Sweep dead memories (after decay, so freshly-decayed ones get swept)
         report.decayed_swept = self.sweep_decayed(0.05)?;
 
-        // 3. Pattern extraction
+        // 4. Pattern extraction
         let patterns = self.extract_patterns(Duration::days(30))?;
         report.patterns_detected = patterns.len();
 
-        // 4. Count episodes scanned
+        // 5. Count episodes scanned
         report.episodes_scanned = self
             .storage
             .count_by_tier(MemoryTier::Episodic)?;
