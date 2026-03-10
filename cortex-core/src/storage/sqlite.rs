@@ -17,8 +17,15 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     pub fn open(path: &str) -> Result<Self, CortexError> {
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=-64000;
+             PRAGMA mmap_size=268435456;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
         let storage = Self {
             conn: Mutex::new(conn),
         };

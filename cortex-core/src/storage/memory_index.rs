@@ -2,10 +2,17 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Simple in-memory vector index using brute-force cosine similarity.
-/// Can be swapped for HNSW later.
+/// Normalized vector entry — precomputed norm for O(1) cosine similarity.
+struct NormalizedEntry {
+    embedding: Vec<f32>,
+    norm: f32,
+}
+
+/// In-memory vector index with precomputed norms and partial sort.
+/// Brute-force cosine similarity, optimized for < 100K vectors.
+/// Can be swapped for HNSW (instant-distance) for larger datasets.
 pub struct MemoryIndex {
-    vectors: RwLock<HashMap<Uuid, Vec<f32>>>,
+    vectors: RwLock<HashMap<Uuid, NormalizedEntry>>,
 }
 
 impl MemoryIndex {
@@ -16,7 +23,8 @@ impl MemoryIndex {
     }
 
     pub fn insert(&self, id: Uuid, embedding: Vec<f32>) {
-        self.vectors.write().insert(id, embedding);
+        let norm = l2_norm(&embedding);
+        self.vectors.write().insert(id, NormalizedEntry { embedding, norm });
     }
 
     pub fn remove(&self, id: &Uuid) {
@@ -32,13 +40,23 @@ impl MemoryIndex {
     }
 
     /// Search for the top-k most similar vectors by cosine similarity.
-    /// Returns (id, similarity_score) pairs sorted descending by score.
+    /// Uses precomputed norms to avoid redundant sqrt per query.
+    /// Uses partial sort (select_nth) instead of full sort for large collections.
     pub fn search(&self, query: &[f32], limit: usize) -> Vec<(Uuid, f32)> {
+        let query_norm = l2_norm(query);
+        if query_norm == 0.0 {
+            return Vec::new();
+        }
+
         let vectors = self.vectors.read();
         let mut results: Vec<(Uuid, f32)> = vectors
             .iter()
-            .filter_map(|(id, vec)| {
-                let sim = cosine_similarity(query, vec);
+            .filter_map(|(id, entry)| {
+                if entry.norm == 0.0 {
+                    return None;
+                }
+                let dot = dot_product(query, &entry.embedding);
+                let sim = dot / (query_norm * entry.norm);
                 if sim.is_finite() {
                     Some((*id, sim))
                 } else {
@@ -47,8 +65,17 @@ impl MemoryIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
+        // Partial sort: only find top-k, O(n) instead of O(n log n)
+        if results.len() > limit {
+            results.select_nth_unstable_by(limit, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(limit);
+            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
         results
     }
 
@@ -57,7 +84,8 @@ impl MemoryIndex {
         let mut vectors = self.vectors.write();
         vectors.clear();
         for (id, embedding) in entries {
-            vectors.insert(id, embedding);
+            let norm = l2_norm(&embedding);
+            vectors.insert(id, NormalizedEntry { embedding, norm });
         }
     }
 }
@@ -68,27 +96,26 @@ impl Default for MemoryIndex {
     }
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+/// Dot product — auto-vectorized by LLVM for f32 slices.
+#[inline]
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// L2 norm — precomputed once per insert.
+#[inline]
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Cosine similarity (standalone, for external use).
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    let dot = dot_product(a, b);
+    let denom = l2_norm(a) * l2_norm(b);
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
 #[cfg(test)]
