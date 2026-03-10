@@ -88,13 +88,19 @@ impl SqliteStorage {
 }
 
 fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    let mut buf = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        buf.extend_from_slice(&f.to_le_bytes());
+    }
+    buf
 }
 
 fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    let mut result = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        result.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    result
 }
 
 impl StorageBackend for SqliteStorage {
@@ -255,7 +261,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -284,7 +290,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE json_extract(source_json, '$.channel') = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -305,7 +311,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 AND json_extract(salience_json, '$.effective_score') < ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -327,7 +333,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 AND created_at >= ?2 AND created_at <= ?3 ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -366,7 +372,7 @@ impl StorageBackend for SqliteStorage {
     ) -> Result<Vec<(Uuid, LinkRelation, f32)>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT target_id, relation, strength FROM links WHERE source_id = ?1")
+            .prepare_cached("SELECT target_id, relation, strength FROM links WHERE source_id = ?1")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
             .query_map(params![source_id.to_string()], |row| {
@@ -452,20 +458,22 @@ impl StorageBackend for SqliteStorage {
         channel_user_id: &str,
     ) -> Result<Option<Person>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
-        let person_id: Option<String> = conn
+        let person = conn
             .query_row(
-                "SELECT person_id FROM channel_identities WHERE channel = ?1 AND channel_user_id = ?2",
+                "SELECT p.id, p.display_name, p.relationship, p.first_seen, p.last_seen, p.interaction_count, p.tags_json, p.notes_json, p.communication_style_json
+                 FROM people p
+                 INNER JOIN channel_identities ci ON ci.person_id = p.id
+                 WHERE ci.channel = ?1 AND ci.channel_user_id = ?2",
                 params![channel, channel_user_id],
-                |row| row.get(0),
+                |row| Ok(parse_person_row(row)),
             )
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
 
-        match person_id {
-            Some(pid) => {
-                let id = Uuid::parse_str(&pid).map_err(|e| CortexError::Storage(e.to_string()))?;
-                drop(conn);
-                self.get_person(id)
+        match person {
+            Some(mut p) => {
+                p.identities = self.load_identities(&conn, p.id)?;
+                Ok(Some(p))
             }
             None => Ok(None),
         }
@@ -521,7 +529,7 @@ impl StorageBackend for SqliteStorage {
     fn list_people(&self) -> Result<Vec<Person>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people ORDER BY last_seen DESC")
+            .prepare_cached("SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people ORDER BY last_seen DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| Ok(parse_person_row(row)))
@@ -583,7 +591,7 @@ impl StorageBackend for SqliteStorage {
     fn list_beliefs_above(&self, threshold: f32) -> Result<Vec<Belief>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT id, key, probability, observations_json, last_updated FROM beliefs WHERE probability >= ?1 ORDER BY probability DESC")
+            .prepare_cached("SELECT id, key, probability, observations_json, last_updated FROM beliefs WHERE probability >= ?1 ORDER BY probability DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
             .query_map(params![threshold], parse_belief_row)
@@ -644,7 +652,7 @@ impl StorageBackend for SqliteStorage {
     fn list_patterns(&self, min_frequency: u32) -> Result<Vec<Pattern>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT id, trigger, actions_json, frequency, last_seen FROM patterns WHERE frequency >= ?1 ORDER BY frequency DESC")
+            .prepare_cached("SELECT id, trigger, actions_json, frequency, last_seen FROM patterns WHERE frequency >= ?1 ORDER BY frequency DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
             .query_map(params![min_frequency], parse_pattern_row)
@@ -675,7 +683,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let id_str = format!("\"{}\"", identity_id);
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE json_extract(source_json, '$.identity_id') = ?1 ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -697,7 +705,7 @@ impl SqliteStorage {
         person_id: Uuid,
     ) -> Result<Vec<ChannelIdentity>, CortexError> {
         let mut stmt = conn
-            .prepare("SELECT channel, channel_user_id, username, display_name FROM channel_identities WHERE person_id = ?1")
+            .prepare_cached("SELECT channel, channel_user_id, username, display_name FROM channel_identities WHERE person_id = ?1")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
             .query_map(params![person_id.to_string()], |row| {
