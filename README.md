@@ -280,7 +280,7 @@ Add to `~/.claude/settings.json`:
 
 Now every new Claude Code session automatically loads your memory context — **zero manual effort**. Claude learns as you work and remembers across sessions.
 
-### 13 Tools
+### 18 Tools
 
 | Tool | Purpose |
 |------|---------|
@@ -288,14 +288,19 @@ Now every new Claude Code session automatically loads your memory context — **
 | `memory_search` | Semantic search across all memory tiers |
 | `memory_context` | Generate LLM-ready context summary (token-budgeted) |
 | `memory_consolidate` | Run decay + promotion + sweep cycle |
+| `memory_infer` | Preview inference without storing |
+| `memory_compress` | Compress old conversation sessions |
+| `memory_stats` | Get memory statistics (counts per tier, index size) |
+| `memory_decay` | Run temporal decay on episodic memories |
 | `belief_observe` | Update a Bayesian belief with evidence |
 | `belief_list` | Query beliefs above confidence threshold |
 | `fact_add` | Store structured knowledge (subject-predicate-object) |
+| `fact_query` | Query facts by entity (SQL-indexed) |
 | `preference_set` | Store user preference with confidence |
+| `preference_query` | Query preferences by key pattern |
 | `person_resolve` | Cross-channel identity resolution |
-| `memory_infer` | Preview inference without storing |
+| `person_list` | List all known people |
 | `contradiction_check` | Check for fact contradictions |
-| `memory_compress` | Compress old conversation sessions |
 | `relationship_extract` | Extract relationships from text |
 
 ## OpenClaw Plugin
@@ -339,7 +344,10 @@ Cortex ships a lightweight HTTP server for integration with any language or fram
 cargo build --release -p cortex-http
 ./target/release/cortex-http --port 3315 --db ~/.cortex/memory.db
 
-# Or via Docker (self-hosted)
+# Or via Docker (pre-built from GHCR)
+docker run -v ~/.cortex:/data -p 3315:3315 ghcr.io/gambletan/cortex/cortex-http:latest
+
+# Or build locally
 docker build -t cortex .
 docker run -v ~/.cortex:/data -p 3315:3315 cortex
 ```
@@ -360,6 +368,8 @@ docker run -v ~/.cortex:/data -p 3315:3315 cortex
 | GET | `/v1/beliefs` | List beliefs |
 | POST | `/v1/beliefs/observe` | Update belief with evidence |
 | POST | `/v1/people` | Resolve person identity |
+| POST | `/v1/memories/compress` | Compress old conversation sessions |
+| POST | `/v1/relationships/extract` | Extract relationships from text |
 | GET | `/v1/export` | Export all data (JSON backup) |
 | POST | `/v1/import` | Import data from backup |
 
@@ -395,6 +405,8 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.1** ✅ — HNSW vector index (50K search: 12ms → 91µs), Python SDK (`pip install cortex-ai-memory`)
 - **v1.2** ✅ — Negation detection (EN + CN), multi-hop retrieval, 117 tests
 - **v1.3** ✅ — Context quality optimization, query expansion, bidirectional relationships, 126 tests
+- **v1.4** ✅ — Incremental HNSW, SQL-indexed entity queries, LLM summarizer hook, 18 MCP tools, configurable decay, LLM-assisted inference, 131 tests
+- **v1.5** ✅ — Docker image (GHCR auto-publish), feature freeze
 - **v2.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile (iOS/Android)
 
 ## License

@@ -176,7 +176,10 @@ Cortex 提供轻量 HTTP 服务，可与任意语言/框架集成。默认绑定
 cargo build --release -p cortex-http
 ./target/release/cortex-http --port 3315 --db ~/.cortex/memory.db
 
-# 或通过 Docker（自托管）
+# 或通过 Docker（预构建镜像）
+docker run -v ~/.cortex:/data -p 3315:3315 ghcr.io/gambletan/cortex/cortex-http:latest
+
+# 或本地构建
 docker build -t cortex .
 docker run -v ~/.cortex:/data -p 3315:3315 cortex
 ```
@@ -197,6 +200,8 @@ docker run -v ~/.cortex:/data -p 3315:3315 cortex
 | GET | `/v1/beliefs` | 列出信念 |
 | POST | `/v1/beliefs/observe` | 用证据更新信念 |
 | POST | `/v1/people` | 解析人物身份 |
+| POST | `/v1/memories/compress` | 压缩旧对话会话 |
+| POST | `/v1/relationships/extract` | 从文本中提取关系 |
 | GET | `/v1/export` | 导出全部数据（JSON 备份） |
 | POST | `/v1/import` | 从备份导入数据 |
 
@@ -246,6 +251,18 @@ claude mcp add cortex --scope user -- ~/.local/bin/cortex-mcp-server ~/.cortex/m
 claude mcp add cortex -- ~/.local/bin/cortex-mcp-server ~/.cortex/memory.db
 ```
 
+Claude Desktop — 添加到 `~/Library/Application Support/Claude/claude_desktop_config.json`：
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "/Users/you/.local/bin/cortex-mcp-server",
+      "args": ["/Users/you/.cortex/memory.db"]
+    }
+  }
+}
+```
+
 **3. 在 CLAUDE.md 中启用自动记忆：**
 
 ```markdown
@@ -260,7 +277,7 @@ claude mcp add cortex -- ~/.local/bin/cortex-mcp-server ~/.cortex/memory.db
 - 定期：调用 memory_consolidate 清理过期记忆
 ```
 
-### 11 个工具
+### 18 个工具
 
 | 工具 | 用途 |
 |------|------|
@@ -269,12 +286,23 @@ claude mcp add cortex -- ~/.local/bin/cortex-mcp-server ~/.cortex/memory.db
 | `memory_context` | 生成 LLM 就绪的上下文摘要（token 预算控制） |
 | `memory_consolidate` | 运行衰减 + 晋升 + 清扫周期 |
 | `memory_infer` | 主动推理预览（不存储） |
-| `contradiction_check` | 检查事实矛盾 |
+| `memory_compress` | 压缩旧对话会话 |
+| `memory_stats` | 获取记忆统计（各层数量、索引大小） |
+| `memory_decay` | 对情景记忆执行时间衰减 |
 | `belief_observe` | 用证据更新贝叶斯信念 |
 | `belief_list` | 查询高于阈值的信念 |
 | `fact_add` | 存储结构化知识（主语-谓语-宾语） |
+| `fact_query` | 按实体查询事实（SQL 索引） |
 | `preference_set` | 存储用户偏好 |
+| `preference_query` | 按键模式查询偏好 |
 | `person_resolve` | 跨渠道身份解析 |
+| `person_list` | 列出所有已知人物 |
+| `contradiction_check` | 检查事实矛盾 |
+| `relationship_extract` | 从文本中提取关系 |
+
+## OpenClaw 插件
+
+同时提供 OpenClaw 记忆插件，支持自动记忆和自动召回钩子。详见 `openclaw-plugin/` 目录。
 
 ## 项目结构
 
@@ -314,6 +342,8 @@ cortex/
 - **v1.1** ✅ — HNSW 向量索引（5万条搜索：12ms → 91µs），Python SDK（`pip install cortex-ai-memory`）
 - **v1.2** ✅ — 否定检测（中英双语），多跳检索，117 个测试
 - **v1.3** ✅ — 上下文质量优化，查询扩展，双向关系推理，126 个测试
+- **v1.4** ✅ — 增量 HNSW，SQL 索引实体查询，LLM 摘要钩子，18 个 MCP 工具，可配置衰减，LLM 辅助推理，131 个测试
+- **v1.5** ✅ — Docker 镜像（GHCR 自动发布），功能冻结
 - **v2.0** — 跨设备同步（CRDT，无需云端），插件系统，移动端（iOS/Android）
 
 ## 许可证
