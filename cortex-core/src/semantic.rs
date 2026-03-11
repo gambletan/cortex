@@ -75,40 +75,25 @@ impl<'a> SemanticStore<'a> {
     }
 
     /// Query facts about a subject or object entity.
+    /// Uses SQL-level filtering when available (no full table scan).
     pub fn query_facts(&self, entity: &str) -> Result<Vec<MemObject>, CortexError> {
-        let all = self
-            .storage
-            .list_by_tier(MemoryTier::Semantic, 10_000)?;
-
-        Ok(all
-            .into_iter()
-            .filter(|m| match &m.content {
-                MemContent::Fact {
-                    subject, object, ..
-                } => {
-                    subject.to_lowercase().contains(&entity.to_lowercase())
-                        || object.to_lowercase().contains(&entity.to_lowercase())
-                }
-                _ => false,
-            })
-            .collect())
+        if entity.is_empty() {
+            // Empty entity = return all facts (for context generation)
+            let all = self.storage.list_by_tier(MemoryTier::Semantic, 10_000)?;
+            return Ok(all.into_iter().filter(|m| matches!(&m.content, MemContent::Fact { .. })).collect());
+        }
+        self.storage.query_facts_by_entity(entity)
     }
 
     /// Query preferences matching a key pattern (substring match).
+    /// Uses SQL-level filtering when available.
     pub fn query_preferences(&self, key_pattern: &str) -> Result<Vec<MemObject>, CortexError> {
-        let all = self
-            .storage
-            .list_by_tier(MemoryTier::Semantic, 10_000)?;
-
-        Ok(all
-            .into_iter()
-            .filter(|m| match &m.content {
-                MemContent::Preference { key, .. } => {
-                    key.to_lowercase().contains(&key_pattern.to_lowercase())
-                }
-                _ => false,
-            })
-            .collect())
+        if key_pattern.is_empty() {
+            // Empty pattern = return all preferences
+            let all = self.storage.list_by_tier(MemoryTier::Semantic, 10_000)?;
+            return Ok(all.into_iter().filter(|m| matches!(&m.content, MemContent::Preference { .. })).collect());
+        }
+        self.storage.query_preferences_by_key(key_pattern)
     }
 
     /// Update the confidence of a semantic memory.

@@ -687,6 +687,51 @@ impl StorageBackend for SqliteStorage {
         Ok(results)
     }
 
+    fn query_facts_by_entity(&self, entity: &str) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let pattern = format!("%{}%", entity.to_lowercase());
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, \
+                 salience_json, privacy_json, tags_json, metadata_json, links_json \
+                 FROM memories WHERE tier = 'semantic' \
+                 AND (LOWER(json_extract(content_json, '$.Fact.subject')) LIKE ?1 \
+                   OR LOWER(json_extract(content_json, '$.Fact.object')) LIKE ?1) \
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![pattern], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn query_preferences_by_key(&self, key_pattern: &str) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let pattern = format!("%{}%", key_pattern.to_lowercase());
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, \
+                 salience_json, privacy_json, tags_json, metadata_json, links_json \
+                 FROM memories WHERE tier = 'semantic' \
+                 AND LOWER(json_extract(content_json, '$.Preference.key')) LIKE ?1 \
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![pattern], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let count: i64 = conn

@@ -30,19 +30,23 @@ impl instant_distance::Point for Point {
 }
 
 /// Hybrid vector index: brute-force for small/mutating collections,
-/// HNSW for large stable collections. Automatically switches strategy.
+/// HNSW for large stable collections. New insertions go into a pending buffer
+/// that is searched via brute-force and merged with HNSW results, avoiding
+/// costly full rebuilds on every search.
 pub struct MemoryIndex {
     inner: RwLock<IndexInner>,
 }
 
 struct IndexInner {
-    /// Raw embeddings (always maintained, source of truth)
-    entries: HashMap<Uuid, NormalizedEntry>,
-    /// HNSW index for fast ANN search (rebuilt on demand)
+    /// Stable entries included in the current HNSW build (source of truth together with pending)
+    stable: HashMap<Uuid, NormalizedEntry>,
+    /// New entries not yet in HNSW — searched via brute-force and merged
+    pending: HashMap<Uuid, NormalizedEntry>,
+    /// HNSW index for fast ANN search on stable entries
     hnsw: Option<HnswMap<Point, Uuid>>,
-    /// Number of mutations since last HNSW build
-    mutations_since_build: usize,
-    /// Size at last HNSW build
+    /// Total removals since last HNSW build (stale entries in HNSW)
+    removals_since_build: usize,
+    /// Size of stable set at last HNSW build
     size_at_build: usize,
 }
 
@@ -53,103 +57,138 @@ struct NormalizedEntry {
 
 /// Use HNSW when collection is large enough to benefit.
 const HNSW_MIN_SIZE: usize = 1000;
-/// Rebuild HNSW when mutations exceed 10% of collection size.
-const HNSW_REBUILD_RATIO: f32 = 0.10;
+/// Rebuild HNSW when pending buffer exceeds 20% of stable size.
+const HNSW_PENDING_RATIO: f32 = 0.20;
+/// Rebuild HNSW when removals exceed 10% of stable size.
+const HNSW_REMOVAL_RATIO: f32 = 0.10;
 
 impl MemoryIndex {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(IndexInner {
-                entries: HashMap::new(),
+                stable: HashMap::new(),
+                pending: HashMap::new(),
                 hnsw: None,
-                mutations_since_build: 0,
+                removals_since_build: 0,
                 size_at_build: 0,
             }),
         }
     }
 
+    /// Insert a new embedding. Goes into the pending buffer (cheap, no rebuild).
     pub fn insert(&self, id: Uuid, embedding: Vec<f32>) {
         let norm = l2_norm(&embedding);
         let mut inner = self.inner.write();
-        inner.entries.insert(id, NormalizedEntry { embedding, norm });
-        inner.mutations_since_build += 1;
+        // Remove from stable if updating an existing entry
+        inner.stable.remove(&id);
+        inner.pending.insert(id, NormalizedEntry { embedding, norm });
     }
 
+    /// Remove an embedding.
     pub fn remove(&self, id: &Uuid) {
         let mut inner = self.inner.write();
-        if inner.entries.remove(id).is_some() {
-            inner.mutations_since_build += 1;
+        if inner.pending.remove(id).is_none() {
+            // Was in stable — mark as removal so HNSW knows it's stale
+            if inner.stable.remove(id).is_some() {
+                inner.removals_since_build += 1;
+            }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().entries.len()
+        let inner = self.inner.read();
+        inner.stable.len() + inner.pending.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().entries.is_empty()
+        let inner = self.inner.read();
+        inner.stable.is_empty() && inner.pending.is_empty()
     }
 
     /// Search for the top-k most similar vectors.
-    /// Uses HNSW for large stable collections, brute-force otherwise.
+    /// Merges HNSW results (stable) with brute-force results (pending).
     pub fn search(&self, query: &[f32], limit: usize) -> Vec<(Uuid, f32)> {
         let mut inner = self.inner.write();
-        let n = inner.entries.len();
+        let total = inner.stable.len() + inner.pending.len();
 
-        if n == 0 {
+        if total == 0 {
             return Vec::new();
         }
 
-        // Small collection or high mutation rate: brute-force
-        if n < HNSW_MIN_SIZE {
-            return brute_force_search(&inner.entries, query, limit);
+        // Small collection: brute-force everything
+        if total < HNSW_MIN_SIZE {
+            return brute_force_search_both(&inner.stable, &inner.pending, query, limit);
         }
 
-        // Check if HNSW needs rebuild
+        // Check if HNSW needs a full rebuild:
+        // 1. No HNSW yet
+        // 2. Too many removals (stale entries in HNSW)
         let needs_rebuild = inner.hnsw.is_none()
-            || inner.mutations_since_build as f32 > inner.size_at_build as f32 * HNSW_REBUILD_RATIO;
+            || (inner.size_at_build > 0
+                && inner.removals_since_build as f32 > inner.size_at_build as f32 * HNSW_REMOVAL_RATIO);
 
-        if needs_rebuild {
-            rebuild_hnsw(&mut inner);
+        // Check if pending buffer should be flushed into stable + rebuild
+        let pending_overflow = inner.hnsw.is_some()
+            && inner.size_at_build > 0
+            && inner.pending.len() as f32 > inner.size_at_build as f32 * HNSW_PENDING_RATIO;
+
+        if needs_rebuild || pending_overflow {
+            flush_and_rebuild(&mut inner);
         }
 
-        // HNSW search
+        // Merge: HNSW search on stable + brute-force on pending
+        let mut results: Vec<(Uuid, f32)> = Vec::new();
+
+        // HNSW search on stable entries
         if let Some(ref hnsw) = inner.hnsw {
             let query_point = Point::new(query.to_vec());
             let mut search = Search::default();
-            let results = hnsw.search(&query_point, &mut search);
+            let hnsw_results = hnsw.search(&query_point, &mut search);
 
-            results
-                .take(limit)
-                .map(|item| {
-                    let id = *item.value;
+            for item in hnsw_results.take(limit * 2) {
+                let id = *item.value;
+                // Skip entries that were removed after the HNSW build
+                if inner.stable.contains_key(&id) {
                     let similarity = 1.0 - item.distance;
-                    (id, similarity)
-                })
-                .collect()
-        } else {
-            brute_force_search(&inner.entries, query, limit)
+                    results.push((id, similarity));
+                }
+            }
         }
+
+        // Brute-force on pending buffer
+        if !inner.pending.is_empty() {
+            let pending_results = brute_force_search_map(&inner.pending, query, limit);
+            results.extend(pending_results);
+        }
+
+        // Merge, deduplicate, sort, truncate
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.dedup_by_key(|r| r.0);
+        results.truncate(limit);
+        results
     }
 
     /// Force HNSW rebuild (call after bulk operations).
     pub fn build_index(&self) {
         let mut inner = self.inner.write();
-        if inner.entries.len() >= HNSW_MIN_SIZE {
-            rebuild_hnsw(&mut inner);
+        let total = inner.stable.len() + inner.pending.len();
+        if total >= HNSW_MIN_SIZE {
+            flush_and_rebuild(&mut inner);
         }
     }
 
     /// Rebuild the index from an iterator of (id, embedding) pairs.
     pub fn rebuild(&self, entries: impl Iterator<Item = (Uuid, Vec<f32>)>) {
         let mut inner = self.inner.write();
-        inner.entries.clear();
+        inner.stable.clear();
+        inner.pending.clear();
         for (id, embedding) in entries {
             let norm = l2_norm(&embedding);
-            inner.entries.insert(id, NormalizedEntry { embedding, norm });
+            inner.pending.insert(id, NormalizedEntry { embedding, norm });
         }
-        inner.mutations_since_build = inner.entries.len(); // force rebuild on next search
         inner.hnsw = None;
+        inner.removals_since_build = 0;
+        inner.size_at_build = 0;
     }
 }
 
@@ -159,16 +198,58 @@ impl Default for MemoryIndex {
     }
 }
 
-fn rebuild_hnsw(inner: &mut IndexInner) {
-    let points: Vec<Point> = inner.entries.values().map(|e| Point::new(e.embedding.clone())).collect();
-    let ids: Vec<Uuid> = inner.entries.keys().copied().collect();
+/// Flush pending entries into stable, then rebuild HNSW from all stable entries.
+fn flush_and_rebuild(inner: &mut IndexInner) {
+    // Move all pending into stable
+    for (id, entry) in inner.pending.drain() {
+        inner.stable.insert(id, entry);
+    }
+
+    let points: Vec<Point> = inner.stable.values().map(|e| Point::new(e.embedding.clone())).collect();
+    let ids: Vec<Uuid> = inner.stable.keys().copied().collect();
     let hnsw = Builder::default().ef_construction(40).build(points, ids);
     inner.hnsw = Some(hnsw);
-    inner.mutations_since_build = 0;
-    inner.size_at_build = inner.entries.len();
+    inner.removals_since_build = 0;
+    inner.size_at_build = inner.stable.len();
 }
 
-fn brute_force_search(
+/// Brute-force search across both stable and pending maps.
+fn brute_force_search_both(
+    stable: &HashMap<Uuid, NormalizedEntry>,
+    pending: &HashMap<Uuid, NormalizedEntry>,
+    query: &[f32],
+    limit: usize,
+) -> Vec<(Uuid, f32)> {
+    let query_norm = l2_norm(query);
+    if query_norm == 0.0 {
+        return Vec::new();
+    }
+
+    let mut results: Vec<(Uuid, f32)> = stable
+        .iter()
+        .chain(pending.iter())
+        .filter_map(|(id, entry)| {
+            if entry.norm == 0.0 {
+                return None;
+            }
+            let dot = dot_product(query, &entry.embedding);
+            let sim = dot / (query_norm * entry.norm);
+            if sim.is_finite() { Some((*id, sim)) } else { None }
+        })
+        .collect();
+
+    if results.len() > limit {
+        results.select_nth_unstable_by(limit, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(limit);
+    }
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results
+}
+
+/// Brute-force search on a single map.
+fn brute_force_search_map(
     entries: &HashMap<Uuid, NormalizedEntry>,
     query: &[f32],
     limit: usize,
@@ -282,11 +363,56 @@ mod tests {
     }
 
     #[test]
+    fn test_search_pending_found() {
+        let index = MemoryIndex::new();
+
+        // Build a stable HNSW first
+        for i in 0..1200 {
+            let id = Uuid::new_v4();
+            let x = (i as f32 * 0.1).sin();
+            let y = (i as f32 * 0.1).cos();
+            let z = (i as f32 * 0.2).sin();
+            index.insert(id, vec![x, y, z]);
+        }
+        index.build_index();
+
+        // Now add a pending entry that should be the best match
+        let target_id = Uuid::new_v4();
+        index.insert(target_id, vec![1.0, 0.0, 0.0]);
+
+        let results = index.search(&[1.0, 0.0, 0.0], 3);
+        assert!(results.iter().any(|(id, _)| *id == target_id),
+            "Pending entry should be found in search results");
+    }
+
+    #[test]
     fn test_remove() {
         let index = MemoryIndex::new();
         let id = Uuid::new_v4();
         index.insert(id, vec![1.0, 0.0]);
         index.remove(&id);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_remove_from_stable() {
+        let index = MemoryIndex::new();
+
+        // Build HNSW with entries
+        for i in 0..1200 {
+            let id = Uuid::new_v4();
+            index.insert(id, vec![(i as f32).sin(), (i as f32).cos(), 0.0]);
+        }
+        let target = Uuid::new_v4();
+        index.insert(target, vec![1.0, 0.0, 0.0]);
+        index.build_index();
+
+        // Remove target from stable
+        index.remove(&target);
+
+        // Should not appear in results
+        let results = index.search(&[1.0, 0.0, 0.0], 5);
+        assert!(!results.iter().any(|(id, _)| *id == target),
+            "Removed stable entry should not appear in results");
     }
 }

@@ -47,6 +47,18 @@ pub enum CortexError {
     Serialization(String),
 }
 
+/// Memory statistics (counts per tier).
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    pub episodic: usize,
+    pub semantic: usize,
+    pub procedural: usize,
+    pub people: usize,
+    pub beliefs: usize,
+    pub index_size: usize,
+    pub total: usize,
+}
+
 /// How often to auto-run consolidation (every N ingests).
 const AUTO_CONSOLIDATION_INTERVAL: u64 = 100;
 
@@ -413,6 +425,54 @@ impl Cortex {
     ) -> Result<CompressionReport, CortexError> {
         let engine = CompressionEngine::new(&self.storage, &self.index);
         engine.run_compression(min_messages, chrono::Duration::days(max_age_days))
+    }
+
+    /// Run compression with an external summarizer (e.g., LLM-powered).
+    pub fn run_compression_with_summarizer(
+        &self,
+        min_messages: usize,
+        max_age_days: i64,
+        summarizer: &compression::SummarizerFn,
+    ) -> Result<CompressionReport, CortexError> {
+        let engine = CompressionEngine::new(&self.storage, &self.index)
+            .with_summarizer(summarizer);
+        engine.run_compression(min_messages, chrono::Duration::days(max_age_days))
+    }
+
+    /// Get memory statistics (counts per tier).
+    pub fn stats(&self) -> Result<MemoryStats, CortexError> {
+        let episodic = self.storage.count_by_tier(MemoryTier::Episodic)?;
+        let semantic = self.storage.count_by_tier(MemoryTier::Semantic)?;
+        let procedural = self.storage.count_by_tier(MemoryTier::Procedural)?;
+        let people = self.storage.list_people()?.len();
+        let beliefs = self.storage.list_beliefs_above(0.0)?.len();
+        let index_size = self.index.len();
+        Ok(MemoryStats {
+            episodic,
+            semantic,
+            procedural,
+            people,
+            beliefs,
+            index_size,
+            total: episodic + semantic + procedural,
+        })
+    }
+
+    /// Query facts by entity (SQL-indexed, no full scan).
+    pub fn query_facts(&self, entity: &str) -> Result<Vec<MemObject>, CortexError> {
+        let semantic = SemanticStore::new(&self.storage, &self.index);
+        semantic.query_facts(entity)
+    }
+
+    /// Query preferences by key pattern.
+    pub fn query_preferences(&self, key_pattern: &str) -> Result<Vec<MemObject>, CortexError> {
+        let semantic = SemanticStore::new(&self.storage, &self.index);
+        semantic.query_preferences(key_pattern)
+    }
+
+    /// List all known people.
+    pub fn list_people(&self) -> Result<Vec<crate::people::Person>, CortexError> {
+        self.storage.list_people()
     }
 
     /// Access to working memory.

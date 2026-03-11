@@ -274,6 +274,58 @@ pub fn list_tools() -> Value {
                 },
                 "required": ["text"]
             }
+        },
+        {
+            "name": "memory_stats",
+            "description": "Get memory statistics: counts per tier (episodic, semantic, procedural), people, beliefs, and vector index size.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "fact_query",
+            "description": "Query semantic facts by entity name. Returns all facts where the entity appears as subject or object. More efficient than memory_search for structured knowledge lookups.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "Entity to search for (e.g. 'Alice', 'Python', 'Shanghai')"
+                    }
+                },
+                "required": ["entity"]
+            }
+        },
+        {
+            "name": "preference_query",
+            "description": "Query user preferences by key pattern. Returns matching preferences.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Key pattern to search (e.g. 'language', 'timezone'). Empty string returns all."
+                    }
+                },
+                "required": ["key"]
+            }
+        },
+        {
+            "name": "person_list",
+            "description": "List all known people in the memory graph. Returns names, channels, and interaction counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "memory_decay",
+            "description": "Run temporal decay on episodic memories. Reduces salience of old, unaccessed memories. Lighter than full consolidation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -294,6 +346,11 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "preference_set" => tool_preference_set(cortex, args),
         "memory_compress" => tool_memory_compress(cortex, args),
         "relationship_extract" => tool_relationship_extract(cortex, args),
+        "memory_stats" => tool_memory_stats(cortex),
+        "fact_query" => tool_fact_query(cortex, args),
+        "preference_query" => tool_preference_query(cortex, args),
+        "person_list" => tool_person_list(cortex),
+        "memory_decay" => tool_memory_decay(cortex),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -623,5 +680,96 @@ fn tool_relationship_extract(cortex: &Arc<Cortex>, args: &Value) -> Result<Strin
     Ok(json!({
         "relationships": items,
         "total": items.len(),
+    }).to_string())
+}
+
+fn tool_memory_stats(cortex: &Arc<Cortex>) -> Result<String, String> {
+    let stats = cortex.stats().map_err(|e| e.to_string())?;
+    Ok(json!({
+        "episodic": stats.episodic,
+        "semantic": stats.semantic,
+        "procedural": stats.procedural,
+        "people": stats.people,
+        "beliefs": stats.beliefs,
+        "index_size": stats.index_size,
+        "total": stats.total,
+    }).to_string())
+}
+
+fn tool_fact_query(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let entity = get_str(args, "entity").ok_or("missing 'entity'")?;
+    let facts = cortex.query_facts(entity).map_err(|e| e.to_string())?;
+
+    let items: Vec<Value> = facts.iter().map(|m| {
+        if let cortex_core::types::MemContent::Fact { subject, predicate, object } = &m.content {
+            json!({
+                "id": m.id.to_string(),
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+                "confidence": format!("{:.2}", m.salience.base_score),
+            })
+        } else {
+            json!({})
+        }
+    }).collect();
+
+    Ok(json!({
+        "entity": entity,
+        "facts": items,
+        "total": items.len(),
+    }).to_string())
+}
+
+fn tool_preference_query(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let key = get_str(args, "key").ok_or("missing 'key'")?;
+    let prefs = cortex.query_preferences(key).map_err(|e| e.to_string())?;
+
+    let items: Vec<Value> = prefs.iter().map(|m| {
+        if let cortex_core::types::MemContent::Preference { key, value, confidence } = &m.content {
+            json!({
+                "id": m.id.to_string(),
+                "key": key,
+                "value": value,
+                "confidence": confidence,
+            })
+        } else {
+            json!({})
+        }
+    }).collect();
+
+    Ok(json!({
+        "preferences": items,
+        "total": items.len(),
+    }).to_string())
+}
+
+fn tool_person_list(cortex: &Arc<Cortex>) -> Result<String, String> {
+    let people = cortex.list_people().map_err(|e| e.to_string())?;
+
+    let items: Vec<Value> = people.iter().map(|p| {
+        json!({
+            "id": p.id.to_string(),
+            "name": p.display_name,
+            "relationship": p.relationship_to_user,
+            "interactions": p.interaction_count,
+            "last_seen": p.last_seen.to_rfc3339(),
+            "channels": p.identities.iter().map(|i| {
+                json!({ "channel": i.channel, "user_id": i.channel_user_id })
+            }).collect::<Vec<_>>(),
+        })
+    }).collect();
+
+    Ok(json!({
+        "people": items,
+        "total": items.len(),
+    }).to_string())
+}
+
+fn tool_memory_decay(cortex: &Arc<Cortex>) -> Result<String, String> {
+    let updated = cortex.run_decay().map_err(|e| e.to_string())?;
+    Ok(json!({
+        "memories_updated": updated,
+        "status": "decay_complete",
     }).to_string())
 }

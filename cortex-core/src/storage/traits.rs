@@ -1,4 +1,4 @@
-use crate::types::{LinkRelation, MemObject, MemoryTier};
+use crate::types::{LinkRelation, MemContent, MemObject, MemoryTier};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -98,6 +98,38 @@ pub trait StorageBackend: Send + Sync {
             }
         }
         Ok(results)
+    }
+
+    // Entity-indexed queries (optimized for semantic lookups)
+    /// Query semantic facts where subject or object contains the entity string.
+    /// Uses SQL-level filtering instead of loading all semantic memories.
+    fn query_facts_by_entity(&self, entity: &str) -> Result<Vec<MemObject>, crate::CortexError> {
+        // Default: fall back to full scan (overridden by SQLite for indexed query)
+        let all = self.list_by_tier(MemoryTier::Semantic, 10_000)?;
+        let entity_lower = entity.to_lowercase();
+        Ok(all.into_iter().filter(|m| {
+            match &m.content {
+                MemContent::Fact { subject, object, .. } => {
+                    subject.to_lowercase().contains(&entity_lower)
+                        || object.to_lowercase().contains(&entity_lower)
+                }
+                _ => false,
+            }
+        }).collect())
+    }
+
+    /// Query semantic preferences where key contains the pattern string.
+    fn query_preferences_by_key(&self, key_pattern: &str) -> Result<Vec<MemObject>, crate::CortexError> {
+        let all = self.list_by_tier(MemoryTier::Semantic, 10_000)?;
+        let pattern_lower = key_pattern.to_lowercase();
+        Ok(all.into_iter().filter(|m| {
+            match &m.content {
+                MemContent::Preference { key, .. } => {
+                    key.to_lowercase().contains(&pattern_lower)
+                }
+                _ => false,
+            }
+        }).collect())
     }
 
     // Bulk operations

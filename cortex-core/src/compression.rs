@@ -18,15 +18,29 @@ pub struct CompressionReport {
     pub summaries_created: usize,
 }
 
+/// External summarizer function type.
+/// Takes a list of texts and the original count, returns a summary string.
+/// Use this to plug in an LLM-based summarizer instead of extractive summarization.
+pub type SummarizerFn = Box<dyn Fn(&[String], usize) -> Result<String, CortexError> + Send + Sync>;
+
 /// Compression engine — reduces episodic bloat while preserving knowledge.
 pub struct CompressionEngine<'a> {
     storage: &'a dyn StorageBackend,
     index: &'a MemoryIndex,
+    /// Optional external summarizer (e.g., LLM-powered).
+    /// When set, replaces the built-in extractive summarizer.
+    summarizer: Option<&'a SummarizerFn>,
 }
 
 impl<'a> CompressionEngine<'a> {
     pub fn new(storage: &'a dyn StorageBackend, index: &'a MemoryIndex) -> Self {
-        Self { storage, index }
+        Self { storage, index, summarizer: None }
+    }
+
+    /// Use an external summarizer (e.g., LLM-powered) for compression.
+    pub fn with_summarizer(mut self, summarizer: &'a SummarizerFn) -> Self {
+        self.summarizer = Some(summarizer);
+        self
     }
 
     /// Find conversation sessions that are candidates for compression.
@@ -127,8 +141,12 @@ impl<'a> CompressionEngine<'a> {
             }
         }
 
-        // Create compressed summary
-        let summary = self.build_summary(&texts, session.memories.len());
+        // Create compressed summary (use external summarizer if available)
+        let summary = if let Some(summarizer) = self.summarizer {
+            (summarizer)(&texts, session.memories.len())?
+        } else {
+            self.build_summary(&texts, session.memories.len())
+        };
 
         let mut source = MemSource::new(&session.channel);
         source.identity_id = identity_id;
