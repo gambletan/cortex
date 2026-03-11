@@ -120,6 +120,24 @@ cortex.observe_belief("user_prefers_morning_meetings", false, 0.6)?;
 ### 存储
 SQLite 持久化，内存向量索引实现快速相似性搜索。单文件数据库，无需外部服务。为边缘部署设计——笔记本、树莓派、服务器都能运行。
 
+## 前置依赖
+
+安装 [Rust 工具链](https://rustup.rs/)（提供 `cargo` 命令）：
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+安装完成后，重启终端或手动加载环境：
+```bash
+source "$HOME/.cargo/env"
+```
+
+验证安装：
+```bash
+cargo --version
+```
+
 ## 快速开始
 
 ```rust
@@ -236,6 +254,7 @@ Cortex 作为 MCP 服务器发布，兼容所有 MCP 客户端。
 **1. 构建并安装：**
 
 ```bash
+mkdir -p ~/.local/bin ~/.cortex
 cargo build --release -p cortex-mcp-server
 cp target/release/cortex-mcp-server ~/.local/bin/
 ```
@@ -263,7 +282,16 @@ Claude Desktop — 添加到 `~/Library/Application Support/Claude/claude_deskto
 }
 ```
 
-**3. 在 CLAUDE.md 中启用自动记忆：**
+**3. 允许工具自动执行（免确认）：**
+
+在 `~/.claude/settings.json` → `permissions.allow` 中添加：
+```json
+"mcp__cortex__*"
+```
+
+> 注意：MCP 工具权限不支持括号格式（如 `mcp__cortex__memory_ingest(*)`），使用通配符 `mcp__cortex__*` 即可。
+
+**4. 在 CLAUDE.md 中启用自动记忆：**
 
 ```markdown
 # 记忆（Cortex）

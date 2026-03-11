@@ -104,6 +104,24 @@ Generates LLM-ready context strings from memory state. Pass a token budget, opti
 ### Storage
 SQLite for persistence, in-memory vector index for fast similarity search. Single-file database, no external services required. Designed for edge deployment -- runs on a laptop, a Raspberry Pi, or a server.
 
+## Prerequisites
+
+Install the [Rust toolchain](https://rustup.rs/) (provides `cargo`):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+After installation, either restart your terminal or run:
+```bash
+source "$HOME/.cargo/env"
+```
+
+Verify:
+```bash
+cargo --version
+```
+
 ## Quick Start
 
 ```rust
@@ -185,6 +203,7 @@ Cortex ships as an MCP server — works with any MCP-compatible client.
 **1. Build & install the binary:**
 
 ```bash
+mkdir -p ~/.local/bin ~/.cortex
 cargo build --release -p cortex-mcp-server
 cp target/release/cortex-mcp-server ~/.local/bin/
 ```
@@ -212,20 +231,14 @@ Claude Desktop — add to `~/Library/Application Support/Claude/claude_desktop_c
 }
 ```
 
-**3. Allow tools in "don't ask" mode** (if using `defaultMode: "dontAsk"`):
+**3. Allow tools in "don't ask" mode:**
 
 Add to `~/.claude/settings.json` → `permissions.allow`:
 ```json
-"mcp__cortex__memory_ingest",
-"mcp__cortex__memory_search",
-"mcp__cortex__memory_context",
-"mcp__cortex__memory_consolidate",
-"mcp__cortex__belief_observe",
-"mcp__cortex__belief_list",
-"mcp__cortex__person_resolve",
-"mcp__cortex__fact_add",
-"mcp__cortex__preference_set"
+"mcp__cortex__*"
 ```
+
+> Note: MCP tool permissions do not support parentheses format (e.g. `mcp__cortex__memory_ingest(*)`). Use the wildcard `mcp__cortex__*` instead.
 
 **4. Make it automatic** — add to your `CLAUDE.md` (project or global `~/.claude/CLAUDE.md`):
 
