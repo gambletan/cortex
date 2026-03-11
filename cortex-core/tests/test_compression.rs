@@ -33,9 +33,9 @@ fn test_find_compressible_sessions() {
     let (storage, index) = setup();
     let engine = CompressionEngine::new(&storage, &index);
 
-    // Insert 5 old messages (same channel, same day)
+    // Insert 5 old messages (same channel, same day — use fixed offset so they land on same date)
     for i in 0..5 {
-        insert_old_memory(&storage, &format!("message {}", i), "telegram", 48 + i);
+        insert_old_memory(&storage, &format!("message {}", i), "telegram", 72);
     }
 
     let sessions = engine

@@ -12,18 +12,42 @@ LLMs start blank every session. Your assistant forgets your name, your preferenc
 
 Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-term memory that persists across sessions, channels, and contexts — with Bayesian beliefs that self-correct, a people graph that resolves identities across platforms, and sub-millisecond performance on everything. All running locally, all yours.
 
-### Benchmarks
+### Cortex vs Mem0 vs OpenAI Memory
+
+| | Cortex | Mem0 | OpenAI Memory |
+|---|---|---|---|
+| **Privacy** | 100% local, zero cloud | Cloud API (your data on their servers) | OpenAI servers |
+| **Latency** | **62µs** ingest, **253µs** search | ~200-500ms | ~300-800ms |
+| **Cost** | Free, forever | $99+/mo (Pro) | ChatGPT Plus ($20/mo) |
+| **Memory tiers** | 4 (Working/Episodic/Semantic/Procedural) | 1 (flat) | 1 (flat) |
+| **Bayesian beliefs** | Self-correcting with evidence | No | No |
+| **People graph** | Cross-channel identity resolution | Paid tier only | No |
+| **Conversation compression** | Automatic session summarization | No | No |
+| **Relationship inference** | Pattern-based (EN + CN) | No | No |
+| **Temporal retrieval** | Intent-aware ("recently" / "first time") | No | No |
+| **Contradiction detection** | Automatic with confidence scores | No | No |
+| **Consolidation** | Episodic → Semantic auto-promotion | No | No |
+| **Context injection** | Token-budgeted LLM-ready output | Manual | Automatic but opaque |
+| **Import/Export** | Full JSON backup & restore | API only | No export |
+| **Self-hosted** | Native binary, Docker, MCP | Cloud only | Cloud only |
+| **Binary size** | 3.8 MB | npm package | N/A |
+| **Dependencies** | 0 runtime deps | Node.js + cloud | N/A |
+| **Open source** | MIT | Partial | No |
+| **Chinese NLP** | Native (inference, retrieval, relationships) | No | Limited |
+
+### Performance Benchmarks
 
 | Operation | Cortex | Mem0 (cloud) | File-based |
 |-----------|--------|-------------|------------|
-| Ingest | **7µs** | ~200ms | ~1ms |
-| Search (top-10) | **132µs** | ~300ms | ~10ms |
-| Context generation | **51µs** | ~500ms | manual |
-| Belief update | **27µs** | N/A | N/A |
-| People graph | **13µs** | paid tier | N/A |
-| 1K memories search | **1.2ms** | ~500ms | ~50ms |
+| Ingest | **62µs** | ~200ms | ~1ms |
+| Search (top-10) | **253µs** | ~300ms | ~10ms |
+| Context generation | **111µs** | ~500ms | manual |
+| Belief update | **28µs** | N/A | N/A |
+| People graph | **20µs** | paid tier | N/A |
+| Structured facts | **8µs** | N/A | N/A |
+| 1K memories search | **1.1ms** | ~500ms | ~50ms |
 
-**2,266x faster** than Mem0 cloud. With features neither Mem0 nor file-based systems offer.
+**1,182x faster** than Mem0 cloud. With features neither Mem0 nor OpenAI Memory offer.
 
 ## Architecture
 
@@ -256,7 +280,7 @@ Add to `~/.claude/settings.json`:
 
 Now every new Claude Code session automatically loads your memory context — **zero manual effort**. Claude learns as you work and remembers across sessions.
 
-### 9 Tools
+### 13 Tools
 
 | Tool | Purpose |
 |------|---------|
@@ -269,6 +293,10 @@ Now every new Claude Code session automatically loads your memory context — **
 | `fact_add` | Store structured knowledge (subject-predicate-object) |
 | `preference_set` | Store user preference with confidence |
 | `person_resolve` | Cross-channel identity resolution |
+| `memory_infer` | Preview inference without storing |
+| `contradiction_check` | Check for fact contradictions |
+| `memory_compress` | Compress old conversation sessions |
+| `relationship_extract` | Extract relationships from text |
 
 ## OpenClaw Plugin
 
@@ -362,8 +390,8 @@ curl -X POST http://localhost:3315/v1/import \
 - **v0.2** ✅ — Local embedding integration (all-MiniLM-L6-v2/ONNX), batch queries, importance-aware decay + auto-consolidation
 - **v0.3** ✅ — Proactive inference (auto-extract facts), temporal awareness, contradiction detection, Chinese NLP
 - **v0.4** ✅ — HTTP REST API (axum), import/export (JSON backup), Docker packaging
-- **v0.5** — Conversation compression, relationship inference, multi-modal memory
-- **v1.0** — Cross-device sync (CRDTs, no cloud), plugin system
+- **v0.5** ✅ — Conversation compression, relationship inference (EN + CN), temporal retrieval enhancement, 112 tests
+- **v1.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile support
 
 ## License
 

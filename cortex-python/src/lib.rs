@@ -23,29 +23,31 @@ impl PyCortex {
     }
 
     /// Ingest a new memory from any channel.
-    #[pyo3(signature = (text, channel, user_id=None, salience=None))]
+    #[pyo3(signature = (text, channel, user_id=None, salience=None, embedding=None))]
     fn ingest(
         &self,
         text: &str,
         channel: &str,
         user_id: Option<&str>,
         salience: Option<f32>,
+        embedding: Option<Vec<f32>>,
     ) -> PyResult<String> {
         let mem = self
             .inner
-            .ingest(text, channel, user_id, salience, None)
+            .ingest(text, channel, user_id, salience, embedding)
             .map_err(to_py_err)?;
         Ok(mem.id.to_string())
     }
 
     /// Multi-signal retrieval. Returns list of (memory_id, score, content_summary).
-    #[pyo3(signature = (query, limit, channel=None, person_id=None))]
+    #[pyo3(signature = (query, limit, channel=None, person_id=None, embedding=None))]
     fn retrieve(
         &self,
         query: &str,
         limit: usize,
         channel: Option<&str>,
         person_id: Option<&str>,
+        embedding: Option<Vec<f32>>,
     ) -> PyResult<Vec<(String, f32, String)>> {
         let pid = person_id
             .map(|s| uuid::Uuid::parse_str(s))
@@ -54,7 +56,7 @@ impl PyCortex {
 
         let results = self
             .inner
-            .retrieve(query, limit, channel, pid, None)
+            .retrieve(query, limit, channel, pid, embedding)
             .map_err(to_py_err)?;
 
         Ok(results
