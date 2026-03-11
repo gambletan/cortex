@@ -1,12 +1,31 @@
 {
-  "name": "@cortex-memory/openclaw-plugin",
+  "name": "@cortex-ai-memory/cortex-memory",
   "version": "0.1.0",
   "type": "module",
   "description": "Cortex persistent memory engine for OpenClaw — 4-tier architecture with Bayesian beliefs and people graph",
   "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/gambletan/cortex"
+    "url": "https://github.com/gambletan/cortex",
+    "directory": "openclaw-plugin"
   },
   "keywords": [
     "openclaw",
@@ -15,14 +34,28 @@
     "cortex",
     "long-term-memory",
     "bayesian",
-    "people-graph"
+    "people-graph",
+    "local-first",
+    "rust"
   ],
   "dependencies": {
     "@sinclair/typebox": "0.34.47"
   },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2025.0.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   }
 }
