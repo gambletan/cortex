@@ -8,7 +8,6 @@
 //! This runs locally using pattern matching and heuristics — no LLM calls.
 //! Designed to be fast enough to run on every ingest (<1ms).
 
-use crate::types::*;
 
 /// Extracted knowledge from a text input.
 #[derive(Debug, Clone, Default)]
@@ -192,7 +191,7 @@ fn extract_preferences(text: &str, lower: &str, knowledge: &mut InferredKnowledg
 // ── Fact extraction ──────────────────────────────────────────────────────────
 
 /// Patterns: "I live in X", "I work at X", "I am a X", "my name is X"
-fn extract_facts(text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
+fn extract_facts(_text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
     // Location: "I live in X", "I'm based in X", "I'm from X"
     for (pattern, predicate) in &[
         ("i live in ", "lives_in"),

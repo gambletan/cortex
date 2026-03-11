@@ -7,7 +7,7 @@ Native Python binding for [Cortex](https://github.com/gambletan/cortex) — a Ru
 ## Install
 
 ```bash
-pip install cortex-memory
+pip install cortex-ai-memory
 ```
 
 ## Quick Start

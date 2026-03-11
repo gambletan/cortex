@@ -391,8 +391,10 @@ curl -X POST http://localhost:3315/v1/import \
 - **v0.3** ✅ — Proactive inference (auto-extract facts), temporal awareness, contradiction detection, Chinese NLP
 - **v0.4** ✅ — HTTP REST API (axum), import/export (JSON backup), Docker packaging
 - **v0.5** ✅ — Conversation compression, relationship inference (EN + CN), temporal retrieval enhancement, 112 tests
-- **v1.1** — HNSW vector index (sub-ms search at 100K+ memories), built-in embeddings (zero external deps)
-- **v1.2** — Python SDK on PyPI (`pip install cortex-memory`), TypeScript SDK
+- **v1.0** ✅ — Feature comparison table, benchmark update, 18-feature Cortex vs Mem0 vs OpenAI
+- **v1.1** ✅ — HNSW vector index (50K search: 12ms → 91µs), Python SDK (`pip install cortex-ai-memory`)
+- **v1.2** ✅ — Negation detection (EN + CN), multi-hop retrieval, 117 tests
+- **v1.3** — Context quality optimization, query expansion, bidirectional relationships
 - **v2.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile (iOS/Android)
 
 ## License

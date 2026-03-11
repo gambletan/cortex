@@ -310,8 +310,10 @@ cortex/
 - **v0.3** ✅ — 主动推理（自动提取事实），时间感知，矛盾检测，中文 NLP
 - **v0.4** ✅ — HTTP REST API（axum），导入/导出（JSON 备份），Docker 打包
 - **v0.5** ✅ — 对话压缩，关系推理（中英双语），时间检索增强，112 个测试
-- **v1.1** — HNSW 向量索引（10万+记忆亚毫秒搜索），内置 Embedding（零外部依赖）
-- **v1.2** — Python SDK 发布 PyPI（`pip install cortex-memory`），TypeScript SDK
+- **v1.0** ✅ — 功能对比表，性能基准更新，18 项 Cortex vs Mem0 vs OpenAI 对比
+- **v1.1** ✅ — HNSW 向量索引（5万条搜索：12ms → 91µs），Python SDK（`pip install cortex-ai-memory`）
+- **v1.2** ✅ — 否定检测（中英双语），多跳检索，117 个测试
+- **v1.3** — 上下文质量优化，查询扩展，双向关系推理
 - **v2.0** — 跨设备同步（CRDT，无需云端），插件系统，移动端（iOS/Android）
 
 ## 许可证

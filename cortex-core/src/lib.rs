@@ -102,7 +102,7 @@ impl Cortex {
 
     /// Auto-generate embedding if embedder is available and none provided.
     /// Lazily initializes the embedding model on first call.
-    fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
+    fn auto_embed(&self, _text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
         if embedding.is_some() {
             return embedding;
         }
