@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
@@ -106,10 +106,13 @@ impl<'a> RetrievalEngine<'a> {
         self
     }
 
-    /// Main retrieval: multi-signal ranked search with multi-hop expansion.
+    /// Main retrieval: multi-signal ranked search with query expansion and multi-hop.
     pub fn retrieve(&self, query: &RetrievalQuery) -> Result<Vec<RetrievalResult>, CortexError> {
         // Detect if query has temporal intent (adjusts scoring strategy)
         let temporal_intent = detect_temporal_intent(&query.text);
+
+        // Query expansion: find related entities from semantic store
+        let expanded_entities = self.expand_query(&query.text)?;
 
         // Gather candidates from vector similarity (if embedding provided)
         let mut candidate_ids: Vec<(Uuid, f32)> = Vec::new();
@@ -129,6 +132,16 @@ impl<'a> RetrievalEngine<'a> {
 
             for mem in recent.iter().chain(semantic.iter()) {
                 candidate_ids.push((mem.id, 0.5)); // neutral similarity
+            }
+        }
+
+        // Query expansion: pull in memories matching expanded entities
+        if !expanded_entities.is_empty() {
+            let expansion_ids = self.get_expansion_candidates(&expanded_entities, query.limit)?;
+            for (id, score) in expansion_ids {
+                if !candidate_ids.iter().any(|(cid, _)| *cid == id) {
+                    candidate_ids.push((id, score));
+                }
             }
         }
 
@@ -189,6 +202,85 @@ impl<'a> RetrievalEngine<'a> {
         // Sort by score descending
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(query.limit);
+
+        Ok(results)
+    }
+
+    /// Query expansion: extract entities from the query text and look up related
+    /// entities from the semantic store. E.g., querying "Alice" also finds facts
+    /// where Alice is subject/object, then returns related entities (her company, etc.)
+    fn expand_query(&self, query_text: &str) -> Result<HashSet<String>, CortexError> {
+        let mut expanded = HashSet::new();
+        let query_lower = query_text.to_lowercase();
+
+        // Extract entity-like tokens from the query (capitalized words, Chinese names)
+        let query_entities = extract_query_entities(query_text);
+        if query_entities.is_empty() {
+            return Ok(expanded);
+        }
+
+        // Look up semantic facts mentioning these entities
+        let semantic_mems = self.storage.list_by_tier(MemoryTier::Semantic, 10_000)?;
+        for mem in &semantic_mems {
+            match &mem.content {
+                MemContent::Fact { subject, predicate, object } => {
+                    let subj_lower = subject.to_lowercase();
+                    let obj_lower = object.to_lowercase();
+                    for entity in &query_entities {
+                        let entity_lower = entity.to_lowercase();
+                        if subj_lower.contains(&entity_lower) {
+                            // Entity is subject → expand with object
+                            expanded.insert(object.clone());
+                            expanded.insert(predicate.clone());
+                        } else if obj_lower.contains(&entity_lower) {
+                            // Entity is object → expand with subject
+                            expanded.insert(subject.clone());
+                            expanded.insert(predicate.clone());
+                        }
+                    }
+                }
+                MemContent::Preference { key, value, .. } => {
+                    // If query mentions a preference key/value, expand
+                    if query_lower.contains(&key.to_lowercase())
+                        || query_lower.contains(&value.to_lowercase())
+                    {
+                        expanded.insert(key.clone());
+                        expanded.insert(value.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Don't expand with common/generic terms
+        expanded.retain(|e| e.len() > 1 && e != "User");
+
+        Ok(expanded)
+    }
+
+    /// Pull in episodic memories that mention any of the expanded entities.
+    fn get_expansion_candidates(
+        &self,
+        entities: &HashSet<String>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, f32)>, CortexError> {
+        let mut results: Vec<(Uuid, f32)> = Vec::new();
+        let episodic = self.storage.list_by_tier(MemoryTier::Episodic, limit * 3)?;
+
+        for mem in &episodic {
+            if let MemContent::Text(ref text) = mem.content {
+                let text_lower = text.to_lowercase();
+                for entity in entities {
+                    if text_lower.contains(&entity.to_lowercase()) {
+                        results.push((mem.id, 0.30)); // expansion score
+                        break;
+                    }
+                }
+            }
+            if results.len() >= limit {
+                break;
+            }
+        }
 
         Ok(results)
     }
@@ -364,6 +456,77 @@ pub enum TemporalIntent {
     Sequence,
 }
 
+/// Extract entity-like tokens from query text for query expansion.
+/// Finds capitalized words (English names) and Chinese name-like sequences.
+fn extract_query_entities(text: &str) -> Vec<String> {
+    let mut entities = Vec::new();
+
+    // English: collect sequences of capitalized words (proper nouns)
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
+        if !word.is_empty() && word.chars().next().map_or(false, |c| c.is_uppercase()) {
+            // Start of a capitalized sequence
+            let mut name_parts = vec![word.to_string()];
+            let mut j = i + 1;
+            while j < words.len() {
+                let next = words[j].trim_matches(|c: char| !c.is_alphanumeric());
+                if !next.is_empty() && next.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    name_parts.push(next.to_string());
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let name = name_parts.join(" ");
+            // Skip common English words that happen to start sentences
+            let skip = [
+                "I", "The", "A", "An", "What", "Where", "When", "Who", "How",
+                "Tell", "Do", "Does", "Is", "Are", "Was", "Were", "Can", "Could",
+                "Will", "Would", "Should", "My", "Your", "His", "Her", "Their",
+            ];
+            if !skip.contains(&name.as_str()) {
+                entities.push(name);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Chinese: extract 2-4 character sequences that look like names
+    // (Between known markers like 关于/about, 的/possessive)
+    let zh_markers = ["关于", "about "];
+    for marker in &zh_markers {
+        if let Some(pos) = text.find(marker) {
+            let after = &text[pos + marker.len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !"的了吗呢吧？！，。".contains(*c))
+                .collect();
+            if name.chars().count() >= 2 && name.chars().count() <= 6 {
+                entities.push(name);
+            }
+        }
+    }
+
+    // Also extract standalone query words that are long enough to be meaningful
+    let lower = text.to_lowercase();
+    for word in lower.split_whitespace() {
+        let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+        if clean.len() >= 4
+            && !["what", "where", "when", "about", "know", "tell", "does", "have"]
+                .contains(&clean.as_str())
+            && !entities.iter().any(|e| e.to_lowercase() == clean)
+        {
+            entities.push(clean);
+        }
+    }
+
+    entities
+}
+
 /// Detect temporal intent from query text.
 /// Supports English and Chinese temporal keywords.
 fn detect_temporal_intent(query: &str) -> TemporalIntent {
@@ -482,5 +645,30 @@ mod tests {
             detect_temporal_intent("Tell me about Alice"),
             TemporalIntent::None
         );
+    }
+
+    #[test]
+    fn test_extract_query_entities_english() {
+        let entities = extract_query_entities("What do I know about Alice?");
+        assert!(entities.iter().any(|e| e == "Alice"), "Should extract Alice: {:?}", entities);
+    }
+
+    #[test]
+    fn test_extract_query_entities_full_name() {
+        let entities = extract_query_entities("Tell me about Alice Smith");
+        assert!(entities.iter().any(|e| e == "Alice Smith"), "Should extract full name: {:?}", entities);
+    }
+
+    #[test]
+    fn test_extract_query_entities_chinese() {
+        let entities = extract_query_entities("关于张三的信息");
+        assert!(entities.iter().any(|e| e == "张三"), "Should extract Chinese name: {:?}", entities);
+    }
+
+    #[test]
+    fn test_extract_query_entities_skip_common() {
+        let entities = extract_query_entities("What is the weather?");
+        // "What" should be skipped
+        assert!(!entities.iter().any(|e| e == "What"), "Should skip common words: {:?}", entities);
     }
 }

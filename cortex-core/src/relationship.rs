@@ -20,6 +20,54 @@ pub fn extract_relationships(text: &str) -> Vec<InferredRelationship> {
     results
 }
 
+/// Get the inverse of a relationship type, if one exists.
+/// Symmetric relations (friend_of, colleague_of, etc.) map to themselves.
+/// Asymmetric relations map to their counterpart (manages ↔ reports_to).
+pub fn inverse_relation(relation: &str) -> Option<&'static str> {
+    match relation {
+        // Symmetric — inverse is the same
+        "colleague_of" => Some("colleague_of"),
+        "friend_of" => Some("friend_of"),
+        "spouse_of" => Some("spouse_of"),
+        "sibling_of" => Some("sibling_of"),
+        "partner_of" => Some("partner_of"),
+        "roommate_of" => Some("roommate_of"),
+        "classmate_of" => Some("classmate_of"),
+        "teammate_of" => Some("teammate_of"),
+        "neighbor_of" => Some("neighbor_of"),
+        "lives_with" => Some("lives_with"),
+        "dating" => Some("dating"),
+        // Asymmetric — inverse is the counterpart
+        "manages" => Some("reports_to"),
+        "reports_to" => Some("manages"),
+        "mentors" => Some("mentored_by"),
+        "mentored_by" => Some("mentors"),
+        "teaches" => Some("taught_by"),
+        "taught_by" => Some("teaches"),
+        "parent_of" => Some("child_of"),
+        "child_of" => Some("parent_of"),
+        _ => None,
+    }
+}
+
+/// Generate bidirectional relationships: for each relationship, also produce its inverse.
+/// E.g., "Alice manages Bob" → also yields "Bob reports_to Alice".
+pub fn with_inverses(relationships: &[InferredRelationship]) -> Vec<InferredRelationship> {
+    let mut result = Vec::with_capacity(relationships.len() * 2);
+    for rel in relationships {
+        result.push(rel.clone());
+        if let Some(inv) = inverse_relation(&rel.relation) {
+            result.push(InferredRelationship {
+                person_a: rel.person_b.clone(),
+                person_b: rel.person_a.clone(),
+                relation: inv.to_string(),
+                confidence: rel.confidence,
+            });
+        }
+    }
+    result
+}
+
 // ── English patterns ─────────────────────────────────────────────────────────
 
 fn extract_english_relationships(text: &str, results: &mut Vec<InferredRelationship>) {
@@ -381,5 +429,55 @@ mod tests {
     fn test_no_relationship() {
         let rels = extract_relationships("The weather is nice today");
         assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn test_inverse_symmetric() {
+        assert_eq!(inverse_relation("friend_of"), Some("friend_of"));
+        assert_eq!(inverse_relation("colleague_of"), Some("colleague_of"));
+        assert_eq!(inverse_relation("spouse_of"), Some("spouse_of"));
+    }
+
+    #[test]
+    fn test_inverse_asymmetric() {
+        assert_eq!(inverse_relation("manages"), Some("reports_to"));
+        assert_eq!(inverse_relation("reports_to"), Some("manages"));
+        assert_eq!(inverse_relation("parent_of"), Some("child_of"));
+        assert_eq!(inverse_relation("child_of"), Some("parent_of"));
+        assert_eq!(inverse_relation("teaches"), Some("taught_by"));
+        assert_eq!(inverse_relation("taught_by"), Some("teaches"));
+    }
+
+    #[test]
+    fn test_inverse_unknown() {
+        assert_eq!(inverse_relation("unknown_relation"), None);
+    }
+
+    #[test]
+    fn test_with_inverses_symmetric() {
+        let rels = extract_relationships("Alice and Bob are friends");
+        let bidirectional = with_inverses(&rels);
+        assert_eq!(bidirectional.len(), 2);
+        assert_eq!(bidirectional[0].person_a, "Alice");
+        assert_eq!(bidirectional[0].person_b, "Bob");
+        assert_eq!(bidirectional[1].person_a, "Bob");
+        assert_eq!(bidirectional[1].person_b, "Alice");
+        assert_eq!(bidirectional[1].relation, "friend_of");
+    }
+
+    #[test]
+    fn test_with_inverses_asymmetric() {
+        let rels = vec![InferredRelationship {
+            person_a: "Alice".to_string(),
+            person_b: "Bob".to_string(),
+            relation: "manages".to_string(),
+            confidence: 0.8,
+        }];
+        let bidirectional = with_inverses(&rels);
+        assert_eq!(bidirectional.len(), 2);
+        assert_eq!(bidirectional[0].relation, "manages");
+        assert_eq!(bidirectional[1].person_a, "Bob");
+        assert_eq!(bidirectional[1].person_b, "Alice");
+        assert_eq!(bidirectional[1].relation, "reports_to");
     }
 }

@@ -58,90 +58,149 @@ impl ContextConfig {
     }
 }
 
+/// A prioritized context section with its items sorted by salience.
+struct ContextSection {
+    header: String,
+    /// (salience_score, formatted_line)
+    items: Vec<(f32, String)>,
+    /// Budget weight — higher means more chars allocated proportionally.
+    weight: f32,
+    /// If true, preserve insertion order instead of sorting by salience.
+    preserve_order: bool,
+}
+
+impl ContextSection {
+    fn new(header: impl Into<String>, weight: f32) -> Self {
+        Self {
+            header: header.into(),
+            items: Vec::new(),
+            weight,
+            preserve_order: false,
+        }
+    }
+
+    fn ordered(header: impl Into<String>, weight: f32) -> Self {
+        Self {
+            header: header.into(),
+            items: Vec::new(),
+            weight,
+            preserve_order: true,
+        }
+    }
+
+    fn push(&mut self, salience: f32, line: String) {
+        self.items.push((salience, line));
+    }
+
+    /// Sort items by salience descending (unless preserve_order is set),
+    /// deduplicate near-identical lines, then render up to `char_budget` chars.
+    fn render(&mut self, char_budget: usize) -> Option<String> {
+        if self.items.is_empty() {
+            return None;
+        }
+        // Sort by salience descending — most important first (unless time-ordered)
+        if !self.preserve_order {
+            self.items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Deduplicate: skip items whose normalized text closely matches an already-included item.
+        // This prevents "User lives_in Shanghai" appearing twice from different sources.
+        let mut out = self.header.clone();
+        let mut used = out.len();
+        let mut seen: Vec<String> = Vec::new();
+
+        for (_, line) in &self.items {
+            if used + line.len() > char_budget {
+                break;
+            }
+            let normalized = normalize_for_dedup(line);
+            if seen.iter().any(|s| is_near_duplicate(s, &normalized)) {
+                continue;
+            }
+            seen.push(normalized);
+            out.push_str(line);
+            used += line.len();
+        }
+        if out.len() > self.header.len() {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
 /// Generate LLM-ready context from Cortex memory state.
+/// Sections are budget-allocated by priority weight; items within each section
+/// are sorted by salience descending so the most important info always appears.
 pub fn generate_context(
     config: &ContextConfig,
     storage: &dyn StorageBackend,
     index: &MemoryIndex,
 ) -> Result<String, CortexError> {
-    let mut sections: Vec<String> = Vec::new();
-    let token_budget = config.max_tokens;
+    let chars_budget = config.max_tokens * 4; // ~1 token ≈ 4 chars
+    let header = "[Cortex Memory Context]";
+    let header_len = header.len();
+    let available = chars_budget.saturating_sub(header_len);
 
-    // Rough estimate: 1 token ~= 4 characters
-    let chars_budget = token_budget * 4;
+    let mut sections: Vec<ContextSection> = Vec::new();
 
-    sections.push("[Cortex Memory Context]".to_string());
-
-    // User preferences
+    // ── User preferences (weight 25%) ───────────────────────────────────
     if config.include_preferences {
         let semantic = SemanticStore::new(storage, index);
         let prefs = semantic.query_preferences("")?;
         if !prefs.is_empty() {
-            let mut pref_section = String::from("\n## User Profile\n");
-            for mem in prefs.iter().take(10) {
-                if let MemContent::Preference {
-                    key,
-                    value,
-                    confidence,
-                } = &mem.content
-                {
+            let mut sec = ContextSection::new("\n## User Profile\n", 25.0);
+            for mem in &prefs {
+                if let MemContent::Preference { key, value, confidence } = &mem.content {
                     let line = format!("- {} = {} (confidence: {:.0}%)\n", key, value, confidence * 100.0);
-                    pref_section.push_str(&line);
+                    sec.push(mem.salience.base_score, line);
                 }
             }
-            sections.push(pref_section);
+            sections.push(sec);
         }
     }
 
-    // Semantic facts (structured knowledge) — reuse the list already fetched for preferences
+    // ── Semantic facts (weight 25%) ─────────────────────────────────────
     if config.include_preferences {
         let semantic = SemanticStore::new(storage, index);
         let facts = semantic.query_facts("")?;
         if !facts.is_empty() {
-            let mut fact_section = String::from("\n## Known Facts\n");
-            for mem in facts.iter().take(15) {
+            let mut sec = ContextSection::new("\n## Known Facts\n", 25.0);
+            for mem in &facts {
                 if let MemContent::Fact { subject, predicate, object } = &mem.content {
-                    fact_section.push_str(&format!("- {} {} {} (confidence: {:.0}%)\n",
-                        subject, predicate, object, mem.salience.base_score * 100.0));
+                    let line = format!("- {} {} {} (confidence: {:.0}%)\n",
+                        subject, predicate, object, mem.salience.base_score * 100.0);
+                    sec.push(mem.salience.base_score, line);
                 }
             }
-            sections.push(fact_section);
+            sections.push(sec);
         }
     }
 
-    // Current conversation partner
+    // ── Conversation partner (weight 10%) ───────────────────────────────
     if let Some(person_id) = config.person_id {
         if config.include_people {
             let people = PeopleGraph::new(storage);
             if let Ok(ctx) = people.get_context(person_id) {
-                let mut person_section = String::from("\n## Current Conversation Partner\n");
-                person_section.push_str(&format!("- Name: {}\n", ctx.person.display_name));
+                let mut sec = ContextSection::new("\n## Current Conversation Partner\n", 10.0);
+                sec.push(1.0, format!("- Name: {}\n", ctx.person.display_name));
                 if !ctx.person.relationship_to_user.is_empty() {
-                    person_section.push_str(&format!(
-                        "- Relationship: {}\n",
-                        ctx.person.relationship_to_user
-                    ));
+                    sec.push(0.9, format!("- Relationship: {}\n", ctx.person.relationship_to_user));
                 }
-                person_section.push_str(&format!(
-                    "- Interactions: {}\n",
-                    ctx.person.interaction_count
-                ));
+                sec.push(0.5, format!("- Interactions: {}\n", ctx.person.interaction_count));
                 if !ctx.person.tags.is_empty() {
-                    person_section.push_str(&format!("- Tags: {}\n", ctx.person.tags.join(", ")));
+                    sec.push(0.4, format!("- Tags: {}\n", ctx.person.tags.join(", ")));
                 }
-                if !ctx.related_memories.is_empty() {
-                    person_section.push_str("- Recent shared context:\n");
-                    for mem in ctx.related_memories.iter().take(3) {
-                        let summary = summarize_content(&mem.content);
-                        person_section.push_str(&format!("  - {}\n", summary));
-                    }
+                for mem in ctx.related_memories.iter().take(3) {
+                    let summary = summarize_content(&mem.content);
+                    sec.push(mem.salience.base_score, format!("  - {}\n", summary));
                 }
-                sections.push(person_section);
+                sections.push(sec);
             }
         }
     }
 
-    // Recent episodes
+    // ── Recent episodes (weight 20%) ────────────────────────────────────
     if config.include_recent_episodes > 0 {
         let recent = if let Some(ref ch) = config.channel {
             storage.list_by_channel(ch, config.include_recent_episodes)?
@@ -153,63 +212,88 @@ pub fn generate_context(
         };
 
         if !recent.is_empty() {
-            let mut episode_section = String::from("\n## Recent Context\n");
+            let mut sec = ContextSection::ordered("\n## Recent Context\n", 20.0);
             for mem in &recent {
                 let summary = summarize_content(&mem.content);
-                let time = mem
-                    .temporal
-                    .event_time
-                    .unwrap_or(mem.temporal.ingestion_time);
-                episode_section.push_str(&format!(
-                    "- [{}] {}\n",
-                    time.format("%Y-%m-%d %H:%M"),
-                    summary
-                ));
+                let time = mem.temporal.event_time.unwrap_or(mem.temporal.ingestion_time);
+                let line = format!("- [{}] {}\n", time.format("%Y-%m-%d %H:%M"), summary);
+                sec.push(mem.salience.base_score, line);
             }
-            sections.push(episode_section);
+            sections.push(sec);
         }
     }
 
-    // Active patterns
+    // ── Active patterns (weight 10%) ────────────────────────────────────
     if config.include_patterns {
         let proc_store = ProceduralStore::new(storage);
         let patterns = proc_store.detect_patterns(3)?;
         if !patterns.is_empty() {
-            let mut pattern_section = String::from("\n## Active Patterns\n");
+            let mut sec = ContextSection::new("\n## Active Patterns\n", 10.0);
             for p in patterns.iter().take(5) {
-                pattern_section.push_str(&format!(
-                    "- When \"{}\": {} (seen {}x)\n",
-                    p.trigger,
-                    p.actions.join(", "),
-                    p.frequency
-                ));
+                let line = format!("- When \"{}\": {} (seen {}x)\n",
+                    p.trigger, p.actions.join(", "), p.frequency);
+                sec.push(p.frequency as f32 / 100.0, line);
             }
-            sections.push(pattern_section);
+            sections.push(sec);
         }
     }
 
-    // Confident beliefs
+    // ── Beliefs (weight 10%) ────────────────────────────────────────────
     let belief_engine = BeliefEngine::new(storage);
     let beliefs = belief_engine.get_confident_beliefs(0.8)?;
     if !beliefs.is_empty() {
-        let mut belief_section = String::from("\n## Beliefs\n");
-        for b in beliefs.iter().take(5) {
+        let mut sec = ContextSection::new("\n## Beliefs\n", 10.0);
+        for b in &beliefs {
             let direction = if b.probability > 0.5 { "likely" } else { "unlikely" };
-            belief_section.push_str(&format!(
-                "- {} ({}, {:.0}%)\n",
-                b.key,
-                direction,
-                b.probability * 100.0
-            ));
+            let line = format!("- {} ({}, {:.0}%)\n", b.key, direction, b.probability * 100.0);
+            // Use deviation from 0.5 as salience — stronger beliefs rank higher
+            let strength = (b.probability - 0.5).abs() * 2.0;
+            sec.push(strength, line);
         }
-        sections.push(belief_section);
+        sections.push(sec);
     }
 
-    // Join and truncate to budget
-    let mut result = sections.join("");
+    // ── Budget allocation & rendering ───────────────────────────────────
+    // Two-pass: first pass allocates proportionally, second pass redistributes
+    // unused budget to sections that could use more.
+    let total_weight: f32 = sections.iter().map(|s| s.weight).sum();
+    let mut result = String::from(header);
+
+    if total_weight > 0.0 {
+        // Pass 1: render each section with its proportional budget
+        let mut rendered: Vec<Option<String>> = Vec::new();
+        let mut leftover: usize = 0;
+
+        for sec in &mut sections {
+            let sec_budget = ((sec.weight / total_weight) * available as f32) as usize;
+            let r = sec.render(sec_budget);
+            let used = r.as_ref().map(|s| s.len()).unwrap_or(0);
+            leftover += sec_budget.saturating_sub(used);
+            rendered.push(r);
+        }
+
+        // Pass 2: if there's leftover, re-render sections that were budget-constrained
+        if leftover > 100 {
+            let bonus_per = leftover / sections.len().max(1);
+            for (i, sec) in sections.iter_mut().enumerate() {
+                let original_budget = ((sec.weight / total_weight) * available as f32) as usize;
+                let expanded = sec.render(original_budget + bonus_per);
+                if let Some(ref exp) = expanded {
+                    if exp.len() > rendered[i].as_ref().map(|s| s.len()).unwrap_or(0) {
+                        rendered[i] = expanded;
+                    }
+                }
+            }
+        }
+
+        for r in rendered.into_iter().flatten() {
+            result.push_str(&r);
+        }
+    }
+
+    // Safety truncation (shouldn't normally trigger)
     if result.len() > chars_budget {
         result.truncate(chars_budget);
-        // Find the last newline to avoid cutting mid-line
         if let Some(pos) = result.rfind('\n') {
             result.truncate(pos + 1);
         }
@@ -250,4 +334,31 @@ fn summarize_content(content: &MemContent) -> String {
             format!("Event: {} at {}", title, start.format("%Y-%m-%d %H:%M"))
         }
     }
+}
+
+/// Normalize a line for deduplication: lowercase, strip punctuation/numbers/whitespace.
+fn normalize_for_dedup(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Two normalized strings are near-duplicates if they share >80% of their words.
+/// Only triggers when both strings have at least 3 words to avoid short-string false positives.
+fn is_near_duplicate(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_words: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let b_words: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    if a_words.len() < 3 || b_words.len() < 3 {
+        return false;
+    }
+    let overlap = a_words.intersection(&b_words).count();
+    let min_len = a_words.len().min(b_words.len());
+    overlap as f32 / min_len as f32 > 0.8
 }

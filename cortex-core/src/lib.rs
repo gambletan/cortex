@@ -102,7 +102,8 @@ impl Cortex {
 
     /// Auto-generate embedding if embedder is available and none provided.
     /// Lazily initializes the embedding model on first call.
-    fn auto_embed(&self, _text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
+    #[allow(unused_variables)]
+    fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
         if embedding.is_some() {
             return embedding;
         }
@@ -222,9 +223,10 @@ impl Cortex {
             let _ = semantic.add_preference(&pref.key, &pref.value, pref.confidence);
         }
 
-        // ── Auto-extract relationships ──────────────────────────────────
+        // ── Auto-extract relationships (bidirectional) ─────────────────
         let relationships = relationship::extract_relationships(text);
-        for rel in &relationships {
+        let bidirectional = relationship::with_inverses(&relationships);
+        for rel in &bidirectional {
             let _ = semantic.add_fact(
                 &rel.person_a,
                 &rel.relation,
