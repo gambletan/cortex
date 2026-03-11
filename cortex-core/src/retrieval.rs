@@ -106,7 +106,7 @@ impl<'a> RetrievalEngine<'a> {
         self
     }
 
-    /// Main retrieval: multi-signal ranked search.
+    /// Main retrieval: multi-signal ranked search with multi-hop expansion.
     pub fn retrieve(&self, query: &RetrievalQuery) -> Result<Vec<RetrievalResult>, CortexError> {
         // Detect if query has temporal intent (adjusts scoring strategy)
         let temporal_intent = detect_temporal_intent(&query.text);
@@ -139,6 +139,14 @@ impl<'a> RetrievalEngine<'a> {
                 if !candidate_ids.iter().any(|(id, _)| *id == mem.id) {
                     candidate_ids.push((mem.id, 0.3)); // lower base similarity
                 }
+            }
+        }
+
+        // Multi-hop expansion: extract entities from top candidates and pull related facts
+        let hop_ids = self.multi_hop_expand(&candidate_ids, query.limit)?;
+        for (id, score) in hop_ids {
+            if !candidate_ids.iter().any(|(cid, _)| *cid == id) {
+                candidate_ids.push((id, score));
             }
         }
 
@@ -183,6 +191,59 @@ impl<'a> RetrievalEngine<'a> {
         results.truncate(query.limit);
 
         Ok(results)
+    }
+
+    /// Multi-hop expansion: look at top initial candidates, extract entities
+    /// (subjects/objects from facts), and pull in related semantic memories.
+    fn multi_hop_expand(
+        &self,
+        candidates: &[(Uuid, f32)],
+        limit: usize,
+    ) -> Result<Vec<(Uuid, f32)>, CortexError> {
+        // Only expand from top-5 candidates to keep it fast
+        let top_n = candidates.len().min(5);
+        let top_ids: Vec<Uuid> = candidates[..top_n].iter().map(|(id, _)| *id).collect();
+        let top_mems = self.storage.get_memories_batch(&top_ids)?;
+
+        // Extract entity names from facts in top candidates
+        let mut entities: Vec<String> = Vec::new();
+        for mem in &top_mems {
+            match &mem.content {
+                MemContent::Fact { subject, object, .. } => {
+                    if subject != "User" && !entities.contains(subject) {
+                        entities.push(subject.clone());
+                    }
+                    if !entities.contains(object) {
+                        entities.push(object.clone());
+                    }
+                }
+                MemContent::Relationship { person_a, person_b, .. } => {
+                    // person_a/person_b are UUIDs, skip for now
+                    let _ = (person_a, person_b);
+                }
+                _ => {}
+            }
+        }
+
+        // Query semantic store for facts mentioning these entities
+        let mut expanded: Vec<(Uuid, f32)> = Vec::new();
+        let semantic_mems = self.storage.list_by_tier(MemoryTier::Semantic, limit * 3)?;
+
+        for mem in &semantic_mems {
+            if let MemContent::Fact { subject, object, .. } = &mem.content {
+                for entity in &entities {
+                    let entity_lower = entity.to_lowercase();
+                    if subject.to_lowercase().contains(&entity_lower)
+                        || object.to_lowercase().contains(&entity_lower)
+                    {
+                        expanded.push((mem.id, 0.25)); // lower score for hop-2 results
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(expanded)
     }
 
     /// Get time-ordered candidates for temporal queries.

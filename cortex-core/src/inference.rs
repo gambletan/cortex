@@ -57,18 +57,49 @@ pub fn extract(text: &str) -> InferredKnowledge {
     let mut knowledge = InferredKnowledge::default();
     let lower = text.to_lowercase();
 
-    // English extraction
-    extract_preferences(text, &lower, &mut knowledge);
-    extract_facts(text, &lower, &mut knowledge);
+    // Skip extraction if the sentence is negated
+    if !is_negated(&lower, text) {
+        // English extraction
+        extract_preferences(text, &lower, &mut knowledge);
+        extract_facts(text, &lower, &mut knowledge);
 
-    // Chinese extraction
-    extract_chinese_facts(text, &mut knowledge);
-    extract_chinese_preferences(text, &mut knowledge);
+        // Chinese extraction
+        extract_chinese_facts(text, &mut knowledge);
+        extract_chinese_preferences(text, &mut knowledge);
+    }
 
-    // Determine temporal hint (both languages)
+    // Determine temporal hint (both languages) — always run
     knowledge.temporal_hint = classify_temporal_multilingual(text, &lower);
 
     knowledge
+}
+
+/// Detect if the text contains negation that should suppress extraction.
+/// "I don't like X" → true, "I don't think it will rain" → true
+/// "I live in X" → false
+fn is_negated(lower: &str, text: &str) -> bool {
+    let en_negations = [
+        "i don't ", "i do not ", "i'm not ", "i am not ",
+        "i never ", "i can't ", "i cannot ", "i won't ",
+        "i didn't ", "i did not ", "i haven't ", "i have not ",
+        "i wouldn't ", "i would not ",
+    ];
+    let zh_negations = [
+        "我不", "我没有", "我没", "我不会", "我从不",
+        "我不是", "我不在", "我不喜欢", "我不想",
+    ];
+
+    for neg in &en_negations {
+        if lower.starts_with(neg) {
+            return true;
+        }
+    }
+    for neg in &zh_negations {
+        if text.starts_with(neg) {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Preference extraction ────────────────────────────────────────────────────
@@ -680,6 +711,26 @@ mod tests {
         let k = extract("I use neovim for editing");
         assert!(!k.preferences.is_empty());
         assert!(k.preferences[0].key.contains("tool_for"));
+    }
+
+    #[test]
+    fn test_negation_english() {
+        let k = extract("I don't like spicy food");
+        assert!(k.preferences.is_empty(), "Negated preference should not be extracted");
+    }
+
+    #[test]
+    fn test_negation_chinese() {
+        let k = extract("我不喜欢辣的");
+        assert!(k.preferences.is_empty(), "Chinese negation should suppress extraction");
+    }
+
+    #[test]
+    fn test_negation_doesnt_block_temporal() {
+        let k = extract("I don't live here right now");
+        // Facts should be empty (negated), but temporal hint should still work
+        assert!(k.facts.is_empty());
+        assert_eq!(k.temporal_hint, TemporalHint::Temporary);
     }
 
     // ── Chinese tests ────────────────────────────────────────────────────
