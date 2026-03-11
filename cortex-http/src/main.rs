@@ -87,6 +87,9 @@ async fn main() {
         // Import/Export
         .route("/v1/export", get(handlers::export_all))
         .route("/v1/import", post(handlers::import_all))
+        // Phase 5: Compression & Relationships
+        .route("/v1/memories/compress", post(handlers::compress))
+        .route("/v1/relationships/extract", post(handlers::extract_relationships))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()

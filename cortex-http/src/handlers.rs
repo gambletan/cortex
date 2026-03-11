@@ -477,3 +477,61 @@ pub async fn import_all(
         "counts": imported,
     })))
 }
+
+// ── Compression ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CompressRequest {
+    pub min_messages: Option<usize>,
+    pub max_age_days: Option<i64>,
+}
+
+pub async fn compress(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompressRequest>,
+) -> AppResult {
+    let report = state
+        .cortex
+        .run_compression(
+            req.min_messages.unwrap_or(5),
+            req.max_age_days.unwrap_or(7),
+        )
+        .map_err(cortex_err)?;
+
+    Ok(Json(json!({
+        "sessions_compressed": report.sessions_compressed,
+        "episodes_consumed": report.episodes_consumed,
+        "summaries_created": report.summaries_created,
+    })))
+}
+
+// ── Relationship extraction ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RelationshipRequest {
+    pub text: String,
+}
+
+pub async fn extract_relationships(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RelationshipRequest>,
+) -> AppResult {
+    let rels = state.cortex.extract_relationships(&req.text);
+
+    let items: Vec<Value> = rels
+        .iter()
+        .map(|r| {
+            json!({
+                "person_a": r.person_a,
+                "person_b": r.person_b,
+                "relation": r.relation,
+                "confidence": r.confidence,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "relationships": items,
+        "total": items.len(),
+    })))
+}

@@ -243,6 +243,37 @@ pub fn list_tools() -> Value {
                 },
                 "required": ["subject", "predicate", "object"]
             }
+        },
+        {
+            "name": "memory_compress",
+            "description": "Compress old conversation sessions into summaries. Reduces storage while preserving key information. Sessions older than max_age_days with at least min_messages entries get compressed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "min_messages": {
+                        "type": "integer",
+                        "description": "Minimum messages per session to compress (default 5)"
+                    },
+                    "max_age_days": {
+                        "type": "integer",
+                        "description": "Only compress sessions older than this many days (default 7)"
+                    }
+                }
+            }
+        },
+        {
+            "name": "relationship_extract",
+            "description": "Extract interpersonal relationships from text. Detects relationships like 'works_with', 'reports_to', 'friend_of', etc. Supports English and Chinese.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to analyze for relationships"
+                    }
+                },
+                "required": ["text"]
+            }
         }
     ])
 }
@@ -261,6 +292,8 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "person_resolve" => tool_person_resolve(cortex, args),
         "fact_add" => tool_fact_add(cortex, args),
         "preference_set" => tool_preference_set(cortex, args),
+        "memory_compress" => tool_memory_compress(cortex, args),
+        "relationship_extract" => tool_relationship_extract(cortex, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -553,5 +586,42 @@ fn tool_contradiction_check(cortex: &Arc<Cortex>, args: &Value) -> Result<String
         "proposed": format!("{} {} {}", subject, predicate, object),
         "contradictions": items,
         "has_conflict": !items.is_empty(),
+    }).to_string())
+}
+
+fn tool_memory_compress(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let min_messages = get_usize(args, "min_messages", 5);
+    let max_age_days = args
+        .get("max_age_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(7);
+
+    let report = cortex
+        .run_compression(min_messages, max_age_days)
+        .map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "sessions_compressed": report.sessions_compressed,
+        "episodes_consumed": report.episodes_consumed,
+        "summaries_created": report.summaries_created,
+    }).to_string())
+}
+
+fn tool_relationship_extract(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let text = get_str(args, "text").ok_or("missing 'text'")?;
+    let rels = cortex.extract_relationships(text);
+
+    let items: Vec<serde_json::Value> = rels.iter().map(|r| {
+        json!({
+            "person_a": r.person_a,
+            "person_b": r.person_b,
+            "relation": r.relation,
+            "confidence": r.confidence,
+        })
+    }).collect();
+
+    Ok(json!({
+        "relationships": items,
+        "total": items.len(),
     }).to_string())
 }

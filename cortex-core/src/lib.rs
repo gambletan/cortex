@@ -1,4 +1,5 @@
 pub mod belief;
+pub mod compression;
 pub mod consolidation;
 pub mod context;
 pub mod embedder;
@@ -6,6 +7,7 @@ pub mod episode;
 pub mod inference;
 pub mod people;
 pub mod procedural;
+pub mod relationship;
 pub mod retrieval;
 pub mod semantic;
 pub mod storage;
@@ -16,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 use crate::belief::BeliefEngine;
+use crate::compression::{CompressionEngine, CompressionReport};
 use crate::consolidation::{ConsolidationEngine, ConsolidationReport};
 use crate::context::{ContextConfig, generate_context};
 use crate::episode::EpisodeStore;
@@ -219,6 +222,25 @@ impl Cortex {
             let _ = semantic.add_preference(&pref.key, &pref.value, pref.confidence);
         }
 
+        // ── Auto-extract relationships ──────────────────────────────────
+        let relationships = relationship::extract_relationships(text);
+        for rel in &relationships {
+            let _ = semantic.add_fact(
+                &rel.person_a,
+                &rel.relation,
+                &rel.person_b,
+                rel.confidence,
+                MemSource::new(channel),
+                None,
+            );
+            tracing::info!(
+                a = %rel.person_a,
+                relation = %rel.relation,
+                b = %rel.person_b,
+                "Auto-extracted relationship"
+            );
+        }
+
         // Auto-consolidation: run every N ingests
         let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
         if count % AUTO_CONSOLIDATION_INTERVAL == 0 {
@@ -373,6 +395,22 @@ impl Cortex {
     /// Returns extracted facts, preferences, and temporal classification.
     pub fn infer(&self, text: &str) -> inference::InferredKnowledge {
         inference::extract(text)
+    }
+
+    /// Extract relationships from text without ingesting.
+    pub fn extract_relationships(&self, text: &str) -> Vec<relationship::InferredRelationship> {
+        relationship::extract_relationships(text)
+    }
+
+    /// Run conversation compression on old sessions.
+    /// Compresses sessions older than `max_age_days` with at least `min_messages` entries.
+    pub fn run_compression(
+        &self,
+        min_messages: usize,
+        max_age_days: i64,
+    ) -> Result<CompressionReport, CortexError> {
+        let engine = CompressionEngine::new(&self.storage, &self.index);
+        engine.run_compression(min_messages, chrono::Duration::days(max_age_days))
     }
 
     /// Access to working memory.
