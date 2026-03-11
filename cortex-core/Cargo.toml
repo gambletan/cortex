@@ -16,6 +16,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
 tracing = "0.1"
 parking_lot = "0.12"
+instant-distance = "0.6"
 fastembed = { version = "4", optional = true }
 
 [[bench]]
