@@ -3,3 +3,26 @@
 *.db-shm
 *.db-wal
 node_modules/
+
+# Embedding model cache
+.fastembed_cache/
+
+# Environment / secrets
+.env
+
+# Build artifacts
+dist/
+*.whl
+*.tar.gz
+
+# Benchmark output
+bench/results/
+bench/*.html
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
