@@ -394,7 +394,7 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.0** ✅ — Feature comparison table, benchmark update, 18-feature Cortex vs Mem0 vs OpenAI
 - **v1.1** ✅ — HNSW vector index (50K search: 12ms → 91µs), Python SDK (`pip install cortex-ai-memory`)
 - **v1.2** ✅ — Negation detection (EN + CN), multi-hop retrieval, 117 tests
-- **v1.3** — Context quality optimization, query expansion, bidirectional relationships
+- **v1.3** ✅ — Context quality optimization, query expansion, bidirectional relationships, 126 tests
 - **v2.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile (iOS/Android)
 
 ## License
