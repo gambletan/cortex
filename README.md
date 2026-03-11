@@ -391,7 +391,9 @@ curl -X POST http://localhost:3315/v1/import \
 - **v0.3** ✅ — Proactive inference (auto-extract facts), temporal awareness, contradiction detection, Chinese NLP
 - **v0.4** ✅ — HTTP REST API (axum), import/export (JSON backup), Docker packaging
 - **v0.5** ✅ — Conversation compression, relationship inference (EN + CN), temporal retrieval enhancement, 112 tests
-- **v1.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile support
+- **v1.1** — HNSW vector index (sub-ms search at 100K+ memories), built-in embeddings (zero external deps)
+- **v1.2** — Python SDK on PyPI (`pip install cortex-memory`), TypeScript SDK
+- **v2.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile (iOS/Android)
 
 ## License
 
