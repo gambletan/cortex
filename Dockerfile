@@ -1,23 +1,42 @@
-FROM rust:1.82-slim AS builder
+# Multi-stage build for cortex-http REST API
 
-WORKDIR /build
-COPY . .
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+FROM rust:1.82-bookworm AS builder
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
-RUN cargo build --release -p cortex-http -p cortex-mcp-server
+WORKDIR /src
 
+# Install build deps for fastembed/ONNX
+RUN apt-get update && apt-get install -y cmake pkg-config && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace
+COPY Cargo.toml Cargo.lock ./
+COPY cortex-core/ cortex-core/
+COPY cortex-http/ cortex-http/
+COPY cortex-mcp-server/ cortex-mcp-server/
+
+# Stub out cortex-python so workspace resolves without Python deps
+RUN mkdir -p cortex-python/src && \
+    printf '[package]\nname = "cortex-python"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\npath = "src/lib.rs"' > cortex-python/Cargo.toml && \
+    echo '' > cortex-python/src/lib.rs
+
+# Build release binary
+RUN cargo build --release -p cortex-http
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/cortex-http /usr/local/bin/cortex-http
-COPY --from=builder /build/target/release/cortex-mcp-server /usr/local/bin/cortex-mcp-server
+COPY --from=builder /src/target/release/cortex-http /usr/local/bin/cortex-http
 
+# Data volume for SQLite persistence
+VOLUME /data
+ENV CORTEX_DB_PATH=/data/memory.db
 ENV CORTEX_HOST=0.0.0.0
 ENV CORTEX_PORT=3315
-ENV CORTEX_DB_PATH=/data/memory.db
 
-VOLUME ["/data"]
 EXPOSE 3315
 
-CMD ["cortex-http", "--host", "0.0.0.0", "--port", "3315", "--db", "/data/memory.db"]
+ENTRYPOINT ["cortex-http"]

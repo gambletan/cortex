@@ -1,0 +1,6 @@
+target/
+.git/
+cortex-python/
+*.db
+*.db-wal
+*.db-shm
