@@ -7,7 +7,63 @@
 //!
 //! This runs locally using pattern matching and heuristics — no LLM calls.
 //! Designed to be fast enough to run on every ingest (<1ms).
+//!
+//! Optionally, an external LLM callback (`InferenceFn`) can be provided for
+//! higher-quality extraction. When set, LLM results are merged with pattern
+//! matching results. Default: disabled (pattern matching only).
 
+use crate::CortexError;
+
+/// External LLM inference callback type.
+/// Takes raw text, returns extracted knowledge.
+/// Opt-in: when not provided, only pattern matching is used.
+pub type InferenceFn =
+    Box<dyn Fn(&str) -> Result<InferredKnowledge, CortexError> + Send + Sync>;
+
+/// Extract with optional LLM assistance.
+/// When `llm_fn` is provided, calls it and merges results with pattern matching.
+/// When `None`, falls back to pure pattern matching (`extract()`).
+pub fn extract_with_llm(
+    text: &str,
+    llm_fn: Option<&InferenceFn>,
+) -> InferredKnowledge {
+    let mut base = extract(text);
+
+    if let Some(f) = llm_fn {
+        match f(text) {
+            Ok(llm_result) => {
+                // Merge LLM results: add non-duplicate facts and preferences
+                for fact in llm_result.facts {
+                    let dominated = base.facts.iter().any(|f| {
+                        f.subject == fact.subject
+                            && f.predicate == fact.predicate
+                            && f.object == fact.object
+                    });
+                    if !dominated {
+                        base.facts.push(fact);
+                    }
+                }
+                for pref in llm_result.preferences {
+                    let dominated = base.preferences.iter().any(|p| {
+                        p.key == pref.key && p.value == pref.value
+                    });
+                    if !dominated {
+                        base.preferences.push(pref);
+                    }
+                }
+                // LLM temporal hint overrides pattern matching if it has a signal
+                if llm_result.temporal_hint != TemporalHint::Unknown {
+                    base.temporal_hint = llm_result.temporal_hint;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("LLM inference failed, using pattern matching only: {}", e);
+            }
+        }
+    }
+
+    base
+}
 
 /// Extracted knowledge from a text input.
 #[derive(Debug, Clone, Default)]
@@ -33,20 +89,15 @@ pub struct InferredPreference {
 }
 
 /// Hint about whether a memory is temporary or permanent.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TemporalHint {
     /// No strong signal either way.
+    #[default]
     Unknown,
     /// Likely temporary (e.g., "I'm working on X right now").
     Temporary,
     /// Likely permanent (e.g., "I live in Shanghai").
     Permanent,
-}
-
-impl Default for TemporalHint {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Extract structured knowledge from raw text.
@@ -517,8 +568,8 @@ fn classify_temporal_multilingual(text: &str, lower: &str) -> TemporalHint {
 /// Try multiple prefixes, return the rest after the first match.
 fn strip_prefix_any<'a>(text: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     for prefix in prefixes {
-        if text.starts_with(prefix) {
-            return Some(&text[prefix.len()..]);
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return Some(rest);
         }
     }
     None

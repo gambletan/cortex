@@ -6,15 +6,56 @@ use crate::storage::traits::StorageBackend;
 use crate::types::*;
 use crate::CortexError;
 
+/// Per-channel decay configuration. When set, overrides hardcoded half-lives.
+/// Default: disabled (None) — uses built-in decay constants.
+#[derive(Debug, Clone)]
+pub struct DecayConfig {
+    /// Half-life in hours for Temporary memories (base, before importance scaling).
+    /// Default hardcoded: 12.0
+    pub temp_half_life_hours: f32,
+    /// Importance scaling factor for Temporary memories.
+    /// Effective half-life = base + (base_score × this factor).
+    /// Default hardcoded: 24.0
+    pub temp_importance_scale: f32,
+    /// Half-life in hours for Normal memories (base).
+    /// Default hardcoded: 72.0
+    pub normal_half_life_hours: f32,
+    /// Importance scaling factor for Normal memories.
+    /// Default hardcoded: 144.0
+    pub normal_importance_scale: f32,
+    /// Floor for Permanent memory decay_factor.
+    /// Default hardcoded: 0.8
+    pub permanent_floor: f32,
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            temp_half_life_hours: 12.0,
+            temp_importance_scale: 24.0,
+            normal_half_life_hours: 72.0,
+            normal_importance_scale: 144.0,
+            permanent_floor: 0.8,
+        }
+    }
+}
+
 /// Episode store — raw memory stream with temporal decay.
 pub struct EpisodeStore<'a> {
     storage: &'a dyn StorageBackend,
     index: &'a MemoryIndex,
+    decay_config: Option<&'a DecayConfig>,
 }
 
 impl<'a> EpisodeStore<'a> {
     pub fn new(storage: &'a dyn StorageBackend, index: &'a MemoryIndex) -> Self {
-        Self { storage, index }
+        Self { storage, index, decay_config: None }
+    }
+
+    /// Set custom decay configuration (opt-in, default disabled).
+    pub fn with_decay_config(mut self, config: &'a DecayConfig) -> Self {
+        self.decay_config = Some(config);
+        self
     }
 
     /// Store a new episodic memory.
@@ -112,11 +153,15 @@ impl<'a> EpisodeStore<'a> {
             .list_by_tier(MemoryTier::Episodic, 10_000)?;
         let mut updated = 0;
 
+        // Use custom config or hardcoded defaults
+        let default_config = DecayConfig::default();
+        let cfg = self.decay_config.unwrap_or(&default_config);
+
         for mut mem in mems {
             // Permanent memories never decay below a floor
             if mem.temporal.durability == MemoryDurability::Permanent {
-                if mem.salience.decay_factor < 0.8 {
-                    mem.salience.decay_factor = 0.8;
+                if mem.salience.decay_factor < cfg.permanent_floor {
+                    mem.salience.decay_factor = cfg.permanent_floor;
                     mem.salience.recompute();
                     self.storage.update_memory(&mem)?;
                     updated += 1;
@@ -128,12 +173,16 @@ impl<'a> EpisodeStore<'a> {
                 .num_hours()
                 .max(0) as f32;
 
-            // Durability-aware half-life:
-            //   Temporary: 12h base (aggressive decay)
-            //   Normal: 72h + importance scaling
+            // Durability-aware half-life (configurable):
+            //   Temporary: base + importance scaling
+            //   Normal: base + importance scaling
             let half_life_hours = match mem.temporal.durability {
-                MemoryDurability::Temporary => 12.0 + (mem.salience.base_score * 24.0),
-                _ => 72.0 + (mem.salience.base_score * 144.0),
+                MemoryDurability::Temporary => {
+                    cfg.temp_half_life_hours + (mem.salience.base_score * cfg.temp_importance_scale)
+                }
+                _ => {
+                    cfg.normal_half_life_hours + (mem.salience.base_score * cfg.normal_importance_scale)
+                }
             };
 
             // Exponential decay: salience halves every half_life_hours of non-access

@@ -59,7 +59,7 @@ impl SqliteStorage {
         let links_json: String = row.get(10)?;
 
         let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
-        let tier = MemoryTier::from_str(&tier_str).unwrap_or(MemoryTier::Episodic);
+        let tier = MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Episodic);
         let content: MemContent = serde_json::from_str(&content_json).unwrap();
         let embedding = embedding_blob.map(|b| bytes_to_f32_vec(&b));
         let temporal: TemporalInfo = serde_json::from_str(&temporal_json).unwrap();
@@ -389,7 +389,7 @@ impl StorageBackend for SqliteStorage {
             let target = Uuid::parse_str(&target_str)
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
             let relation =
-                LinkRelation::from_str(&rel_str).unwrap_or(LinkRelation::RelatedTo);
+                LinkRelation::parse(&rel_str).unwrap_or(LinkRelation::RelatedTo);
             results.push((target, relation, strength));
         }
         Ok(results)

@@ -68,6 +68,10 @@ pub struct Cortex {
     index: MemoryIndex,
     working: WorkingMemory,
     ingest_counter: AtomicU64,
+    /// Optional custom decay config (opt-in, default disabled).
+    decay_config: Option<episode::DecayConfig>,
+    /// Optional LLM inference callback (opt-in, default disabled).
+    inference_fn: Option<inference::InferenceFn>,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -94,6 +98,8 @@ impl Cortex {
             index,
             working: WorkingMemory::default(),
             ingest_counter: AtomicU64::new(0),
+            decay_config: None,
+            inference_fn: None,
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
@@ -107,9 +113,25 @@ impl Cortex {
             index: MemoryIndex::new(),
             working: WorkingMemory::default(),
             ingest_counter: AtomicU64::new(0),
+            decay_config: None,
+            inference_fn: None,
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Enable custom decay configuration (opt-in).
+    /// When set, overrides the hardcoded decay half-lives.
+    pub fn with_decay_config(mut self, config: episode::DecayConfig) -> Self {
+        self.decay_config = Some(config);
+        self
+    }
+
+    /// Enable LLM-assisted inference (opt-in).
+    /// When set, LLM results are merged with pattern matching during ingest.
+    pub fn with_inference_fn(mut self, f: inference::InferenceFn) -> Self {
+        self.inference_fn = Some(f);
+        self
     }
 
     /// Auto-generate embedding if embedder is available and none provided.
@@ -165,8 +187,8 @@ impl Cortex {
             people.record_interaction(person.id)?;
         }
 
-        // ── Proactive inference ──────────────────────────────────────────
-        let inferred = inference::extract(text);
+        // ── Proactive inference (with optional LLM) ────────────────────
+        let inferred = inference::extract_with_llm(text, self.inference_fn.as_ref());
 
         // Set durability based on temporal hint
         let durability = match inferred.temporal_hint {
@@ -257,7 +279,7 @@ impl Cortex {
 
         // Auto-consolidation: run every N ingests
         let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if count % AUTO_CONSOLIDATION_INTERVAL == 0 {
+        if count.is_multiple_of(AUTO_CONSOLIDATION_INTERVAL) {
             tracing::info!("Auto-consolidation triggered at ingest #{}", count);
             if let Err(e) = self.run_consolidation() {
                 tracing::warn!("Auto-consolidation failed: {}", e);
@@ -323,13 +345,17 @@ impl Cortex {
 
     /// Run a full consolidation cycle (decay + promote + sweep + patterns).
     pub fn run_consolidation(&self) -> Result<ConsolidationReport, CortexError> {
-        let engine = ConsolidationEngine::new(&self.storage, &self.index);
+        let engine = ConsolidationEngine::new(&self.storage, &self.index)
+            .with_decay_config(self.decay_config.as_ref());
         engine.run_consolidation_cycle()
     }
 
     /// Run only temporal decay on episodic memories.
     pub fn run_decay(&self) -> Result<usize, CortexError> {
-        let episodes = EpisodeStore::new(&self.storage, &self.index);
+        let mut episodes = EpisodeStore::new(&self.storage, &self.index);
+        if let Some(ref cfg) = self.decay_config {
+            episodes = episodes.with_decay_config(cfg);
+        }
         episodes.decay_tick()
     }
 
@@ -406,9 +432,9 @@ impl Cortex {
     }
 
     /// Run proactive inference on text without ingesting.
-    /// Returns extracted facts, preferences, and temporal classification.
+    /// Uses LLM callback if configured, otherwise pattern matching only.
     pub fn infer(&self, text: &str) -> inference::InferredKnowledge {
-        inference::extract(text)
+        inference::extract_with_llm(text, self.inference_fn.as_ref())
     }
 
     /// Extract relationships from text without ingesting.

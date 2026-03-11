@@ -2,7 +2,7 @@ use chrono::Duration;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::episode::EpisodeStore;
+use crate::episode::{DecayConfig, EpisodeStore};
 use crate::procedural::{Pattern, ProceduralStore};
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
@@ -25,11 +25,18 @@ pub struct ConsolidationReport {
 pub struct ConsolidationEngine<'a> {
     storage: &'a dyn StorageBackend,
     index: &'a MemoryIndex,
+    decay_config: Option<&'a DecayConfig>,
 }
 
 impl<'a> ConsolidationEngine<'a> {
     pub fn new(storage: &'a dyn StorageBackend, index: &'a MemoryIndex) -> Self {
-        Self { storage, index }
+        Self { storage, index, decay_config: None }
+    }
+
+    /// Set custom decay configuration (forwarded to EpisodeStore).
+    pub fn with_decay_config(mut self, config: Option<&'a DecayConfig>) -> Self {
+        self.decay_config = config;
+        self
     }
 
     /// Run a full consolidation cycle:
@@ -41,7 +48,10 @@ impl<'a> ConsolidationEngine<'a> {
         let mut report = ConsolidationReport::default();
 
         // 1. Apply temporal decay first (updates salience scores)
-        let episodes = EpisodeStore::new(self.storage, self.index);
+        let mut episodes = EpisodeStore::new(self.storage, self.index);
+        if let Some(cfg) = self.decay_config {
+            episodes = episodes.with_decay_config(cfg);
+        }
         report.decayed_updated = episodes.decay_tick()?;
 
         // 2. Find repeated episodic facts for promotion

@@ -466,13 +466,13 @@ fn extract_query_entities(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < words.len() {
         let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
-        if !word.is_empty() && word.chars().next().map_or(false, |c| c.is_uppercase()) {
+        if !word.is_empty() && word.chars().next().is_some_and(|c| c.is_uppercase()) {
             // Start of a capitalized sequence
             let mut name_parts = vec![word.to_string()];
             let mut j = i + 1;
             while j < words.len() {
                 let next = words[j].trim_matches(|c: char| !c.is_alphanumeric());
-                if !next.is_empty() && next.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if !next.is_empty() && next.chars().next().is_some_and(|c| c.is_uppercase()) {
                     name_parts.push(next.to_string());
                     j += 1;
                 } else {

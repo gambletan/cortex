@@ -99,13 +99,10 @@ impl<'a> SemanticStore<'a> {
     /// Update the confidence of a semantic memory.
     pub fn update_confidence(&self, id: Uuid, new_confidence: f32) -> Result<(), CortexError> {
         if let Some(mut mem) = self.storage.get_memory(id)? {
-            match &mut mem.content {
-                MemContent::Preference {
-                    ref mut confidence, ..
-                } => {
-                    *confidence = new_confidence;
-                }
-                _ => {}
+            if let MemContent::Preference {
+                ref mut confidence, ..
+            } = &mut mem.content {
+                *confidence = new_confidence;
             }
             mem.salience.base_score = new_confidence;
             mem.salience.recompute();

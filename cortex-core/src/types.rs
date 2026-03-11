@@ -4,20 +4,15 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Whether a memory is temporary (will decay fast) or permanent (should persist).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MemoryDurability {
     /// Default — decay follows normal importance-aware curve.
+    #[default]
     Normal,
     /// Temporary — aggressive decay (e.g., "debugging X right now").
     Temporary,
     /// Permanent — never decay below a floor (e.g., "I live in Shanghai").
     Permanent,
-}
-
-impl Default for MemoryDurability {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl MemoryDurability {
@@ -29,7 +24,7 @@ impl MemoryDurability {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "temporary" => Self::Temporary,
             "permanent" => Self::Permanent,
@@ -72,7 +67,7 @@ impl MemoryTier {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "working" => Some(Self::Working),
             "episodic" => Some(Self::Episodic),
@@ -192,17 +187,12 @@ impl MemSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum PrivacyLevel {
+    #[default]
     Private,
     Shared { scope: String },
     Public,
-}
-
-impl Default for PrivacyLevel {
-    fn default() -> Self {
-        Self::Private
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +226,7 @@ impl LinkRelation {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "related_to" => Some(Self::RelatedTo),
             "supports" => Some(Self::Supports),
