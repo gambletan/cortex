@@ -37,6 +37,30 @@ pub struct MemoryIndex {
     inner: RwLock<IndexInner>,
 }
 
+/// Configuration for HNSW index thresholds and build parameters.
+#[derive(Clone, Debug)]
+pub struct IndexConfig {
+    /// Minimum collection size before using HNSW (below this, brute-force is used).
+    pub min_size: usize,
+    /// Rebuild HNSW when pending buffer exceeds this fraction of stable size.
+    pub pending_ratio: f32,
+    /// Rebuild HNSW when removals exceed this fraction of stable size.
+    pub removal_ratio: f32,
+    /// HNSW ef_construction parameter (higher = better recall, slower build).
+    pub ef_construction: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            min_size: HNSW_MIN_SIZE,
+            pending_ratio: HNSW_PENDING_RATIO,
+            removal_ratio: HNSW_REMOVAL_RATIO,
+            ef_construction: 40,
+        }
+    }
+}
+
 struct IndexInner {
     /// Stable entries included in the current HNSW build (source of truth together with pending)
     stable: HashMap<Uuid, NormalizedEntry>,
@@ -48,6 +72,8 @@ struct IndexInner {
     removals_since_build: usize,
     /// Size of stable set at last HNSW build
     size_at_build: usize,
+    /// Index configuration
+    config: IndexConfig,
 }
 
 struct NormalizedEntry {
@@ -64,6 +90,10 @@ const HNSW_REMOVAL_RATIO: f32 = 0.10;
 
 impl MemoryIndex {
     pub fn new() -> Self {
+        Self::with_config(IndexConfig::default())
+    }
+
+    pub fn with_config(config: IndexConfig) -> Self {
         Self {
             inner: RwLock::new(IndexInner {
                 stable: HashMap::new(),
@@ -71,6 +101,7 @@ impl MemoryIndex {
                 hnsw: None,
                 removals_since_build: 0,
                 size_at_build: 0,
+                config,
             }),
         }
     }
@@ -116,7 +147,7 @@ impl MemoryIndex {
         }
 
         // Small collection: brute-force everything
-        if total < HNSW_MIN_SIZE {
+        if total < inner.config.min_size {
             return brute_force_search_both(&inner.stable, &inner.pending, query, limit);
         }
 
@@ -125,12 +156,12 @@ impl MemoryIndex {
         // 2. Too many removals (stale entries in HNSW)
         let needs_rebuild = inner.hnsw.is_none()
             || (inner.size_at_build > 0
-                && inner.removals_since_build as f32 > inner.size_at_build as f32 * HNSW_REMOVAL_RATIO);
+                && inner.removals_since_build as f32 > inner.size_at_build as f32 * inner.config.removal_ratio);
 
         // Check if pending buffer should be flushed into stable + rebuild
         let pending_overflow = inner.hnsw.is_some()
             && inner.size_at_build > 0
-            && inner.pending.len() as f32 > inner.size_at_build as f32 * HNSW_PENDING_RATIO;
+            && inner.pending.len() as f32 > inner.size_at_build as f32 * inner.config.pending_ratio;
 
         if needs_rebuild || pending_overflow {
             flush_and_rebuild(&mut inner);
@@ -172,7 +203,7 @@ impl MemoryIndex {
     pub fn build_index(&self) {
         let mut inner = self.inner.write();
         let total = inner.stable.len() + inner.pending.len();
-        if total >= HNSW_MIN_SIZE {
+        if total >= inner.config.min_size {
             flush_and_rebuild(&mut inner);
         }
     }
@@ -207,7 +238,7 @@ fn flush_and_rebuild(inner: &mut IndexInner) {
 
     let points: Vec<Point> = inner.stable.values().map(|e| Point::new(e.embedding.clone())).collect();
     let ids: Vec<Uuid> = inner.stable.keys().copied().collect();
-    let hnsw = Builder::default().ef_construction(40).build(points, ids);
+    let hnsw = Builder::default().ef_construction(inner.config.ef_construction).build(points, ids);
     inner.hnsw = Some(hnsw);
     inner.removals_since_build = 0;
     inner.size_at_build = inner.stable.len();

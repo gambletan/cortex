@@ -180,6 +180,33 @@ impl<'a> RetrievalEngine<'a> {
             },
         };
 
+        // Adapt weights for query content type (applied multiplicatively)
+        let query_type = detect_query_type(&query.text);
+        let weights = match query_type {
+            QueryType::PersonQuery => RetrievalWeights {
+                similarity: weights.similarity,
+                temporal: weights.temporal * 0.5,
+                salience: weights.salience,
+                social: weights.social * 3.0,
+                channel: weights.channel,
+            },
+            QueryType::FactQuery => RetrievalWeights {
+                similarity: weights.similarity * 1.3,
+                temporal: weights.temporal * 0.7,
+                salience: weights.salience,
+                social: weights.social,
+                channel: weights.channel,
+            },
+            QueryType::PreferenceQuery => RetrievalWeights {
+                similarity: weights.similarity,
+                temporal: weights.temporal,
+                salience: weights.salience * 1.5,
+                social: weights.social * 0.5,
+                channel: weights.channel,
+            },
+            QueryType::General | QueryType::Temporal => weights,
+        };
+
         // Score each candidate
         let mut results = Vec::new();
         for (id, sim_score) in &candidate_ids {
@@ -444,6 +471,100 @@ impl<'a> RetrievalEngine<'a> {
     }
 }
 
+// ── Query type detection ─────────────────────────────────────────────────────
+
+/// Detected query content type for adaptive weight adjustment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryType {
+    General,
+    PersonQuery,
+    FactQuery,
+    PreferenceQuery,
+    Temporal, // handled by TemporalIntent; kept for classification completeness
+}
+
+/// Detect query content type from query text.
+/// Supports English and Chinese query patterns.
+pub fn detect_query_type(query: &str) -> QueryType {
+    let lower = query.to_lowercase();
+
+    // Check temporal first — if TemporalIntent is active, classify as Temporal
+    if detect_temporal_intent(query) != TemporalIntent::None {
+        return QueryType::Temporal;
+    }
+
+    // Preference patterns (check before fact patterns since "what do I like" contains "what")
+    let pref_en = ["what do i like", "my preference", "do i prefer", "my favorite", "my favourite"];
+    let pref_zh = ["我喜欢什么", "我的偏好", "我偏好", "我喜欢的"];
+    for pat in &pref_en {
+        if lower.contains(pat) {
+            return QueryType::PreferenceQuery;
+        }
+    }
+    for pat in &pref_zh {
+        if query.contains(pat) {
+            return QueryType::PreferenceQuery;
+        }
+    }
+
+    // Person patterns
+    let person_en = ["who is", "who was", "who are", "about him", "about her", "about them"];
+    for pat in &person_en {
+        if lower.contains(pat) {
+            return QueryType::PersonQuery;
+        }
+    }
+    // "who" at start of query
+    if lower.starts_with("who ") {
+        return QueryType::PersonQuery;
+    }
+    // "about [Name]" — look for "about" followed by a capitalized word
+    if let Some(pos) = lower.find("about ") {
+        let after = &query[pos + 6..];
+        if after.chars().next().is_some_and(|c| c.is_uppercase()) {
+            return QueryType::PersonQuery;
+        }
+    }
+    // Chinese person patterns
+    let person_zh = ["谁是", "谁"];
+    for pat in &person_zh {
+        if query.contains(pat) {
+            return QueryType::PersonQuery;
+        }
+    }
+    if let Some(pos) = query.find("关于") {
+        let after = &query[pos + "关于".len()..];
+        // Extract the word after "关于" up to a boundary, treat as person query only if 2-4 chars (name-like)
+        // and does not contain common non-name words
+        let name: String = after
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !"的了吗呢吧？！，。".contains(*c))
+            .collect();
+        let char_count = name.chars().count();
+        let non_name_words = ["这个", "那个", "什么", "哪个", "一些", "所有", "我们", "他们", "项目", "问题", "情况", "事情"];
+        let is_non_name = non_name_words.iter().any(|w| name.contains(w));
+        if (2..=4).contains(&char_count) && !is_non_name {
+            return QueryType::PersonQuery;
+        }
+    }
+
+    // Fact patterns
+    let fact_en = ["what is", "what are", "where does", "where is", "what does"];
+    let fact_zh = ["是什么", "哪里", "在哪", "做什么"];
+    for pat in &fact_en {
+        if lower.contains(pat) {
+            return QueryType::FactQuery;
+        }
+    }
+    for pat in &fact_zh {
+        if query.contains(pat) {
+            return QueryType::FactQuery;
+        }
+    }
+
+    QueryType::General
+}
+
 // ── Temporal intent detection ────────────────────────────────────────────────
 
 /// Detected temporal intent in a query.
@@ -645,6 +766,67 @@ mod tests {
             detect_temporal_intent("Tell me about Alice"),
             TemporalIntent::None
         );
+    }
+
+    // ── QueryType detection tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_query_type_person_who() {
+        assert_eq!(detect_query_type("Who is Alice?"), QueryType::PersonQuery);
+        assert_eq!(detect_query_type("who was that person?"), QueryType::PersonQuery);
+    }
+
+    #[test]
+    fn test_query_type_person_about_name() {
+        assert_eq!(detect_query_type("Tell me about Alice"), QueryType::PersonQuery);
+        assert_eq!(detect_query_type("What do you know about Bob Smith?"), QueryType::PersonQuery);
+    }
+
+    #[test]
+    fn test_query_type_person_chinese() {
+        assert_eq!(detect_query_type("谁是张三"), QueryType::PersonQuery);
+        assert_eq!(detect_query_type("关于张三的信息"), QueryType::PersonQuery);
+        // Non-name phrases after "关于" should NOT be PersonQuery
+        assert_ne!(detect_query_type("关于这个项目的进展"), QueryType::PersonQuery);
+        assert_ne!(detect_query_type("关于问题的解答"), QueryType::PersonQuery);
+    }
+
+    #[test]
+    fn test_query_type_fact() {
+        assert_eq!(detect_query_type("What is Rust?"), QueryType::FactQuery);
+        assert_eq!(detect_query_type("Where does Alice work?"), QueryType::FactQuery);
+        assert_eq!(detect_query_type("What does Bob do?"), QueryType::FactQuery);
+    }
+
+    #[test]
+    fn test_query_type_fact_chinese() {
+        assert_eq!(detect_query_type("Rust是什么"), QueryType::FactQuery);
+        assert_eq!(detect_query_type("他在哪里工作"), QueryType::FactQuery);
+    }
+
+    #[test]
+    fn test_query_type_preference() {
+        assert_eq!(detect_query_type("What do I like to eat?"), QueryType::PreferenceQuery);
+        assert_eq!(detect_query_type("What is my preference for editors?"), QueryType::PreferenceQuery);
+    }
+
+    #[test]
+    fn test_query_type_preference_chinese() {
+        assert_eq!(detect_query_type("我喜欢什么颜色"), QueryType::PreferenceQuery);
+        assert_eq!(detect_query_type("我的偏好是什么"), QueryType::PreferenceQuery);
+    }
+
+    #[test]
+    fn test_query_type_temporal_defers() {
+        // Temporal queries should be classified as Temporal, not other types
+        assert_eq!(detect_query_type("What did I do last time?"), QueryType::Temporal);
+        assert_eq!(detect_query_type("最近聊了什么"), QueryType::Temporal);
+    }
+
+    #[test]
+    fn test_query_type_general() {
+        assert_eq!(detect_query_type("hello there"), QueryType::General);
+        assert_eq!(detect_query_type("summarize everything"), QueryType::General);
     }
 
     #[test]

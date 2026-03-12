@@ -30,16 +30,24 @@ pub struct CompressionEngine<'a> {
     /// Optional external summarizer (e.g., LLM-powered).
     /// When set, replaces the built-in extractive summarizer.
     summarizer: Option<&'a SummarizerFn>,
+    /// Maximum character length for extractive summaries.
+    summary_max_chars: usize,
 }
 
 impl<'a> CompressionEngine<'a> {
     pub fn new(storage: &'a dyn StorageBackend, index: &'a MemoryIndex) -> Self {
-        Self { storage, index, summarizer: None }
+        Self { storage, index, summarizer: None, summary_max_chars: 500 }
     }
 
     /// Use an external summarizer (e.g., LLM-powered) for compression.
     pub fn with_summarizer(mut self, summarizer: &'a SummarizerFn) -> Self {
         self.summarizer = Some(summarizer);
+        self
+    }
+
+    /// Set the maximum character length for extractive summaries.
+    pub fn with_summary_max_chars(mut self, n: usize) -> Self {
+        self.summary_max_chars = n;
         self
     }
 
@@ -218,7 +226,7 @@ impl<'a> CompressionEngine<'a> {
 
     /// Build a compressed summary from a list of texts.
     /// Uses extractive summarization: keep the most informative sentences,
-    /// deduplicate, and concatenate with timestamps.
+    /// deduplicate, categorize by content type, and concatenate.
     fn build_summary(&self, texts: &[String], original_count: usize) -> String {
         // Deduplicate exact and near-exact matches
         let mut unique_texts: Vec<&String> = Vec::new();
@@ -239,35 +247,155 @@ impl<'a> CompressionEngine<'a> {
             }
         }
 
-        // Score by information density (longer + more unique words = more informative)
+        // Categorize texts into groups: facts, preferences, general
+        let mut groups: std::collections::HashMap<ContentGroup, Vec<&String>> =
+            std::collections::HashMap::new();
+        for t in &unique_texts {
+            groups.entry(classify_content(t)).or_default().push(t);
+        }
+
+        // Build document frequency map for TF-IDF-like scoring.
+        // Document frequency = number of texts a word appears in.
+        let num_docs = unique_texts.len().max(1) as f32;
+        let mut doc_freq: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for t in &unique_texts {
+            let words_in_doc: std::collections::HashSet<String> = t
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .collect();
+            for w in words_in_doc {
+                *doc_freq.entry(w).or_insert(0) += 1;
+            }
+        }
+
+        // Score each text using TF-IDF-like metric:
+        //   score = sum of (tf * idf) for each unique word
+        //   tf = count of word in this text / total words in text
+        //   idf = ln(num_docs / doc_freq(word))
         let mut scored: Vec<(&String, f32)> = unique_texts
             .iter()
             .map(|t| {
-                let words: std::collections::HashSet<&str> = t.split_whitespace().collect();
-                let score = words.len() as f32 * (1.0 + (t.len() as f32 / 100.0).ln().max(0.0));
+                let word_list: Vec<String> = t
+                    .split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .collect();
+                let total_words = word_list.len().max(1) as f32;
+
+                // Term frequency counts
+                let mut tf_counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for w in &word_list {
+                    *tf_counts.entry(w.as_str()).or_insert(0) += 1;
+                }
+
+                let score: f32 = tf_counts
+                    .iter()
+                    .map(|(word, &count)| {
+                        let tf = count as f32 / total_words;
+                        let df = doc_freq
+                            .get(*word)
+                            .copied()
+                            .unwrap_or(1) as f32;
+                        let idf = (num_docs / df).ln().max(0.0);
+                        tf * idf
+                    })
+                    .sum();
+
                 (*t, score)
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Keep top sentences up to ~500 chars
-        let mut summary_parts = Vec::new();
-        let mut total_len = 0;
-        for (text, _) in &scored {
-            if total_len + text.len() > 500 && !summary_parts.is_empty() {
+        // Build index-based scored list for stable identity tracking.
+        let scored_indices: Vec<(usize, f32)> = scored
+            .iter()
+            .enumerate()
+            .map(|(i, (_, s))| (i, *s))
+            .collect();
+
+        // Classify each scored entry by content group.
+        let entry_groups: Vec<ContentGroup> = scored.iter().map(|(t, _)| classify_content(t)).collect();
+
+        // Ensure at least one entry from each non-empty content group is represented.
+        let mut selected: Vec<&str> = Vec::new();
+        let mut total_len: usize = 0;
+        let mut selected_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let max_chars = self.summary_max_chars;
+
+        // First pass: pick the highest-scored entry from each group.
+        for group in &[ContentGroup::Fact, ContentGroup::Preference, ContentGroup::General] {
+            let best = scored_indices
+                .iter()
+                .filter(|(i, _)| entry_groups[*i] == *group)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some(&(idx, _)) = best {
+                let text = scored[idx].0;
+                if total_len + text.len() <= max_chars || selected.is_empty() {
+                    selected.push(text.as_str());
+                    total_len += text.len();
+                    selected_indices.insert(idx);
+                }
+            }
+        }
+
+        // Second pass: fill remaining budget from the global ranked list.
+        for (idx, _) in &scored_indices {
+            if total_len >= max_chars {
                 break;
             }
-            summary_parts.push(text.as_str());
+            if selected_indices.contains(idx) {
+                continue;
+            }
+            let text = scored[*idx].0;
+            if total_len + text.len() > max_chars && !selected.is_empty() {
+                break;
+            }
+            selected.push(text.as_str());
             total_len += text.len();
+            selected_indices.insert(*idx);
         }
 
         let header = format!("[Compressed: {} messages]", original_count);
-        if summary_parts.is_empty() {
+        if selected.is_empty() {
             header
         } else {
-            format!("{} {}", header, summary_parts.join(" | "))
+            format!("{} {}", header, selected.join(" | "))
         }
     }
+}
+
+/// Content group for categorization during compression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ContentGroup {
+    Fact,
+    Preference,
+    General,
+}
+
+/// Classify text into a content group for compression summarization.
+fn classify_content(text: &str) -> ContentGroup {
+    let trimmed = text.trim();
+    // Facts: contain "=" or structured "subject predicate object" patterns
+    if trimmed.contains('=') {
+        return ContentGroup::Fact;
+    }
+    // Preferences: "key: value" or "key:value" format (single colon, not URLs)
+    if let Some(colon_pos) = trimmed.find(':') {
+        let before = &trimmed[..colon_pos];
+        // Exclude URLs (http:, https:, ftp:) and timestamps
+        if !before.ends_with("http")
+            && !before.ends_with("https")
+            && !before.ends_with("ftp")
+            && !before.chars().all(|c| c.is_ascii_digit())
+            && before.split_whitespace().count() <= 4
+        {
+            return ContentGroup::Preference;
+        }
+    }
+    ContentGroup::General
 }
 
 /// A detected conversation session suitable for compression.

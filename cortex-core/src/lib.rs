@@ -6,6 +6,9 @@ pub mod embedder;
 pub mod episode;
 pub mod inference;
 pub mod people;
+pub mod plugin;
+pub mod plugin_manager;
+pub mod plugins;
 pub mod procedural;
 pub mod relationship;
 pub mod retrieval;
@@ -19,13 +22,15 @@ use uuid::Uuid;
 
 use crate::belief::BeliefEngine;
 use crate::compression::{CompressionEngine, CompressionReport};
-use crate::consolidation::{ConsolidationEngine, ConsolidationReport};
+use crate::consolidation::{ConsolidationConfig, ConsolidationEngine, ConsolidationReport};
 use crate::context::{ContextConfig, generate_context};
 use crate::episode::EpisodeStore;
 use crate::people::PeopleGraph;
+use crate::plugin::{Plugin, PluginAction, PluginContext};
+use crate::plugin_manager::PluginManager;
 use crate::retrieval::{RetrievalEngine, RetrievalQuery, RetrievalResult};
 use crate::semantic::SemanticStore;
-use crate::storage::memory_index::MemoryIndex;
+use crate::storage::memory_index::{IndexConfig, MemoryIndex};
 use crate::storage::sqlite::SqliteStorage;
 use crate::storage::traits::StorageBackend;
 use crate::types::*;
@@ -59,8 +64,8 @@ pub struct MemoryStats {
     pub total: usize,
 }
 
-/// How often to auto-run consolidation (every N ingests).
-const AUTO_CONSOLIDATION_INTERVAL: u64 = 100;
+/// Default interval: auto-run consolidation every N ingests.
+const DEFAULT_AUTO_CONSOLIDATION_INTERVAL: u64 = 100;
 
 /// Main Cortex instance — the entry point for all memory operations.
 pub struct Cortex {
@@ -72,6 +77,12 @@ pub struct Cortex {
     decay_config: Option<episode::DecayConfig>,
     /// Optional LLM inference callback (opt-in, default disabled).
     inference_fn: Option<inference::InferenceFn>,
+    /// Plugin manager for lifecycle hooks and custom tools.
+    plugins: PluginManager,
+    /// Consolidation configuration (tunable parameters).
+    consolidation_config: ConsolidationConfig,
+    /// How often to auto-run consolidation (every N ingests).
+    auto_consolidation_interval: u64,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -79,8 +90,13 @@ pub struct Cortex {
 impl Cortex {
     /// Open or create a Cortex database at the given path.
     pub fn open(db_path: &str) -> Result<Self, CortexError> {
+        Self::open_with_config(db_path, IndexConfig::default())
+    }
+
+    /// Open or create a Cortex database with custom index configuration.
+    pub fn open_with_config(db_path: &str, index_config: IndexConfig) -> Result<Self, CortexError> {
         let storage = SqliteStorage::open(db_path)?;
-        let index = MemoryIndex::new();
+        let index = MemoryIndex::with_config(index_config);
 
         // Load existing embeddings into memory index
         let all_tiers = [MemoryTier::Episodic, MemoryTier::Semantic, MemoryTier::Procedural];
@@ -100,6 +116,9 @@ impl Cortex {
             ingest_counter: AtomicU64::new(0),
             decay_config: None,
             inference_fn: None,
+            plugins: PluginManager::new(),
+            consolidation_config: ConsolidationConfig::default(),
+            auto_consolidation_interval: DEFAULT_AUTO_CONSOLIDATION_INTERVAL,
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
@@ -115,6 +134,9 @@ impl Cortex {
             ingest_counter: AtomicU64::new(0),
             decay_config: None,
             inference_fn: None,
+            plugins: PluginManager::new(),
+            consolidation_config: ConsolidationConfig::default(),
+            auto_consolidation_interval: DEFAULT_AUTO_CONSOLIDATION_INTERVAL,
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
         })
@@ -131,6 +153,30 @@ impl Cortex {
     /// When set, LLM results are merged with pattern matching during ingest.
     pub fn with_inference_fn(mut self, f: inference::InferenceFn) -> Self {
         self.inference_fn = Some(f);
+        self
+    }
+
+    /// Set custom consolidation configuration.
+    pub fn with_consolidation_config(mut self, config: ConsolidationConfig) -> Self {
+        self.consolidation_config = config;
+        self
+    }
+
+    /// Set how often auto-consolidation runs (every N ingests).
+    pub fn with_auto_consolidation_interval(mut self, interval: u64) -> Self {
+        self.auto_consolidation_interval = interval;
+        self
+    }
+
+    /// Register a plugin (compile-time, trait-object based).
+    pub fn with_plugin(mut self, plugin: Box<dyn Plugin>) -> Self {
+        self.plugins.register(plugin);
+        self
+    }
+
+    /// Register a plugin with configuration.
+    pub fn with_plugin_config(mut self, plugin: Box<dyn Plugin>, config: serde_json::Value) -> Self {
+        self.plugins.register_with_config(plugin, config);
         self
     }
 
@@ -209,12 +255,34 @@ impl Cortex {
             builder = builder.embedding(emb);
         }
 
-        let mem = builder.build();
+        let mut mem = builder.build();
+
+        // ── Plugin: on_pre_ingest ─────────────────────────────────────────
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+        let pre_actions = self.plugins.on_pre_ingest(&mem, text, &plugin_ctx);
+        let skip = PluginManager::apply_actions(&pre_actions, &mut mem);
+        if skip {
+            return Ok(mem);
+        }
+
+        // Apply plugin-requested side effects (facts, preferences, beliefs)
+        let deferred_actions: Vec<_> = pre_actions
+            .iter()
+            .filter(|a| matches!(a, PluginAction::AddFact { .. } | PluginAction::AddPreference { .. } | PluginAction::ObserveBelief { .. }))
+            .cloned()
+            .collect();
+
         self.storage.store_memory(&mem)?;
         if let Some(emb) = embedding {
             self.index.insert(mem.id, emb);
         }
-        let result = mem;
+        let result = mem.clone();
+
+        // ── Plugin: on_post_ingest ────────────────────────────────────────
+        self.plugins.on_post_ingest(&result, &plugin_ctx);
 
         // ── Auto-extract facts ───────────────────────────────────────────
         let semantic = SemanticStore::new(&self.storage, &self.index);
@@ -277,9 +345,14 @@ impl Cortex {
             );
         }
 
+        // ── Plugin: apply deferred actions (facts, preferences, beliefs) ──
+        self.apply_plugin_side_effects(&deferred_actions, "pre_ingest");
+
         // Auto-consolidation: run every N ingests
         let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_multiple_of(AUTO_CONSOLIDATION_INTERVAL) {
+        if self.auto_consolidation_interval > 0
+            && count.is_multiple_of(self.auto_consolidation_interval)
+        {
             tracing::info!("Auto-consolidation triggered at ingest #{}", count);
             if let Err(e) = self.run_consolidation() {
                 tracing::warn!("Auto-consolidation failed: {}", e);
@@ -312,7 +385,16 @@ impl Cortex {
         }
 
         let engine = RetrievalEngine::new(&self.storage, &self.index);
-        engine.retrieve(&q)
+        let mut results = engine.retrieve(&q)?;
+
+        // ── Plugin: on_pre_retrieve ───────────────────────────────────────
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+        self.plugins.on_pre_retrieve(query, &mut results, &plugin_ctx);
+
+        Ok(results)
     }
 
     /// Generate LLM-ready context from memory state.
@@ -346,8 +428,19 @@ impl Cortex {
     /// Run a full consolidation cycle (decay + promote + sweep + patterns).
     pub fn run_consolidation(&self) -> Result<ConsolidationReport, CortexError> {
         let engine = ConsolidationEngine::new(&self.storage, &self.index)
+            .with_config(self.consolidation_config.clone())
             .with_decay_config(self.decay_config.as_ref());
-        engine.run_consolidation_cycle()
+        let report = engine.run_consolidation_cycle()?;
+
+        // ── Plugin: on_consolidation ──────────────────────────────────────
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+        let actions = self.plugins.on_consolidation(&report, &plugin_ctx);
+        self.apply_plugin_side_effects(&actions, "consolidation");
+
+        Ok(report)
     }
 
     /// Run only temporal decay on episodic memories.
@@ -356,7 +449,16 @@ impl Cortex {
         if let Some(ref cfg) = self.decay_config {
             episodes = episodes.with_decay_config(cfg);
         }
-        episodes.decay_tick()
+        let count = episodes.decay_tick()?;
+
+        // ── Plugin: on_decay ──────────────────────────────────────────────
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+        self.plugins.on_decay(count, &plugin_ctx);
+
+        Ok(count)
     }
 
     /// Get beliefs above a confidence threshold.
@@ -514,5 +616,46 @@ impl Cortex {
     /// Get the memory index (for advanced use).
     pub fn index(&self) -> &MemoryIndex {
         &self.index
+    }
+
+    /// Get the plugin manager (for tool dispatch from MCP server).
+    pub fn plugin_manager(&self) -> &PluginManager {
+        &self.plugins
+    }
+
+    /// Create a PluginContext for the current state.
+    pub fn plugin_context(&self) -> PluginContext<'_> {
+        PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        }
+    }
+
+    /// Apply side-effect actions (facts, preferences, beliefs) from plugins.
+    fn apply_plugin_side_effects(&self, actions: &[PluginAction], _hook: &str) {
+        let semantic = SemanticStore::new(&self.storage, &self.index);
+        for action in actions {
+            match action {
+                PluginAction::AddFact { subject, predicate, object, confidence } => {
+                    let _ = semantic.add_fact(
+                        subject, predicate, object, *confidence,
+                        MemSource::new("plugin"), None,
+                    );
+                }
+                PluginAction::AddPreference { key, value, confidence } => {
+                    let _ = semantic.add_preference(key, value, *confidence);
+                }
+                PluginAction::ObserveBelief { key, supports, strength } => {
+                    let belief_engine = BeliefEngine::new(&self.storage);
+                    let evidence = if *supports {
+                        crate::belief::Evidence::Supports(*strength)
+                    } else {
+                        crate::belief::Evidence::Contradicts(*strength)
+                    };
+                    let _ = belief_engine.observe(key, evidence);
+                }
+                _ => {}
+            }
+        }
     }
 }

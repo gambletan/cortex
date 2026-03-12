@@ -82,8 +82,19 @@ struct McpServer {
 }
 
 impl McpServer {
+    #[allow(dead_code)]
     fn new(db_path: &str) -> Result<Self, cortex_core::CortexError> {
         let cortex = Cortex::open(db_path)?;
+        Ok(Self {
+            cortex: Arc::new(cortex),
+        })
+    }
+
+    fn new_with_plugins(db_path: &str) -> Result<Self, cortex_core::CortexError> {
+        use cortex_core::plugins::tag_classifier::TagClassifierPlugin;
+
+        let cortex = Cortex::open(db_path)?
+            .with_plugin(Box::new(TagClassifierPlugin::new()));
         Ok(Self {
             cortex: Arc::new(cortex),
         })
@@ -118,7 +129,7 @@ impl McpServer {
             // ── Tool discovery ──────────────────────────────────────────
             "tools/list" => Some(JsonRpcResponse::success(
                 id,
-                json!({ "tools": tools::list_tools() }),
+                json!({ "tools": tools::list_tools_with_plugins(&self.cortex) }),
             )),
 
             // ── Tool execution ──────────────────────────────────────────
@@ -188,7 +199,7 @@ fn main() {
 
     info!(db = %db_path, "starting cortex-mcp-server");
 
-    let server = match McpServer::new(&db_path) {
+    let server = match McpServer::new_with_plugins(&db_path) {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "failed to open cortex database");

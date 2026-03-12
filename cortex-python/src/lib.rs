@@ -8,7 +8,7 @@ fn to_py_err(e: cortex_core::CortexError) -> PyErr {
 }
 
 /// Main Cortex Python binding.
-#[pyclass]
+#[pyclass(name = "Cortex")]
 struct PyCortex {
     inner: Cortex,
 }
@@ -172,7 +172,7 @@ impl PyCortex {
 }
 
 #[pymodule]
-fn cortex_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn cortex_ai_memory(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCortex>()?;
     Ok(())
 }

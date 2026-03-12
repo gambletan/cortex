@@ -6,7 +6,24 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Return the list of available tools (MCP tool schema format).
-pub fn list_tools() -> Value {
+/// Includes built-in tools and any plugin-registered tools.
+pub fn list_tools_with_plugins(cortex: &Arc<Cortex>) -> Value {
+    let mut tools = list_tools_builtin();
+
+    // Append plugin tools
+    for pt in cortex.plugin_manager().list_tools() {
+        tools.as_array_mut().unwrap().push(json!({
+            "name": pt.name,
+            "description": pt.description,
+            "inputSchema": pt.input_schema,
+        }));
+    }
+
+    tools
+}
+
+/// Return the list of built-in tools (without plugins).
+fn list_tools_builtin() -> Value {
     json!([
         {
             "name": "memory_ingest",
@@ -351,7 +368,14 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "preference_query" => tool_preference_query(cortex, args),
         "person_list" => tool_person_list(cortex),
         "memory_decay" => tool_memory_decay(cortex),
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => {
+            // Fallback to plugin-registered tools
+            let ctx = cortex.plugin_context();
+            match cortex.plugin_manager().call_tool(name, args, &ctx) {
+                Some(result) => result,
+                None => Err(format!("Unknown tool: {name}")),
+            }
+        }
     }
 }
 

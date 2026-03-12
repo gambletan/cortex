@@ -219,6 +219,38 @@ fn extract_preferences(text: &str, lower: &str, knowledge: &mut InferredKnowledg
         }
     }
 
+    // "I'm into X", "I'm passionate about X", "I mainly use X"
+    if let Some(rest) = strip_prefix_any(lower, &["i'm into ", "i am into "]) {
+        let value = clean_value(first_clause(rest));
+        if !value.is_empty() && value.len() < 100 {
+            knowledge.preferences.push(InferredPreference {
+                key: "interest".into(),
+                value,
+                confidence: 0.75,
+            });
+        }
+    }
+    if let Some(rest) = strip_prefix_any(lower, &["i'm passionate about ", "i am passionate about "]) {
+        let value = clean_value(first_clause(rest));
+        if !value.is_empty() && value.len() < 100 {
+            knowledge.preferences.push(InferredPreference {
+                key: "passion".into(),
+                value,
+                confidence: 0.80,
+            });
+        }
+    }
+    if let Some(rest) = strip_prefix_any(lower, &["i mainly use "]) {
+        let value = clean_value(first_clause(rest));
+        if !value.is_empty() && value.len() < 100 {
+            knowledge.preferences.push(InferredPreference {
+                key: "preference".into(),
+                value,
+                confidence: 0.80,
+            });
+        }
+    }
+
     // Language patterns
     for (pattern, lang_key) in &[
         ("i speak ", "language"),
@@ -312,9 +344,10 @@ fn extract_facts(_text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
         }
     }
 
-    // Age/experience: "I have X years of experience"
+    // "I have ..." — dispatch to experience, children, or pet
     if let Some(rest) = strip_prefix_any(lower, &["i have "]) {
         if rest.contains("years of experience") || rest.contains("years experience") {
+            // Age/experience: "I have X years of experience"
             let years_part = first_clause(rest);
             knowledge.facts.push(InferredFact {
                 subject: "User".into(),
@@ -322,6 +355,38 @@ fn extract_facts(_text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
                 object: clean_value(years_part),
                 confidence: 0.80,
             });
+        } else if rest.contains("kid") || rest.contains("child") || rest.contains("children") {
+            // Children: "I have 2 kids"
+            let object = clean_value(first_clause(rest));
+            if !object.is_empty() {
+                knowledge.facts.push(InferredFact {
+                    subject: "User".into(),
+                    predicate: "has_children".into(),
+                    object,
+                    confidence: 0.85,
+                });
+            }
+        } else {
+            // Pet: "I have a dog", "I have two cats", "I have an iguana"
+            let article_stripped = rest
+                .strip_prefix("a ")
+                .or_else(|| rest.strip_prefix("an "))
+                .unwrap_or(rest);
+            let object = clean_value(first_clause(article_stripped));
+            let pet_words = [
+                "dog", "cat", "pet", "bird", "fish", "hamster", "rabbit",
+                "parrot", "turtle", "snake", "guinea pig", "ferret", "lizard",
+                "iguana", "gerbil", "chinchilla", "kitten", "puppy",
+            ];
+            let object_lower = object.to_lowercase();
+            if pet_words.iter().any(|w| object_lower.contains(w)) {
+                knowledge.facts.push(InferredFact {
+                    subject: "User".into(),
+                    predicate: "has_pet".into(),
+                    object,
+                    confidence: 0.85,
+                });
+            }
         }
     }
 
@@ -333,6 +398,65 @@ fn extract_facts(_text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
                 subject: "User".into(),
                 predicate: "timezone".into(),
                 object: tz,
+                confidence: 0.90,
+            });
+        }
+    }
+
+    // Education: "I studied X", "I graduated from X", "I have a degree in X", "I majored in X"
+    for (pattern, predicate) in &[
+        ("i studied at ", "studied_at"),
+        ("i studied ", "degree_in"),
+        ("i graduated from ", "studied_at"),
+        ("i have a degree in ", "degree_in"),
+        ("i majored in ", "degree_in"),
+    ] {
+        if let Some(rest) = strip_prefix_any(lower, &[pattern]) {
+            // Preserve original case from the input text
+            let orig_rest = &_text[_text.len() - rest.len()..];
+            let object = clean_value(first_clause(orig_rest));
+            if !object.is_empty() && object.len() < 80 {
+                knowledge.facts.push(InferredFact {
+                    subject: "User".into(),
+                    predicate: predicate.to_string(),
+                    object,
+                    confidence: 0.85,
+                });
+            }
+        }
+    }
+
+    // Hobbies: "my hobby is X", "I enjoy doing X", "in my free time I X"
+    if let Some(rest) = strip_prefix_any(lower, &["my hobby is ", "my hobbies are ", "i enjoy doing ", "in my free time i "]) {
+        let object = clean_value(first_clause(rest));
+        if !object.is_empty() && object.len() < 80 {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: "hobby".into(),
+                object,
+                confidence: 0.80,
+            });
+        }
+    }
+
+    // Relationship: "I'm married"
+    if lower.starts_with("i'm married") || lower.starts_with("i am married") {
+        knowledge.facts.push(InferredFact {
+            subject: "User".into(),
+            predicate: "marital_status".into(),
+            object: "married".into(),
+            confidence: 0.90,
+        });
+    }
+
+    // Native language: "my native language is X", "my mother tongue is X"
+    if let Some(rest) = strip_prefix_any(lower, &["my native language is ", "my mother tongue is "]) {
+        let object = clean_value(first_clause(rest));
+        if !object.is_empty() && object.len() < 50 {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: "native_language".into(),
+                object: capitalize_first(&object),
                 confidence: 0.90,
             });
         }
@@ -432,6 +556,61 @@ fn extract_chinese_facts(text: &str, knowledge: &mut InferredKnowledge) {
             confidence: 0.80,
         });
     }
+
+    // Education: "我毕业于X", "我在X上学", "我学的是X"
+    for (prefix, suffix, predicate) in &[
+        ("我毕业于", "", "studied_at"),
+        ("我在", "上学", "studied_at"),
+        ("我学的是", "", "degree_in"),
+    ] {
+        if let Some(obj) = extract_zh_pattern(text, prefix, suffix) {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: predicate.to_string(),
+                object: obj,
+                confidence: 0.85,
+            });
+        }
+    }
+
+    // Hobbies: "我的爱好是X", "我平时喜欢X"
+    for prefix in &["我的爱好是", "我平时喜欢"] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            if !obj.is_empty() && obj.len() < 80 {
+                knowledge.facts.push(InferredFact {
+                    subject: "User".into(),
+                    predicate: "hobby".into(),
+                    object: obj,
+                    confidence: 0.80,
+                });
+                break;
+            }
+        }
+    }
+
+    // Pet: "我养了X"
+    if let Some(obj) = extract_zh_prefix(text, "我养了") {
+        if !obj.is_empty() && obj.len() < 50 {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: "has_pet".into(),
+                object: obj,
+                confidence: 0.85,
+            });
+        }
+    }
+
+    // Native language: "我的母语是X"
+    if let Some(obj) = extract_zh_prefix(text, "我的母语是") {
+        if !obj.is_empty() && obj.len() < 50 {
+            knowledge.facts.push(InferredFact {
+                subject: "User".into(),
+                predicate: "native_language".into(),
+                object: obj,
+                confidence: 0.90,
+            });
+        }
+    }
 }
 
 // ── Chinese preference extraction ────────────────────────────────────────────
@@ -487,6 +666,20 @@ fn extract_chinese_preferences(text: &str, knowledge: &mut InferredKnowledge) {
                     });
                     break;
                 }
+            }
+        }
+    }
+
+    // "我主要用X", "我经常用X"
+    for prefix in &["我主要用", "我经常用"] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            if !obj.is_empty() && obj.len() < 100 {
+                knowledge.preferences.push(InferredPreference {
+                    key: "preference".into(),
+                    value: obj,
+                    confidence: 0.80,
+                });
+                break;
             }
         }
     }
@@ -864,5 +1057,192 @@ mod tests {
         let k = extract("I live in Shanghai，我喜欢用Rust");
         assert!(k.facts.len() >= 1); // English: lives_in Shanghai
         assert!(!k.preferences.is_empty()); // Chinese: likes Rust
+    }
+
+    // ── New English fact pattern tests ─────────────────────────────────
+
+    #[test]
+    fn test_extract_education_studied() {
+        let k = extract("I studied Computer Science");
+        let fact = k.facts.iter().find(|f| f.predicate == "degree_in").unwrap();
+        assert_eq!(fact.object, "Computer Science");
+    }
+
+    #[test]
+    fn test_extract_education_graduated() {
+        let k = extract("I graduated from MIT");
+        let fact = k.facts.iter().find(|f| f.predicate == "studied_at").unwrap();
+        assert_eq!(fact.object, "MIT");
+    }
+
+    #[test]
+    fn test_extract_education_degree() {
+        let k = extract("I have a degree in Physics");
+        let fact = k.facts.iter().find(|f| f.predicate == "degree_in").unwrap();
+        assert_eq!(fact.object, "Physics");
+    }
+
+    #[test]
+    fn test_extract_education_majored() {
+        let k = extract("I majored in Mathematics");
+        let fact = k.facts.iter().find(|f| f.predicate == "degree_in").unwrap();
+        assert_eq!(fact.object, "Mathematics");
+    }
+
+    #[test]
+    fn test_extract_hobby() {
+        let k = extract("My hobby is painting");
+        let fact = k.facts.iter().find(|f| f.predicate == "hobby").unwrap();
+        assert_eq!(fact.object, "painting");
+    }
+
+    #[test]
+    fn test_extract_hobby_enjoy_doing() {
+        let k = extract("I enjoy doing yoga");
+        let fact = k.facts.iter().find(|f| f.predicate == "hobby").unwrap();
+        assert_eq!(fact.object, "yoga");
+    }
+
+    #[test]
+    fn test_extract_hobby_free_time() {
+        let k = extract("In my free time I read books");
+        let fact = k.facts.iter().find(|f| f.predicate == "hobby").unwrap();
+        assert_eq!(fact.object, "read books");
+    }
+
+    #[test]
+    fn test_extract_married() {
+        let k = extract("I'm married");
+        let fact = k.facts.iter().find(|f| f.predicate == "marital_status").unwrap();
+        assert_eq!(fact.object, "married");
+    }
+
+    #[test]
+    fn test_extract_children() {
+        let k = extract("I have 2 kids");
+        let fact = k.facts.iter().find(|f| f.predicate == "has_children").unwrap();
+        assert_eq!(fact.object, "2 kids");
+    }
+
+    #[test]
+    fn test_extract_pet() {
+        let k = extract("I have a dog");
+        let fact = k.facts.iter().find(|f| f.predicate == "has_pet").unwrap();
+        assert_eq!(fact.object, "dog");
+    }
+
+    #[test]
+    fn test_extract_pet_cat() {
+        let k = extract("I have a cat");
+        let fact = k.facts.iter().find(|f| f.predicate == "has_pet").unwrap();
+        assert_eq!(fact.object, "cat");
+    }
+
+    #[test]
+    fn test_extract_native_language() {
+        let k = extract("My native language is Chinese");
+        let fact = k.facts.iter().find(|f| f.predicate == "native_language").unwrap();
+        assert_eq!(fact.object, "Chinese");
+    }
+
+    #[test]
+    fn test_extract_mother_tongue() {
+        let k = extract("My mother tongue is Japanese");
+        let fact = k.facts.iter().find(|f| f.predicate == "native_language").unwrap();
+        assert_eq!(fact.object, "Japanese");
+    }
+
+    // ── New English preference pattern tests ──────────────────────────
+
+    #[test]
+    fn test_extract_pref_into() {
+        let k = extract("I'm into machine learning");
+        let pref = k.preferences.iter().find(|p| p.key == "interest").unwrap();
+        assert_eq!(pref.value, "machine learning");
+        assert!((pref.confidence - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_extract_pref_passionate() {
+        let k = extract("I'm passionate about open source");
+        let pref = k.preferences.iter().find(|p| p.key == "passion").unwrap();
+        assert_eq!(pref.value, "open source");
+        assert!((pref.confidence - 0.80).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_extract_pref_mainly_use() {
+        let k = extract("I mainly use Linux");
+        let pref = k.preferences.iter().find(|p| p.key == "preference" && p.value == "linux").unwrap();
+        assert!((pref.confidence - 0.80).abs() < 0.01);
+    }
+
+    // ── New Chinese fact pattern tests ────────────────────────────────
+
+    #[test]
+    fn test_zh_education_graduated() {
+        let k = extract("我毕业于清华大学");
+        let fact = k.facts.iter().find(|f| f.predicate == "studied_at").unwrap();
+        assert_eq!(fact.object, "清华大学");
+    }
+
+    #[test]
+    fn test_zh_education_school() {
+        let k = extract("我在北大上学");
+        let fact = k.facts.iter().find(|f| f.predicate == "studied_at").unwrap();
+        assert_eq!(fact.object, "北大");
+    }
+
+    #[test]
+    fn test_zh_education_degree() {
+        let k = extract("我学的是计算机");
+        let fact = k.facts.iter().find(|f| f.predicate == "degree_in").unwrap();
+        assert_eq!(fact.object, "计算机");
+    }
+
+    #[test]
+    fn test_zh_hobby() {
+        let k = extract("我的爱好是跑步");
+        let fact = k.facts.iter().find(|f| f.predicate == "hobby").unwrap();
+        assert_eq!(fact.object, "跑步");
+    }
+
+    #[test]
+    fn test_zh_hobby_usually() {
+        let k = extract("我平时喜欢看书");
+        let fact = k.facts.iter().find(|f| f.predicate == "hobby").unwrap();
+        assert_eq!(fact.object, "看书");
+    }
+
+    #[test]
+    fn test_zh_pet() {
+        let k = extract("我养了一只猫");
+        let fact = k.facts.iter().find(|f| f.predicate == "has_pet").unwrap();
+        assert_eq!(fact.object, "一只猫");
+    }
+
+    #[test]
+    fn test_zh_native_language() {
+        let k = extract("我的母语是中文");
+        let fact = k.facts.iter().find(|f| f.predicate == "native_language").unwrap();
+        assert_eq!(fact.object, "中文");
+    }
+
+    // ── New Chinese preference pattern tests ──────────────────────────
+
+    #[test]
+    fn test_zh_pref_mainly_use() {
+        let k = extract("我主要用VS Code");
+        let pref = k.preferences.iter().find(|p| p.key == "preference").unwrap();
+        assert_eq!(pref.value, "VS Code");
+        assert!((pref.confidence - 0.80).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_zh_pref_often_use() {
+        let k = extract("我经常用Python");
+        let pref = k.preferences.iter().find(|p| p.key == "preference").unwrap();
+        assert_eq!(pref.value, "Python");
+        assert!((pref.confidence - 0.80).abs() < 0.01);
     }
 }

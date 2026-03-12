@@ -21,16 +21,47 @@ pub struct ConsolidationReport {
     pub people_updated: usize,
 }
 
+/// Configurable parameters for consolidation cycles.
+#[derive(Debug, Clone)]
+pub struct ConsolidationConfig {
+    /// Minimum number of occurrences before an episodic memory is promoted to semantic.
+    pub min_occurrences: usize,
+    /// Salience threshold below which episodic memories are swept (soft-deleted).
+    pub sweep_threshold: f32,
+    /// Time window (in days) for behavioral pattern extraction.
+    pub pattern_window_days: i64,
+    /// Multiplier applied to salience when promoting episodic to semantic.
+    pub salience_boost: f32,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            min_occurrences: 3,
+            sweep_threshold: 0.05,
+            pattern_window_days: 30,
+            salience_boost: 1.5,
+        }
+    }
+}
+
 /// Background consolidation engine — like sleep for the brain.
 pub struct ConsolidationEngine<'a> {
     storage: &'a dyn StorageBackend,
     index: &'a MemoryIndex,
     decay_config: Option<&'a DecayConfig>,
+    config: ConsolidationConfig,
 }
 
 impl<'a> ConsolidationEngine<'a> {
     pub fn new(storage: &'a dyn StorageBackend, index: &'a MemoryIndex) -> Self {
-        Self { storage, index, decay_config: None }
+        Self { storage, index, decay_config: None, config: ConsolidationConfig::default() }
+    }
+
+    /// Set custom consolidation configuration.
+    pub fn with_config(mut self, config: ConsolidationConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Set custom decay configuration (forwarded to EpisodeStore).
@@ -55,17 +86,17 @@ impl<'a> ConsolidationEngine<'a> {
         report.decayed_updated = episodes.decay_tick()?;
 
         // 2. Find repeated episodic facts for promotion
-        let promoted = self.find_promotion_candidates(3)?;
+        let promoted = self.find_promotion_candidates(self.config.min_occurrences)?;
         for ids in &promoted {
             self.promote_to_semantic(ids.clone())?;
         }
         report.promoted_to_semantic = promoted.len();
 
         // 3. Sweep dead memories (after decay, so freshly-decayed ones get swept)
-        report.decayed_swept = self.sweep_decayed(0.05)?;
+        report.decayed_swept = self.sweep_decayed(self.config.sweep_threshold)?;
 
         // 4. Pattern extraction
-        let patterns = self.extract_patterns(Duration::days(30))?;
+        let patterns = self.extract_patterns(Duration::days(self.config.pattern_window_days))?;
         report.patterns_detected = patterns.len();
 
         // 5. Count episodes scanned
@@ -127,7 +158,7 @@ impl<'a> ConsolidationEngine<'a> {
             .ok_or_else(|| CortexError::NotFound(format!("Memory {}", episode_ids[0])))?;
 
         // Create semantic memory with boosted salience
-        let salience = Salience::new((first.salience.base_score * 1.5).min(1.0));
+        let salience = Salience::new((first.salience.base_score * self.config.salience_boost).min(1.0));
         let mem = MemObjectBuilder::new(MemoryTier::Semantic, first.content.clone(), first.source.clone())
             .salience(salience)
             .tags(first.tags.clone())
