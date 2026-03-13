@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn test_mixed_zh_en() {
         let k = extract("I live in Shanghai，我喜欢用Rust");
-        assert!(k.facts.len() >= 1); // English: lives_in Shanghai
+        assert!(!k.facts.is_empty()); // English: lives_in Shanghai
         assert!(!k.preferences.is_empty()); // Chinese: likes Rust
     }
 

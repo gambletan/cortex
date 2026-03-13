@@ -76,6 +76,17 @@ pub trait Plugin: Send + Sync {
     /// Initialize the plugin with optional configuration.
     fn init(&mut self, _config: Option<Value>) {}
 
+    /// Return names of plugins that must be loaded before this one.
+    fn dependencies(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Return a semver requirement for the Cortex version this plugin supports.
+    /// E.g., ">=0.1.0, <1.0.0". Returns None if no constraint.
+    fn cortex_version_req(&self) -> Option<String> {
+        None
+    }
+
     /// Called before a memory is stored. Can modify the memory or return actions.
     fn on_pre_ingest(
         &self,

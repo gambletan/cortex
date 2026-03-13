@@ -82,6 +82,10 @@ fn list_tools_builtin() -> Value {
                         "type": "array",
                         "items": { "type": "number" },
                         "description": "Query embedding for semantic search (optional)"
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Filter by namespace for isolation (optional)"
                     }
                 },
                 "required": ["query"]
@@ -343,6 +347,53 @@ fn list_tools_builtin() -> Value {
                 "type": "object",
                 "properties": {}
             }
+        },
+        {
+            "name": "memory_archive",
+            "description": "Archive a memory to cold storage. Removes it from the active index. Use for old/low-value memories you want to keep but not actively search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory UUID to archive"
+                    }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "memory_ingest_batch",
+            "description": "Ingest multiple memories in a single transaction. More efficient than multiple memory_ingest calls. Supports deduplication.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "Array of memory items to ingest",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "description": "Content to remember" },
+                                "channel": { "type": "string", "description": "Source channel" },
+                                "user_id": { "type": "string", "description": "User ID (optional)" },
+                                "salience": { "type": "number", "description": "Importance 0-1 (optional)" },
+                                "namespace": { "type": "string", "description": "Namespace for isolation (optional)" }
+                            },
+                            "required": ["text", "channel"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }
+        },
+        {
+            "name": "tag_list_taxonomy",
+            "description": "List all tags currently in use across memories, with counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -368,6 +419,9 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "preference_query" => tool_preference_query(cortex, args),
         "person_list" => tool_person_list(cortex),
         "memory_decay" => tool_memory_decay(cortex),
+        "memory_archive" => tool_memory_archive(cortex, args),
+        "memory_ingest_batch" => tool_memory_ingest_batch(cortex, args),
+        "tag_list_taxonomy" => tool_tag_list_taxonomy(cortex),
         _ => {
             // Fallback to plugin-registered tools
             let ctx = cortex.plugin_context();
@@ -460,9 +514,10 @@ fn tool_memory_search(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Stri
     let person_id = get_str(args, "person_id")
         .and_then(|s| Uuid::parse_str(s).ok());
     let embedding = get_embedding(args);
+    let namespace = get_str(args, "namespace");
 
     let results = cortex
-        .retrieve(query, limit, channel, person_id, embedding)
+        .retrieve_with_namespace(query, limit, channel, person_id, embedding, namespace)
         .map_err(|e| e.to_string())?;
 
     let items: Vec<Value> = results
@@ -709,14 +764,25 @@ fn tool_relationship_extract(cortex: &Arc<Cortex>, args: &Value) -> Result<Strin
 
 fn tool_memory_stats(cortex: &Arc<Cortex>) -> Result<String, String> {
     let stats = cortex.stats().map_err(|e| e.to_string())?;
+    let metrics = cortex.metrics();
     Ok(json!({
         "episodic": stats.episodic,
         "semantic": stats.semantic,
         "procedural": stats.procedural,
+        "archived": stats.archived,
         "people": stats.people,
         "beliefs": stats.beliefs,
         "index_size": stats.index_size,
         "total": stats.total,
+        "metrics": {
+            "ingests": metrics.ingests,
+            "batch_ingests": metrics.batch_ingests,
+            "retrievals": metrics.retrievals,
+            "dedup_hits": metrics.dedup_hits,
+            "consolidations": metrics.consolidations,
+            "decay_runs": metrics.decay_runs,
+            "archives": metrics.archives,
+        }
     }).to_string())
 }
 
@@ -795,5 +861,77 @@ fn tool_memory_decay(cortex: &Arc<Cortex>) -> Result<String, String> {
     Ok(json!({
         "memories_updated": updated,
         "status": "decay_complete",
+    }).to_string())
+}
+
+fn tool_memory_archive(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let id_str = get_str(args, "id").ok_or("missing 'id'")?;
+    let id = Uuid::parse_str(id_str).map_err(|e| format!("Invalid UUID: {}", e))?;
+
+    cortex.archive_memory(id).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "id": id_str,
+        "status": "archived",
+    }).to_string())
+}
+
+fn tool_memory_ingest_batch(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let items_arr = args.get("items")
+        .and_then(|v| v.as_array())
+        .ok_or("missing 'items' array")?;
+
+    let items: Vec<cortex_core::types::BatchIngestItem> = items_arr.iter().map(|item| {
+        cortex_core::types::BatchIngestItem {
+            text: item.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            channel: item.get("channel").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+            user_id: item.get("user_id").and_then(|v| v.as_str()).map(String::from),
+            salience_hint: item.get("salience").and_then(|v| v.as_f64()).map(|v| v as f32),
+            embedding: None,
+            namespace: item.get("namespace").and_then(|v| v.as_str()).map(String::from),
+        }
+    }).collect();
+
+    let report = cortex.ingest_batch(items).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "total_submitted": report.total_submitted,
+        "stored": report.stored,
+        "deduplicated": report.deduplicated,
+        "skipped_by_plugin": report.skipped_by_plugin,
+        "status": "batch_complete"
+    }).to_string())
+}
+
+fn tool_tag_list_taxonomy(cortex: &Arc<Cortex>) -> Result<String, String> {
+    use std::collections::HashMap;
+
+    let mut tag_counts: HashMap<String, usize> = HashMap::new();
+    let tiers = [
+        cortex_core::types::MemoryTier::Episodic,
+        cortex_core::types::MemoryTier::Semantic,
+        cortex_core::types::MemoryTier::Procedural,
+    ];
+
+    for tier in &tiers {
+        if let Ok(mems) = cortex.storage().list_by_tier(*tier, 100_000) {
+            for mem in mems {
+                for tag in &mem.tags {
+                    *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut sorted: Vec<_> = tag_counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let items: Vec<Value> = sorted.iter().map(|(tag, count)| {
+        json!({ "tag": tag, "count": count })
+    }).collect();
+
+    Ok(json!({
+        "tags": items,
+        "total_unique": items.len(),
     }).to_string())
 }

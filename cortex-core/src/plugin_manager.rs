@@ -1,5 +1,6 @@
 //! Plugin manager — registration, hook dispatch, and action application.
 
+use std::collections::HashMap;
 use std::panic;
 
 use serde_json::Value;
@@ -50,6 +51,69 @@ impl PluginManager {
         );
         plugin.init(Some(config));
         self.plugins.push(plugin);
+    }
+
+    /// Register multiple plugins with dependency-ordered loading.
+    /// Performs topological sort based on `dependencies()` declarations.
+    pub fn register_all(&mut self, mut plugins: Vec<Box<dyn Plugin>>) {
+        // Build name→index map and dependency graph
+        let names: Vec<String> = plugins.iter().map(|p| p.meta().name.clone()).collect();
+        let name_to_idx: HashMap<String, usize> = names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
+
+        // Topological sort (Kahn's algorithm)
+        let n = plugins.len();
+        let mut in_degree = vec![0usize; n];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for (i, plugin) in plugins.iter().enumerate() {
+            for dep in plugin.dependencies() {
+                if let Some(&dep_idx) = name_to_idx.get(&dep) {
+                    adj[dep_idx].push(i);
+                    in_degree[i] += 1;
+                } else {
+                    warn!(plugin = %names[i], dependency = %dep, "Missing plugin dependency");
+                }
+            }
+        }
+
+        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut order = Vec::with_capacity(n);
+
+        while let Some(idx) = queue.pop() {
+            order.push(idx);
+            for &next in &adj[idx] {
+                in_degree[next] -= 1;
+                if in_degree[next] == 0 {
+                    queue.push(next);
+                }
+            }
+        }
+
+        if order.len() < n {
+            warn!("Circular plugin dependency detected; loading in declaration order");
+            order = (0..n).collect();
+        }
+
+        // Sort plugins array by order (drain into indexed slots)
+        let mut indexed: Vec<Option<Box<dyn Plugin>>> = plugins.drain(..).map(Some).collect();
+        for idx in order {
+            if let Some(plugin) = indexed[idx].take() {
+                self.register(plugin);
+            }
+        }
+    }
+
+    /// Check version compatibility for a plugin.
+    pub fn check_version_compat(plugin: &dyn Plugin, cortex_version: &str) -> bool {
+        if let Some(req_str) = plugin.cortex_version_req() {
+            if let (Ok(req), Ok(ver)) = (
+                semver::VersionReq::parse(&req_str),
+                semver::Version::parse(cortex_version),
+            ) {
+                return req.matches(&ver);
+            }
+        }
+        true // no constraint = always compatible
     }
 
     /// Number of registered plugins.

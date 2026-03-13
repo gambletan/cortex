@@ -132,6 +132,50 @@ pub trait StorageBackend: Send + Sync {
         }).collect())
     }
 
+    // Batch store (transactional)
+    fn store_memories_batch(&self, mems: &[MemObject]) -> Result<usize, crate::CortexError> {
+        // Default: N individual inserts (override for transactional batch)
+        for mem in mems {
+            self.store_memory(mem)?;
+        }
+        Ok(mems.len())
+    }
+
+    // Deduplication
+    fn find_by_content_hash(&self, hash: &str) -> Result<Option<MemObject>, crate::CortexError>;
+
+    // Archival
+    fn archive_memory(&self, id: Uuid) -> Result<(), crate::CortexError> {
+        if let Some(mut mem) = self.get_memory(id)? {
+            mem.tier = crate::types::MemoryTier::Archived;
+            self.update_memory(&mem)?;
+        }
+        Ok(())
+    }
+
+    fn restore_memory(&self, id: Uuid, target_tier: MemoryTier) -> Result<(), crate::CortexError> {
+        if let Some(mut mem) = self.get_memory(id)? {
+            mem.tier = target_tier;
+            self.update_memory(&mem)?;
+        }
+        Ok(())
+    }
+
+    // Namespace-filtered queries
+    fn list_by_tier_and_namespace(
+        &self,
+        tier: MemoryTier,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemObject>, crate::CortexError> {
+        // Default: filter in memory (override for SQL-level filtering)
+        let all = self.list_by_tier(tier, limit)?;
+        Ok(match namespace {
+            Some(ns) => all.into_iter().filter(|m| m.namespace.as_deref() == Some(ns)).collect(),
+            None => all,
+        })
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

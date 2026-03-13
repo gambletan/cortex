@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -47,6 +48,12 @@ pub struct MemObject {
     pub links: Vec<MemLink>,
     pub tags: Vec<String>,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// SHA-256 hash of content for deduplication.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Namespace for access control isolation.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +62,8 @@ pub enum MemoryTier {
     Episodic,
     Semantic,
     Procedural,
+    /// Cold storage for old/low-salience memories.
+    Archived,
 }
 
 impl MemoryTier {
@@ -64,6 +73,7 @@ impl MemoryTier {
             Self::Episodic => "episodic",
             Self::Semantic => "semantic",
             Self::Procedural => "procedural",
+            Self::Archived => "archived",
         }
     }
 
@@ -73,6 +83,7 @@ impl MemoryTier {
             "episodic" => Some(Self::Episodic),
             "semantic" => Some(Self::Semantic),
             "procedural" => Some(Self::Procedural),
+            "archived" => Some(Self::Archived),
             _ => None,
         }
     }
@@ -252,6 +263,7 @@ pub struct MemObjectBuilder {
     metadata: HashMap<String, serde_json::Value>,
     event_time: Option<DateTime<Utc>>,
     durability: MemoryDurability,
+    namespace: Option<String>,
 }
 
 impl MemObjectBuilder {
@@ -267,6 +279,7 @@ impl MemObjectBuilder {
             metadata: HashMap::new(),
             event_time: None,
             durability: MemoryDurability::default(),
+            namespace: None,
         }
     }
 
@@ -305,8 +318,14 @@ impl MemObjectBuilder {
         self
     }
 
+    pub fn namespace(mut self, ns: impl Into<String>) -> Self {
+        self.namespace = Some(ns.into());
+        self
+    }
+
     pub fn build(self) -> MemObject {
         let now = Utc::now();
+        let content_hash = compute_content_hash(&self.content);
         MemObject {
             id: Uuid::new_v4(),
             tier: self.tier,
@@ -326,6 +345,80 @@ impl MemObjectBuilder {
             links: Vec::new(),
             tags: self.tags,
             metadata: self.metadata,
+            content_hash: Some(content_hash),
+            namespace: self.namespace,
         }
     }
+}
+
+/// Compute SHA-256 hash of memory content for deduplication.
+pub fn compute_content_hash(content: &MemContent) -> String {
+    let text = match content {
+        MemContent::Text(t) => t.clone(),
+        MemContent::Fact { subject, predicate, object } => {
+            format!("fact:{}:{}:{}", subject, predicate, object)
+        }
+        MemContent::Preference { key, value, .. } => format!("pref:{}:{}", key, value),
+        MemContent::Relationship { person_a, person_b, relation } => {
+            format!("rel:{}:{}:{}", person_a, person_b, relation)
+        }
+        MemContent::Pattern { trigger, actions, .. } => {
+            format!("pattern:{}:{}", trigger, actions.join(","))
+        }
+        MemContent::Event { title, start, .. } => format!("event:{}:{}", title, start),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Configuration for batch ingest deduplication.
+#[derive(Debug, Clone)]
+pub struct DeduplicationConfig {
+    /// Enable exact content hash dedup.
+    pub exact_dedup: bool,
+    /// Enable near-duplicate detection via vector similarity.
+    pub near_dedup: bool,
+    /// Cosine similarity threshold for near-dedup (0.0-1.0).
+    pub near_dedup_threshold: f32,
+}
+
+impl Default for DeduplicationConfig {
+    fn default() -> Self {
+        Self {
+            exact_dedup: true,
+            near_dedup: false,
+            near_dedup_threshold: 0.95,
+        }
+    }
+}
+
+/// Item for batch ingest.
+pub struct BatchIngestItem {
+    pub text: String,
+    pub channel: String,
+    pub user_id: Option<String>,
+    pub salience_hint: Option<f32>,
+    pub embedding: Option<Vec<f32>>,
+    pub namespace: Option<String>,
+}
+
+/// Result of a batch ingest operation.
+#[derive(Debug, Default)]
+pub struct BatchIngestReport {
+    pub total_submitted: usize,
+    pub stored: usize,
+    pub deduplicated: usize,
+    pub skipped_by_plugin: usize,
+}
+
+/// Memory event for the change feed.
+#[derive(Debug, Clone)]
+pub enum CortexEvent {
+    MemoryCreated { id: Uuid, tier: MemoryTier },
+    MemoryUpdated { id: Uuid },
+    MemoryDeleted { id: Uuid },
+    MemoryArchived { id: Uuid },
+    ConsolidationCompleted { report: String },
+    DecayCompleted { count: usize },
 }

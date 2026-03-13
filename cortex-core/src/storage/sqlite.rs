@@ -57,6 +57,9 @@ impl SqliteStorage {
         let tags_json: String = row.get(8)?;
         let metadata_json: String = row.get(9)?;
         let links_json: String = row.get(10)?;
+        // Columns 11+ are optional (content_hash, namespace added by migration)
+        let content_hash: Option<String> = row.get(11).ok().unwrap_or(None);
+        let namespace: Option<String> = row.get(12).ok().unwrap_or(None);
 
         let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
         let tier = MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Episodic);
@@ -83,6 +86,8 @@ impl SqliteStorage {
             links,
             tags,
             metadata,
+            content_hash,
+            namespace,
         })
     }
 }
@@ -126,6 +131,10 @@ impl StorageBackend for SqliteStorage {
 
             CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+            CREATE INDEX IF NOT EXISTS idx_memories_source_channel
+                ON memories(json_extract(source_json, '$.channel'));
+            CREATE INDEX IF NOT EXISTS idx_memories_salience
+                ON memories(json_extract(salience_json, '$.effective_score'));
 
             CREATE TABLE IF NOT EXISTS links (
                 source_id TEXT NOT NULL,
@@ -179,6 +188,21 @@ impl StorageBackend for SqliteStorage {
             ",
         )
         .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Migration: add content_hash and namespace columns if missing
+        let has_content_hash: bool = conn
+            .prepare("SELECT content_hash FROM memories LIMIT 0")
+            .is_ok();
+        if !has_content_hash {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN content_hash TEXT;
+                 ALTER TABLE memories ADD COLUMN namespace TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash);
+                 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -187,8 +211,8 @@ impl StorageBackend for SqliteStorage {
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         conn.execute(
-            "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 mem.id.to_string(),
                 mem.tier.as_str(),
@@ -201,6 +225,8 @@ impl StorageBackend for SqliteStorage {
                 serde_json::to_string(&mem.tags).unwrap(),
                 serde_json::to_string(&mem.metadata).unwrap(),
                 serde_json::to_string(&mem.links).unwrap(),
+                mem.content_hash,
+                mem.namespace,
                 now,
                 now,
             ],
@@ -213,7 +239,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let result = conn
             .query_row(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE id = ?1",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id = ?1",
                 params![id.to_string()],
                 Self::parse_mem_row,
             )
@@ -227,7 +253,7 @@ impl StorageBackend for SqliteStorage {
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         conn.execute(
-            "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, updated_at=?12 WHERE id=?1",
+            "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, updated_at=?14 WHERE id=?1",
             params![
                 mem.id.to_string(),
                 mem.tier.as_str(),
@@ -240,6 +266,8 @@ impl StorageBackend for SqliteStorage {
                 serde_json::to_string(&mem.tags).unwrap(),
                 serde_json::to_string(&mem.metadata).unwrap(),
                 serde_json::to_string(&mem.links).unwrap(),
+                mem.content_hash,
+                mem.namespace,
                 now,
             ],
         )
@@ -262,7 +290,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
@@ -291,7 +319,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE json_extract(source_json, '$.channel') = ?1 ORDER BY created_at DESC LIMIT ?2",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE json_extract(source_json, '$.channel') = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
@@ -312,7 +340,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 AND json_extract(salience_json, '$.effective_score') < ?2",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND json_extract(salience_json, '$.effective_score') < ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
@@ -334,7 +362,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE tier = ?1 AND created_at >= ?2 AND created_at <= ?3 ORDER BY created_at DESC",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND created_at >= ?2 AND created_at <= ?3 ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
@@ -671,7 +699,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE id IN ({})",
+            "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id IN ({})",
             placeholders.join(", ")
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -693,7 +721,8 @@ impl StorageBackend for SqliteStorage {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, \
-                 salience_json, privacy_json, tags_json, metadata_json, links_json \
+                 salience_json, privacy_json, tags_json, metadata_json, links_json, \
+                 content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
                  AND (LOWER(json_extract(content_json, '$.Fact.subject')) LIKE ?1 \
                    OR LOWER(json_extract(content_json, '$.Fact.object')) LIKE ?1) \
@@ -716,7 +745,8 @@ impl StorageBackend for SqliteStorage {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, \
-                 salience_json, privacy_json, tags_json, metadata_json, links_json \
+                 salience_json, privacy_json, tags_json, metadata_json, links_json, \
+                 content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
                  AND LOWER(json_extract(content_json, '$.Preference.key')) LIKE ?1 \
                  ORDER BY created_at DESC",
@@ -744,19 +774,112 @@ impl StorageBackend for SqliteStorage {
         Ok(count as usize)
     }
 
+    fn store_memories_batch(&self, mems: &[MemObject]) -> Result<usize, CortexError> {
+        if mems.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        let mut count = 0;
+        for mem in mems {
+            let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+            let result = conn.execute(
+                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    mem.id.to_string(),
+                    mem.tier.as_str(),
+                    serde_json::to_string(&mem.content).unwrap(),
+                    embedding_blob,
+                    serde_json::to_string(&mem.temporal).unwrap(),
+                    serde_json::to_string(&mem.source).unwrap(),
+                    serde_json::to_string(&mem.salience).unwrap(),
+                    serde_json::to_string(&mem.privacy).unwrap(),
+                    serde_json::to_string(&mem.tags).unwrap(),
+                    serde_json::to_string(&mem.metadata).unwrap(),
+                    serde_json::to_string(&mem.links).unwrap(),
+                    mem.content_hash,
+                    mem.namespace,
+                    now,
+                    now,
+                ],
+            );
+            if result.is_ok() {
+                count += 1;
+            }
+        }
+
+        conn.execute_batch("COMMIT;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(count)
+    }
+
+    fn find_by_content_hash(&self, hash: &str) -> Result<Option<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let result = conn
+            .query_row(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE content_hash = ?1 LIMIT 1",
+                params![hash],
+                Self::parse_mem_row,
+            )
+            .optional()
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(result)
+    }
+
+    fn list_by_tier_and_namespace(
+        &self,
+        tier: MemoryTier,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemObject>, CortexError> {
+        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
+            Some(ns) => (
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND namespace = ?2 ORDER BY created_at DESC LIMIT ?3".to_string(),
+                vec![
+                    Box::new(tier.as_str().to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(ns.to_string()),
+                    Box::new(limit as i64),
+                ],
+            ),
+            None => (
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2".to_string(),
+                vec![
+                    Box::new(tier.as_str().to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64),
+                ],
+            ),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
     fn list_memories_by_source_identity(
         &self,
         identity_id: Uuid,
     ) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
-        let id_str = format!("\"{}\"", identity_id);
+        let id_str = identity_id.to_string();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json FROM memories WHERE json_extract(source_json, '$.identity_id') = ?1 ORDER BY created_at DESC",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE json_extract(source_json, '$.identity_id') = ?1 OR json_extract(source_json, '$.identity_id') = ?2 ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let quoted_id_str = format!("\"{}\"", id_str);
         let rows = stmt
-            .query_map(params![id_str], Self::parse_mem_row)
+            .query_map(params![id_str, quoted_id_str], Self::parse_mem_row)
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut results = Vec::new();
         for row in rows {

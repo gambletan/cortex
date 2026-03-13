@@ -4,6 +4,7 @@ pub mod consolidation;
 pub mod context;
 pub mod embedder;
 pub mod episode;
+pub mod events;
 pub mod inference;
 pub mod people;
 pub mod plugin;
@@ -25,6 +26,7 @@ use crate::compression::{CompressionEngine, CompressionReport};
 use crate::consolidation::{ConsolidationConfig, ConsolidationEngine, ConsolidationReport};
 use crate::context::{ContextConfig, generate_context};
 use crate::episode::EpisodeStore;
+use crate::events::{EventBus, EventHandler};
 use crate::people::PeopleGraph;
 use crate::plugin::{Plugin, PluginAction, PluginContext};
 use crate::plugin_manager::PluginManager;
@@ -58,10 +60,70 @@ pub struct MemoryStats {
     pub episodic: usize,
     pub semantic: usize,
     pub procedural: usize,
+    pub archived: usize,
     pub people: usize,
     pub beliefs: usize,
     pub index_size: usize,
     pub total: usize,
+}
+
+/// Observable metrics for Cortex operations.
+pub struct CortexMetrics {
+    pub ingests: AtomicU64,
+    pub batch_ingests: AtomicU64,
+    pub retrievals: AtomicU64,
+    pub dedup_hits: AtomicU64,
+    pub consolidations: AtomicU64,
+    pub decay_runs: AtomicU64,
+    pub compressions: AtomicU64,
+    pub archives: AtomicU64,
+    pub plugin_errors: AtomicU64,
+}
+
+impl Default for CortexMetrics {
+    fn default() -> Self {
+        Self {
+            ingests: AtomicU64::new(0),
+            batch_ingests: AtomicU64::new(0),
+            retrievals: AtomicU64::new(0),
+            dedup_hits: AtomicU64::new(0),
+            consolidations: AtomicU64::new(0),
+            decay_runs: AtomicU64::new(0),
+            compressions: AtomicU64::new(0),
+            archives: AtomicU64::new(0),
+            plugin_errors: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CortexMetrics {
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            ingests: self.ingests.load(Ordering::Relaxed),
+            batch_ingests: self.batch_ingests.load(Ordering::Relaxed),
+            retrievals: self.retrievals.load(Ordering::Relaxed),
+            dedup_hits: self.dedup_hits.load(Ordering::Relaxed),
+            consolidations: self.consolidations.load(Ordering::Relaxed),
+            decay_runs: self.decay_runs.load(Ordering::Relaxed),
+            compressions: self.compressions.load(Ordering::Relaxed),
+            archives: self.archives.load(Ordering::Relaxed),
+            plugin_errors: self.plugin_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of metrics (all plain u64, no atomics).
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub ingests: u64,
+    pub batch_ingests: u64,
+    pub retrievals: u64,
+    pub dedup_hits: u64,
+    pub consolidations: u64,
+    pub decay_runs: u64,
+    pub compressions: u64,
+    pub archives: u64,
+    pub plugin_errors: u64,
 }
 
 /// Default interval: auto-run consolidation every N ingests.
@@ -83,6 +145,12 @@ pub struct Cortex {
     consolidation_config: ConsolidationConfig,
     /// How often to auto-run consolidation (every N ingests).
     auto_consolidation_interval: u64,
+    /// Observable operation metrics.
+    metrics: CortexMetrics,
+    /// Event bus for change feed.
+    event_bus: EventBus,
+    /// Deduplication configuration.
+    dedup_config: DeduplicationConfig,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -119,6 +187,9 @@ impl Cortex {
             plugins: PluginManager::new(),
             consolidation_config: ConsolidationConfig::default(),
             auto_consolidation_interval: DEFAULT_AUTO_CONSOLIDATION_INTERVAL,
+            metrics: CortexMetrics::default(),
+            event_bus: EventBus::new(),
+            dedup_config: DeduplicationConfig::default(),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
@@ -137,6 +208,9 @@ impl Cortex {
             plugins: PluginManager::new(),
             consolidation_config: ConsolidationConfig::default(),
             auto_consolidation_interval: DEFAULT_AUTO_CONSOLIDATION_INTERVAL,
+            metrics: CortexMetrics::default(),
+            event_bus: EventBus::new(),
+            dedup_config: DeduplicationConfig::default(),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
         })
@@ -178,6 +252,22 @@ impl Cortex {
     pub fn with_plugin_config(mut self, plugin: Box<dyn Plugin>, config: serde_json::Value) -> Self {
         self.plugins.register_with_config(plugin, config);
         self
+    }
+
+    /// Set deduplication configuration.
+    pub fn with_dedup_config(mut self, config: DeduplicationConfig) -> Self {
+        self.dedup_config = config;
+        self
+    }
+
+    /// Subscribe to the event bus (change feed).
+    pub fn on_event(&self, handler: EventHandler) {
+        self.event_bus.subscribe(handler);
+    }
+
+    /// Get a snapshot of operation metrics.
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Auto-generate embedding if embedder is available and none provided.
@@ -275,11 +365,29 @@ impl Cortex {
             .cloned()
             .collect();
 
+        // ── Deduplication check ─────────────────────────────────────────
+        if self.dedup_config.exact_dedup {
+            if let Some(ref hash) = mem.content_hash {
+                if self.storage.find_by_content_hash(hash)?.is_some() {
+                    self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(hash = %hash, "Exact duplicate skipped");
+                    return Ok(mem);
+                }
+            }
+        }
+
         self.storage.store_memory(&mem)?;
         if let Some(emb) = embedding {
             self.index.insert(mem.id, emb);
         }
         let result = mem.clone();
+
+        // Emit event
+        self.event_bus.emit(&CortexEvent::MemoryCreated {
+            id: result.id,
+            tier: result.tier,
+        });
+        self.metrics.ingests.fetch_add(1, Ordering::Relaxed);
 
         // ── Plugin: on_post_ingest ────────────────────────────────────────
         self.plugins.on_post_ingest(&result, &plugin_ctx);
@@ -362,7 +470,128 @@ impl Cortex {
         Ok(result)
     }
 
-    /// Multi-signal retrieval.
+    /// Batch ingest multiple memories in a single transaction.
+    /// Supports deduplication and batched index rebuild.
+    #[tracing::instrument(skip(self, items), fields(count = items.len()))]
+    pub fn ingest_batch(
+        &self,
+        items: Vec<BatchIngestItem>,
+    ) -> Result<BatchIngestReport, CortexError> {
+        let mut report = BatchIngestReport {
+            total_submitted: items.len(),
+            ..Default::default()
+        };
+
+        let mut mems_to_store: Vec<MemObject> = Vec::with_capacity(items.len());
+        let mut embeddings_to_index: Vec<(Uuid, Vec<f32>)> = Vec::new();
+
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+
+        for item in &items {
+            let mut source = MemSource::new(&item.channel);
+            let embedding = self.auto_embed(&item.text, item.embedding.clone());
+
+            if let Some(ref uid) = item.user_id {
+                let people = PeopleGraph::new(&self.storage);
+                if let Ok(person) = people.resolve_identity(&item.channel, uid, None, None) {
+                    source.identity_id = Some(person.id);
+                    let _ = people.record_interaction(person.id);
+                }
+            }
+
+            let inferred = inference::extract_with_llm(&item.text, self.inference_fn.as_ref());
+            let durability = match inferred.temporal_hint {
+                inference::TemporalHint::Temporary => MemoryDurability::Temporary,
+                inference::TemporalHint::Permanent => MemoryDurability::Permanent,
+                inference::TemporalHint::Unknown => MemoryDurability::Normal,
+            };
+
+            let mut builder = MemObjectBuilder::new(
+                MemoryTier::Episodic,
+                MemContent::Text(item.text.clone()),
+                source,
+            )
+            .salience(Salience::new(item.salience_hint.unwrap_or(0.5)))
+            .durability(durability);
+
+            if let Some(ref ns) = item.namespace {
+                builder = builder.namespace(ns.clone());
+            }
+            if let Some(ref emb) = embedding {
+                builder = builder.embedding(emb.clone());
+            }
+
+            let mut mem = builder.build();
+
+            // Dedup check
+            if self.dedup_config.exact_dedup {
+                if let Some(ref hash) = mem.content_hash {
+                    if self.storage.find_by_content_hash(hash)?.is_some() {
+                        report.deduplicated += 1;
+                        self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    // Also check within current batch
+                    if mems_to_store.iter().any(|m| m.content_hash.as_ref() == Some(hash)) {
+                        report.deduplicated += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Plugin pre-ingest
+            let pre_actions = self.plugins.on_pre_ingest(&mem, &item.text, &plugin_ctx);
+            let skip = PluginManager::apply_actions(&pre_actions, &mut mem);
+            if skip {
+                report.skipped_by_plugin += 1;
+                continue;
+            }
+
+            if let Some(emb) = embedding {
+                embeddings_to_index.push((mem.id, emb));
+            }
+            mems_to_store.push(mem);
+        }
+
+        // Batch store in a single transaction
+        let stored = self.storage.store_memories_batch(&mems_to_store)?;
+        report.stored = stored;
+
+        // Batch index insert
+        for (id, emb) in embeddings_to_index {
+            self.index.insert(id, emb);
+        }
+
+        // Emit events
+        for mem in &mems_to_store {
+            self.event_bus.emit(&CortexEvent::MemoryCreated {
+                id: mem.id,
+                tier: mem.tier,
+            });
+        }
+
+        self.metrics.batch_ingests.fetch_add(1, Ordering::Relaxed);
+        self.metrics.ingests.fetch_add(stored as u64, Ordering::Relaxed);
+
+        // Auto-consolidation check
+        let count = self.ingest_counter.fetch_add(stored as u64, Ordering::Relaxed) + stored as u64;
+        if self.auto_consolidation_interval > 0
+            && count / self.auto_consolidation_interval > (count - stored as u64) / self.auto_consolidation_interval
+        {
+            tracing::info!("Auto-consolidation triggered after batch ingest at count {}", count);
+            if let Err(e) = self.run_consolidation() {
+                tracing::warn!("Auto-consolidation failed: {}", e);
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Multi-signal retrieval with optional namespace isolation.
+    #[tracing::instrument(skip(self, embedding))]
     pub fn retrieve(
         &self,
         query: &str,
@@ -370,6 +599,20 @@ impl Cortex {
         channel: Option<&str>,
         person_id: Option<Uuid>,
         embedding: Option<Vec<f32>>,
+    ) -> Result<Vec<RetrievalResult>, CortexError> {
+        self.retrieve_with_namespace(query, limit, channel, person_id, embedding, None)
+    }
+
+    /// Multi-signal retrieval with explicit namespace filtering.
+    #[tracing::instrument(skip(self, embedding))]
+    pub fn retrieve_with_namespace(
+        &self,
+        query: &str,
+        limit: usize,
+        channel: Option<&str>,
+        person_id: Option<Uuid>,
+        embedding: Option<Vec<f32>>,
+        namespace: Option<&str>,
     ) -> Result<Vec<RetrievalResult>, CortexError> {
         let embedding = self.auto_embed(query, embedding);
 
@@ -379,6 +622,9 @@ impl Cortex {
         }
         if let Some(pid) = person_id {
             q = q.with_person(pid);
+        }
+        if let Some(ns) = namespace {
+            q = q.with_namespace(ns);
         }
         if let Some(emb) = embedding {
             q = q.with_embedding(emb);
@@ -394,6 +640,7 @@ impl Cortex {
         };
         self.plugins.on_pre_retrieve(query, &mut results, &plugin_ctx);
 
+        self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
         Ok(results)
     }
 
@@ -426,6 +673,7 @@ impl Cortex {
     }
 
     /// Run a full consolidation cycle (decay + promote + sweep + patterns).
+    #[tracing::instrument(skip(self))]
     pub fn run_consolidation(&self) -> Result<ConsolidationReport, CortexError> {
         let engine = ConsolidationEngine::new(&self.storage, &self.index)
             .with_config(self.consolidation_config.clone())
@@ -440,10 +688,15 @@ impl Cortex {
         let actions = self.plugins.on_consolidation(&report, &plugin_ctx);
         self.apply_plugin_side_effects(&actions, "consolidation");
 
+        self.metrics.consolidations.fetch_add(1, Ordering::Relaxed);
+        self.event_bus.emit(&CortexEvent::ConsolidationCompleted {
+            report: format!("{:?}", report),
+        });
         Ok(report)
     }
 
     /// Run only temporal decay on episodic memories.
+    #[tracing::instrument(skip(self))]
     pub fn run_decay(&self) -> Result<usize, CortexError> {
         let mut episodes = EpisodeStore::new(&self.storage, &self.index);
         if let Some(ref cfg) = self.decay_config {
@@ -458,6 +711,8 @@ impl Cortex {
         };
         self.plugins.on_decay(count, &plugin_ctx);
 
+        self.metrics.decay_runs.fetch_add(1, Ordering::Relaxed);
+        self.event_bus.emit(&CortexEvent::DecayCompleted { count });
         Ok(count)
     }
 
@@ -572,6 +827,7 @@ impl Cortex {
         let episodic = self.storage.count_by_tier(MemoryTier::Episodic)?;
         let semantic = self.storage.count_by_tier(MemoryTier::Semantic)?;
         let procedural = self.storage.count_by_tier(MemoryTier::Procedural)?;
+        let archived = self.storage.count_by_tier(MemoryTier::Archived)?;
         let people = self.storage.list_people()?.len();
         let beliefs = self.storage.list_beliefs_above(0.0)?.len();
         let index_size = self.index.len();
@@ -579,11 +835,55 @@ impl Cortex {
             episodic,
             semantic,
             procedural,
+            archived,
             people,
             beliefs,
             index_size,
             total: episodic + semantic + procedural,
         })
+    }
+
+    /// Archive a memory (move to cold storage tier).
+    pub fn archive_memory(&self, id: Uuid) -> Result<(), CortexError> {
+        self.storage.archive_memory(id)?;
+        self.index.remove(&id);
+        self.metrics.archives.fetch_add(1, Ordering::Relaxed);
+        self.event_bus.emit(&CortexEvent::MemoryArchived { id });
+        Ok(())
+    }
+
+    /// Restore an archived memory to its original tier.
+    pub fn restore_memory(&self, id: Uuid, target_tier: MemoryTier) -> Result<(), CortexError> {
+        self.storage.restore_memory(id, target_tier)?;
+        // Re-index if it has an embedding
+        if let Some(mem) = self.storage.get_memory(id)? {
+            if let Some(ref emb) = mem.embedding {
+                self.index.insert(id, emb.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Archive old, low-salience memories automatically.
+    /// Moves episodic memories older than `max_age_days` with salience below `threshold`.
+    pub fn auto_archive(
+        &self,
+        max_age_days: i64,
+        salience_threshold: f32,
+    ) -> Result<usize, CortexError> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days);
+        let candidates = self.storage.list_by_salience_below(MemoryTier::Episodic, salience_threshold)?;
+        let mut count = 0;
+        for mem in candidates {
+            if mem.temporal.ingestion_time < cutoff
+                && mem.temporal.durability != MemoryDurability::Permanent
+            {
+                self.archive_memory(mem.id)?;
+                count += 1;
+            }
+        }
+        tracing::info!(count, "Auto-archived old low-salience memories");
+        Ok(count)
     }
 
     /// Query facts by entity (SQL-indexed, no full scan).

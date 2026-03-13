@@ -14,6 +14,7 @@ pub struct RetrievalQuery {
     pub embedding: Option<Vec<f32>>,
     pub channel: Option<String>,
     pub person_id: Option<Uuid>,
+    pub namespace: Option<String>,
     pub time_context: DateTime<Utc>,
     pub limit: usize,
 }
@@ -25,6 +26,7 @@ impl RetrievalQuery {
             embedding: None,
             channel: None,
             person_id: None,
+            namespace: None,
             time_context: Utc::now(),
             limit,
         }
@@ -42,6 +44,11 @@ impl RetrievalQuery {
 
     pub fn with_person(mut self, person_id: Uuid) -> Self {
         self.person_id = Some(person_id);
+        self
+    }
+
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
         self
     }
 }
@@ -211,6 +218,18 @@ impl<'a> RetrievalEngine<'a> {
         let mut results = Vec::new();
         for (id, sim_score) in &candidate_ids {
             if let Some(mem) = mem_map.get(id) {
+                // Namespace isolation: skip memories that don't match requested namespace
+                if let Some(ref ns) = query.namespace {
+                    if mem.namespace.as_deref() != Some(ns.as_str()) {
+                        continue;
+                    }
+                }
+
+                // Skip archived memories from retrieval results
+                if mem.tier == MemoryTier::Archived {
+                    continue;
+                }
+
                 let breakdown = self.compute_scores(mem, *sim_score, query, &temporal_intent);
                 let final_score = weights.similarity * breakdown.similarity
                     + weights.temporal * breakdown.temporal
@@ -234,8 +253,7 @@ impl<'a> RetrievalEngine<'a> {
     }
 
     /// Query expansion: extract entities from the query text and look up related
-    /// entities from the semantic store. E.g., querying "Alice" also finds facts
-    /// where Alice is subject/object, then returns related entities (her company, etc.)
+    /// entities from the semantic store using indexed queries per entity.
     fn expand_query(&self, query_text: &str) -> Result<HashSet<String>, CortexError> {
         let mut expanded = HashSet::new();
         let query_lower = query_text.to_lowercase();
@@ -246,36 +264,29 @@ impl<'a> RetrievalEngine<'a> {
             return Ok(expanded);
         }
 
-        // Look up semantic facts mentioning these entities
-        let semantic_mems = self.storage.list_by_tier(MemoryTier::Semantic, 10_000)?;
-        for mem in &semantic_mems {
-            match &mem.content {
-                MemContent::Fact { subject, predicate, object } => {
-                    let subj_lower = subject.to_lowercase();
-                    let obj_lower = object.to_lowercase();
-                    for entity in &query_entities {
-                        let entity_lower = entity.to_lowercase();
-                        if subj_lower.contains(&entity_lower) {
-                            // Entity is subject → expand with object
-                            expanded.insert(object.clone());
-                            expanded.insert(predicate.clone());
-                        } else if obj_lower.contains(&entity_lower) {
-                            // Entity is object → expand with subject
-                            expanded.insert(subject.clone());
-                            expanded.insert(predicate.clone());
-                        }
+        // Use indexed fact queries per entity instead of loading all semantic memories
+        for entity in &query_entities {
+            let facts = self.storage.query_facts_by_entity(entity)?;
+            for mem in &facts {
+                if let MemContent::Fact { subject, predicate, object } = &mem.content {
+                    let entity_lower = entity.to_lowercase();
+                    if subject.to_lowercase().contains(&entity_lower) {
+                        expanded.insert(object.clone());
+                        expanded.insert(predicate.clone());
+                    } else if object.to_lowercase().contains(&entity_lower) {
+                        expanded.insert(subject.clone());
+                        expanded.insert(predicate.clone());
                     }
                 }
-                MemContent::Preference { key, value, .. } => {
-                    // If query mentions a preference key/value, expand
-                    if query_lower.contains(&key.to_lowercase())
-                        || query_lower.contains(&value.to_lowercase())
-                    {
-                        expanded.insert(key.clone());
-                        expanded.insert(value.clone());
-                    }
-                }
-                _ => {}
+            }
+        }
+
+        // Check preferences matching query terms
+        let prefs = self.storage.query_preferences_by_key(&query_lower)?;
+        for mem in &prefs {
+            if let MemContent::Preference { key, value, .. } = &mem.content {
+                expanded.insert(key.clone());
+                expanded.insert(value.clone());
             }
         }
 
@@ -344,20 +355,18 @@ impl<'a> RetrievalEngine<'a> {
             }
         }
 
-        // Query semantic store for facts mentioning these entities
+        // Query semantic store for facts mentioning these entities (indexed)
         let mut expanded: Vec<(Uuid, f32)> = Vec::new();
-        let semantic_mems = self.storage.list_by_tier(MemoryTier::Semantic, limit * 3)?;
+        let mut seen = HashSet::new();
 
-        for mem in &semantic_mems {
-            if let MemContent::Fact { subject, object, .. } = &mem.content {
-                for entity in &entities {
-                    let entity_lower = entity.to_lowercase();
-                    if subject.to_lowercase().contains(&entity_lower)
-                        || object.to_lowercase().contains(&entity_lower)
-                    {
-                        expanded.push((mem.id, 0.25)); // lower score for hop-2 results
-                        break;
-                    }
+        for entity in &entities {
+            let facts = self.storage.query_facts_by_entity(entity)?;
+            for mem in facts {
+                if seen.insert(mem.id) {
+                    expanded.push((mem.id, 0.25)); // lower score for hop-2 results
+                }
+                if expanded.len() >= limit {
+                    break;
                 }
             }
         }
