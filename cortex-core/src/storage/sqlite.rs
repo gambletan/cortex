@@ -24,7 +24,8 @@ impl SqliteStorage {
         conn.execute_batch(
             "PRAGMA cache_size=-64000;
              PRAGMA mmap_size=268435456;
-             PRAGMA temp_store=MEMORY;",
+             PRAGMA temp_store=MEMORY;
+             PRAGMA busy_timeout=5000;",
         )
         .map_err(|e| CortexError::Storage(e.to_string()))
     }
@@ -37,7 +38,9 @@ impl SqliteStorage {
              PRAGMA cache_size=-64000;
              PRAGMA mmap_size=268435456;
              PRAGMA temp_store=MEMORY;
-             PRAGMA foreign_keys=ON;",
+             PRAGMA foreign_keys=ON;
+             PRAGMA wal_autocheckpoint=1000;
+             PRAGMA busy_timeout=5000;",
         )
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
@@ -297,12 +300,13 @@ impl StorageBackend for SqliteStorage {
 
     fn get_memory(&self, id: Uuid) -> Result<Option<MemObject>, CortexError> {
         let conn = self.read_conn()?;
-        let result = conn
-            .query_row(
+        let mut stmt = conn
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id = ?1",
-                params![id.to_string()],
-                Self::parse_mem_row,
             )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let result = stmt
+            .query_row(params![id.to_string()], Self::parse_mem_row)
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(result)
@@ -348,7 +352,7 @@ impl StorageBackend for SqliteStorage {
         tier: MemoryTier,
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
@@ -446,7 +450,7 @@ impl StorageBackend for SqliteStorage {
         relation: LinkRelation,
         strength: f32,
     ) -> Result<(), CortexError> {
-        let conn = self.read_conn()?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)",
             params![source_id.to_string(), target_id.to_string(), relation.as_str(), strength],
@@ -825,12 +829,11 @@ impl StorageBackend for SqliteStorage {
 
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, CortexError> {
         let conn = self.read_conn()?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM memories WHERE tier = ?1",
-                params![tier.as_str()],
-                |row| row.get(0),
-            )
+        let mut stmt = conn
+            .prepare_cached("SELECT COUNT(*) FROM memories WHERE tier = ?1")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let count: i64 = stmt
+            .query_row(params![tier.as_str()], |row| row.get(0))
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(count as usize)
     }
@@ -881,12 +884,13 @@ impl StorageBackend for SqliteStorage {
 
     fn find_by_content_hash(&self, hash: &str) -> Result<Option<MemObject>, CortexError> {
         let conn = self.read_conn()?;
-        let result = conn
-            .query_row(
+        let mut stmt = conn
+            .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE content_hash = ?1 LIMIT 1",
-                params![hash],
-                Self::parse_mem_row,
             )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let result = stmt
+            .query_row(params![hash], Self::parse_mem_row)
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(result)
