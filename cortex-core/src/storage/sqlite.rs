@@ -9,12 +9,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+/// Number of read-only connections in the pool.
+const READ_POOL_SIZE: usize = 4;
+
 /// SQLite-backed storage for Cortex. Local-first, zero-config.
+/// Uses WAL mode with separate read/write connections for concurrency.
 pub struct SqliteStorage {
-    conn: Mutex<Connection>,
+    write_conn: Mutex<Connection>,
+    read_pool: Vec<Mutex<Connection>>,
 }
 
 impl SqliteStorage {
+    fn apply_read_pragmas(conn: &Connection) -> Result<(), CortexError> {
+        conn.execute_batch(
+            "PRAGMA cache_size=-64000;
+             PRAGMA mmap_size=268435456;
+             PRAGMA temp_store=MEMORY;",
+        )
+        .map_err(|e| CortexError::Storage(e.to_string()))
+    }
+
     pub fn open(path: &str) -> Result<Self, CortexError> {
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute_batch(
@@ -26,8 +40,24 @@ impl SqliteStorage {
              PRAGMA foreign_keys=ON;",
         )
         .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Open read-only connections for concurrent reads
+        let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
+        for _ in 0..READ_POOL_SIZE {
+            let reader = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+            Self::apply_read_pragmas(&reader)?;
+            read_pool.push(Mutex::new(reader));
+        }
+
         let storage = Self {
-            conn: Mutex::new(conn),
+            write_conn: Mutex::new(conn),
+            read_pool,
         };
         storage.init()?;
         Ok(storage)
@@ -38,11 +68,27 @@ impl SqliteStorage {
             Connection::open_in_memory().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // In-memory DBs can't share connections, so read_pool is empty
         let storage = Self {
-            conn: Mutex::new(conn),
+            write_conn: Mutex::new(conn),
+            read_pool: Vec::new(),
         };
         storage.init()?;
         Ok(storage)
+    }
+
+    /// Get a read connection. Tries each reader first, falls back to write conn.
+    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CortexError> {
+        for reader in &self.read_pool {
+            if let Ok(guard) = reader.try_lock() {
+                return Ok(guard);
+            }
+        }
+        // All readers busy or no readers (in-memory mode): use write conn
+        if let Some(reader) = self.read_pool.first() {
+            return reader.lock().map_err(|e| CortexError::Storage(e.to_string()));
+        }
+        self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))
     }
 
     fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
@@ -110,7 +156,7 @@ fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
 
 impl StorageBackend for SqliteStorage {
     fn init(&self) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS memories (
@@ -133,8 +179,7 @@ impl StorageBackend for SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_memories_source_channel
                 ON memories(json_extract(source_json, '$.channel'));
-            CREATE INDEX IF NOT EXISTS idx_memories_salience
-                ON memories(json_extract(salience_json, '$.effective_score'));
+            -- salience_score materialized column indexed via migration below
 
             CREATE TABLE IF NOT EXISTS links (
                 source_id TEXT NOT NULL,
@@ -203,16 +248,30 @@ impl StorageBackend for SqliteStorage {
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         }
 
+        // Migration: add materialized salience_score column
+        let has_salience_score: bool = conn
+            .prepare("SELECT salience_score FROM memories LIMIT 0")
+            .is_ok();
+        if !has_salience_score {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN salience_score REAL;
+                 CREATE INDEX IF NOT EXISTS idx_memories_tier_salience ON memories(tier, salience_score);
+                 UPDATE memories SET salience_score = json_extract(salience_json, '$.effective_score')
+                     WHERE salience_score IS NULL;",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+
         Ok(())
     }
 
     fn store_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         conn.execute(
-            "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 mem.id.to_string(),
                 mem.tier.as_str(),
@@ -227,6 +286,7 @@ impl StorageBackend for SqliteStorage {
                 serde_json::to_string(&mem.links).unwrap(),
                 mem.content_hash,
                 mem.namespace,
+                mem.salience.effective_score,
                 now,
                 now,
             ],
@@ -236,7 +296,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn get_memory(&self, id: Uuid) -> Result<Option<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let result = conn
             .query_row(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id = ?1",
@@ -249,11 +309,11 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         conn.execute(
-            "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, updated_at=?14 WHERE id=?1",
+            "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, updated_at=?15 WHERE id=?1",
             params![
                 mem.id.to_string(),
                 mem.tier.as_str(),
@@ -268,6 +328,7 @@ impl StorageBackend for SqliteStorage {
                 serde_json::to_string(&mem.links).unwrap(),
                 mem.content_hash,
                 mem.namespace,
+                mem.salience.effective_score,
                 now,
             ],
         )
@@ -276,7 +337,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute("DELETE FROM memories WHERE id = ?1", params![id.to_string()])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
@@ -287,7 +348,7 @@ impl StorageBackend for SqliteStorage {
         tier: MemoryTier,
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
@@ -316,7 +377,7 @@ impl StorageBackend for SqliteStorage {
         channel: &str,
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE json_extract(source_json, '$.channel') = ?1 ORDER BY created_at DESC LIMIT ?2",
@@ -337,10 +398,10 @@ impl StorageBackend for SqliteStorage {
         tier: MemoryTier,
         threshold: f32,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND json_extract(salience_json, '$.effective_score') < ?2",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND salience_score < ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
@@ -359,7 +420,7 @@ impl StorageBackend for SqliteStorage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND created_at >= ?2 AND created_at <= ?3 ORDER BY created_at DESC",
@@ -385,7 +446,7 @@ impl StorageBackend for SqliteStorage {
         relation: LinkRelation,
         strength: f32,
     ) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         conn.execute(
             "INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)",
             params![source_id.to_string(), target_id.to_string(), relation.as_str(), strength],
@@ -398,7 +459,7 @@ impl StorageBackend for SqliteStorage {
         &self,
         source_id: Uuid,
     ) -> Result<Vec<(Uuid, LinkRelation, f32)>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT target_id, relation, strength FROM links WHERE source_id = ?1")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -425,7 +486,7 @@ impl StorageBackend for SqliteStorage {
 
     // People
     fn store_person(&self, person: &Person) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "INSERT INTO people (id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -459,7 +520,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn get_person(&self, id: Uuid) -> Result<Option<Person>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let person = conn
             .query_row(
                 "SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people WHERE id = ?1",
@@ -485,7 +546,7 @@ impl StorageBackend for SqliteStorage {
         channel: &str,
         channel_user_id: &str,
     ) -> Result<Option<Person>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let person = conn
             .query_row(
                 "SELECT p.id, p.display_name, p.relationship, p.first_seen, p.last_seen, p.interaction_count, p.tags_json, p.notes_json, p.communication_style_json
@@ -508,7 +569,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_person(&self, person: &Person) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "UPDATE people SET display_name=?2, relationship=?3, first_seen=?4, last_seen=?5, interaction_count=?6, tags_json=?7, notes_json=?8, communication_style_json=?9 WHERE id=?1",
             params![
@@ -548,14 +609,14 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn delete_person(&self, id: Uuid) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute("DELETE FROM people WHERE id = ?1", params![id.to_string()])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
     }
 
     fn list_people(&self) -> Result<Vec<Person>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people ORDER BY last_seen DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -573,7 +634,7 @@ impl StorageBackend for SqliteStorage {
 
     // Beliefs
     fn store_belief(&self, belief: &Belief) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "INSERT INTO beliefs (id, key, probability, observations_json, last_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -589,7 +650,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn get_belief(&self, key: &str) -> Result<Option<Belief>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let result = conn
             .query_row(
                 "SELECT id, key, probability, observations_json, last_updated FROM beliefs WHERE key = ?1",
@@ -602,7 +663,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_belief(&self, belief: &Belief) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "UPDATE beliefs SET probability=?2, observations_json=?3, last_updated=?4 WHERE id=?1",
             params![
@@ -617,7 +678,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn list_beliefs_above(&self, threshold: f32) -> Result<Vec<Belief>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT id, key, probability, observations_json, last_updated FROM beliefs WHERE probability >= ?1 ORDER BY probability DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -633,7 +694,7 @@ impl StorageBackend for SqliteStorage {
 
     // Patterns
     fn store_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "INSERT INTO patterns (id, trigger, actions_json, frequency, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -649,7 +710,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn get_pattern(&self, trigger: &str) -> Result<Option<Pattern>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let result = conn
             .query_row(
                 "SELECT id, trigger, actions_json, frequency, last_seen FROM patterns WHERE trigger = ?1",
@@ -662,7 +723,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute(
             "UPDATE patterns SET trigger=?2, actions_json=?3, frequency=?4, last_seen=?5 WHERE id=?1",
             params![
@@ -678,7 +739,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn list_patterns(&self, min_frequency: u32) -> Result<Vec<Pattern>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT id, trigger, actions_json, frequency, last_seen FROM patterns WHERE frequency >= ?1 ORDER BY frequency DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -696,7 +757,7 @@ impl StorageBackend for SqliteStorage {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
         let sql = format!(
             "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id IN ({})",
@@ -716,7 +777,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn query_facts_by_entity(&self, entity: &str) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let pattern = format!("%{}%", entity.to_lowercase());
         let mut stmt = conn
             .prepare_cached(
@@ -740,7 +801,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn query_preferences_by_key(&self, key_pattern: &str) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let pattern = format!("%{}%", key_pattern.to_lowercase());
         let mut stmt = conn
             .prepare_cached(
@@ -763,7 +824,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories WHERE tier = ?1",
@@ -778,7 +839,7 @@ impl StorageBackend for SqliteStorage {
         if mems.is_empty() {
             return Ok(0);
         }
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         conn.execute_batch("BEGIN TRANSACTION;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -787,8 +848,8 @@ impl StorageBackend for SqliteStorage {
         for mem in mems {
             let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
             let result = conn.execute(
-                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     mem.id.to_string(),
                     mem.tier.as_str(),
@@ -803,6 +864,7 @@ impl StorageBackend for SqliteStorage {
                     serde_json::to_string(&mem.links).unwrap(),
                     mem.content_hash,
                     mem.namespace,
+                    mem.salience.effective_score,
                     now,
                     now,
                 ],
@@ -818,7 +880,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn find_by_content_hash(&self, hash: &str) -> Result<Option<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let result = conn
             .query_row(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE content_hash = ?1 LIMIT 1",
@@ -836,7 +898,7 @@ impl StorageBackend for SqliteStorage {
         namespace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match namespace {
             Some(ns) => (
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND namespace = ?2 ORDER BY created_at DESC LIMIT ?3".to_string(),
@@ -870,7 +932,7 @@ impl StorageBackend for SqliteStorage {
         &self,
         identity_id: Uuid,
     ) -> Result<Vec<MemObject>, CortexError> {
-        let conn = self.conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.read_conn()?;
         let id_str = identity_id.to_string();
         let mut stmt = conn
             .prepare_cached(

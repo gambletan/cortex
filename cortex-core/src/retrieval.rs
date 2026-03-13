@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
@@ -54,8 +55,9 @@ impl RetrievalQuery {
 }
 
 /// Retrieval result with score breakdown.
+#[derive(Clone)]
 pub struct RetrievalResult {
-    pub memory: MemObject,
+    pub memory: Arc<MemObject>,
     pub score: f32,
     pub score_breakdown: ScoreBreakdown,
 }
@@ -173,7 +175,7 @@ impl<'a> RetrievalEngine<'a> {
         // Batch fetch all candidates in a single query
         let all_ids: Vec<Uuid> = candidate_ids.iter().map(|(id, _)| *id).collect();
         let memories = self.storage.get_memories_batch(&all_ids)?;
-        let mem_map: HashMap<Uuid, MemObject> = memories.into_iter().map(|m| (m.id, m)).collect();
+        let mem_map: HashMap<Uuid, Arc<MemObject>> = memories.into_iter().map(|m| (m.id, Arc::new(m))).collect();
 
         // Adapt weights for temporal queries
         let weights = match temporal_intent {
@@ -238,7 +240,7 @@ impl<'a> RetrievalEngine<'a> {
                     + weights.channel * breakdown.channel;
 
                 results.push(RetrievalResult {
-                    memory: mem.clone(),
+                    memory: Arc::clone(mem),
                     score: final_score,
                     score_breakdown: breakdown,
                 });

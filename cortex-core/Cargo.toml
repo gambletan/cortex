@@ -19,6 +19,7 @@ parking_lot = "0.12"
 instant-distance = "0.6"
 sha2 = "0.10"
 semver = "1"
+lru = "0.12"
 fastembed = { version = "4", optional = true }
 
 [[bench]]

@@ -18,7 +18,10 @@ pub mod storage;
 pub mod types;
 pub mod working;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::belief::BeliefEngine;
@@ -151,6 +154,8 @@ pub struct Cortex {
     event_bus: EventBus,
     /// Deduplication configuration.
     dedup_config: DeduplicationConfig,
+    /// LRU cache for retrieval results.
+    retrieval_cache: Mutex<lru::LruCache<u64, Vec<RetrievalResult>>>,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -190,6 +195,9 @@ impl Cortex {
             metrics: CortexMetrics::default(),
             event_bus: EventBus::new(),
             dedup_config: DeduplicationConfig::default(),
+            retrieval_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(64).unwrap(),
+            )),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
@@ -211,6 +219,9 @@ impl Cortex {
             metrics: CortexMetrics::default(),
             event_bus: EventBus::new(),
             dedup_config: DeduplicationConfig::default(),
+            retrieval_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(64).unwrap(),
+            )),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
         })
@@ -467,6 +478,7 @@ impl Cortex {
             }
         }
 
+        self.invalidate_retrieval_cache();
         Ok(result)
     }
 
@@ -587,6 +599,7 @@ impl Cortex {
             }
         }
 
+        self.invalidate_retrieval_cache();
         Ok(report)
     }
 
@@ -614,6 +627,24 @@ impl Cortex {
         embedding: Option<Vec<f32>>,
         namespace: Option<&str>,
     ) -> Result<Vec<RetrievalResult>, CortexError> {
+        // ── Cache lookup ──────────────────────────────────────────────────
+        let cache_key = {
+            let mut h = DefaultHasher::new();
+            query.hash(&mut h);
+            limit.hash(&mut h);
+            channel.hash(&mut h);
+            person_id.hash(&mut h);
+            namespace.hash(&mut h);
+            h.finish()
+        };
+
+        if let Ok(mut cache) = self.retrieval_cache.lock() {
+            if let Some(cached) = cache.get(&cache_key) {
+                self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached.clone());
+            }
+        }
+
         let embedding = self.auto_embed(query, embedding);
 
         let mut q = RetrievalQuery::new(query, limit);
@@ -639,6 +670,11 @@ impl Cortex {
             index: &self.index,
         };
         self.plugins.on_pre_retrieve(query, &mut results, &plugin_ctx);
+
+        // ── Cache store ───────────────────────────────────────────────────
+        if let Ok(mut cache) = self.retrieval_cache.lock() {
+            cache.put(cache_key, results.clone());
+        }
 
         self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
         Ok(results)
@@ -688,6 +724,7 @@ impl Cortex {
         let actions = self.plugins.on_consolidation(&report, &plugin_ctx);
         self.apply_plugin_side_effects(&actions, "consolidation");
 
+        self.invalidate_retrieval_cache();
         self.metrics.consolidations.fetch_add(1, Ordering::Relaxed);
         self.event_bus.emit(&CortexEvent::ConsolidationCompleted {
             report: format!("{:?}", report),
@@ -711,6 +748,7 @@ impl Cortex {
         };
         self.plugins.on_decay(count, &plugin_ctx);
 
+        self.invalidate_retrieval_cache();
         self.metrics.decay_runs.fetch_add(1, Ordering::Relaxed);
         self.event_bus.emit(&CortexEvent::DecayCompleted { count });
         Ok(count)
@@ -847,6 +885,7 @@ impl Cortex {
     pub fn archive_memory(&self, id: Uuid) -> Result<(), CortexError> {
         self.storage.archive_memory(id)?;
         self.index.remove(&id);
+        self.invalidate_retrieval_cache();
         self.metrics.archives.fetch_add(1, Ordering::Relaxed);
         self.event_bus.emit(&CortexEvent::MemoryArchived { id });
         Ok(())
@@ -861,6 +900,7 @@ impl Cortex {
                 self.index.insert(id, emb.clone());
             }
         }
+        self.invalidate_retrieval_cache();
         Ok(())
     }
 
@@ -928,6 +968,13 @@ impl Cortex {
         PluginContext {
             storage: &self.storage,
             index: &self.index,
+        }
+    }
+
+    /// Clear the retrieval cache (call after any write operation).
+    fn invalidate_retrieval_cache(&self) {
+        if let Ok(mut cache) = self.retrieval_cache.lock() {
+            cache.clear();
         }
     }
 
