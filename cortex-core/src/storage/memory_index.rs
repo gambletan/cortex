@@ -312,16 +312,34 @@ fn brute_force_search_map(
     results
 }
 
-/// Dot product — auto-vectorized by LLVM for f32 slices.
+/// Dot product — 4-lane accumulator for better SIMD autovectorization by LLVM.
 #[inline]
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    let len = a.len().min(b.len());
+    let chunks = len / 4;
+    let mut acc = [0.0f32; 4];
+
+    for i in 0..chunks {
+        let base = i * 4;
+        acc[0] += a[base] * b[base];
+        acc[1] += a[base + 1] * b[base + 1];
+        acc[2] += a[base + 2] * b[base + 2];
+        acc[3] += a[base + 3] * b[base + 3];
+    }
+
+    let mut sum = acc[0] + acc[1] + acc[2] + acc[3];
+    for i in (chunks * 4)..len {
+        sum += a[i] * b[i];
+    }
+    sum
 }
 
 /// L2 norm — precomputed once per insert.
 #[inline]
+/// L2 norm — uses dot_product for consistent SIMD optimization.
+#[inline]
 fn l2_norm(v: &[f32]) -> f32 {
-    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    dot_product(v, v).sqrt()
 }
 
 /// Cosine similarity (standalone, for external use).

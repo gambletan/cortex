@@ -176,6 +176,33 @@ pub trait StorageBackend: Send + Sync {
         })
     }
 
+    /// Search episodic text memories containing any of the given terms (SQL LIKE).
+    /// Returns (id, text) pairs for matching memories, limited to `limit` results.
+    fn search_episodic_by_terms(
+        &self,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(Uuid, String)>, crate::CortexError> {
+        // Default: load all episodic and filter in memory
+        let all = self.list_by_tier(MemoryTier::Episodic, limit * 3)?;
+        let mut results = Vec::new();
+        for mem in all {
+            if let MemContent::Text(ref text) = mem.content {
+                let text_lower = text.to_lowercase();
+                for term in terms {
+                    if text_lower.contains(&term.to_lowercase()) {
+                        results.push((mem.id, text.clone()));
+                        break;
+                    }
+                }
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

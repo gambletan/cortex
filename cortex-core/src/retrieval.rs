@@ -304,25 +304,9 @@ impl<'a> RetrievalEngine<'a> {
         entities: &HashSet<String>,
         limit: usize,
     ) -> Result<Vec<(Uuid, f32)>, CortexError> {
-        let mut results: Vec<(Uuid, f32)> = Vec::new();
-        let episodic = self.storage.list_by_tier(MemoryTier::Episodic, limit * 3)?;
-
-        for mem in &episodic {
-            if let MemContent::Text(ref text) = mem.content {
-                let text_lower = text.to_lowercase();
-                for entity in entities {
-                    if text_lower.contains(&entity.to_lowercase()) {
-                        results.push((mem.id, 0.30)); // expansion score
-                        break;
-                    }
-                }
-            }
-            if results.len() >= limit {
-                break;
-            }
-        }
-
-        Ok(results)
+        let terms: Vec<String> = entities.iter().cloned().collect();
+        let matches = self.storage.search_episodic_by_terms(&terms, limit)?;
+        Ok(matches.into_iter().map(|(id, _text)| (id, 0.30_f32)).collect())
     }
 
     /// Multi-hop expansion: look at top initial candidates, extract entities

@@ -272,10 +272,13 @@ impl StorageBackend for SqliteStorage {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
-        conn.execute(
-            "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        stmt.execute(params![
                 mem.id.to_string(),
                 mem.tier.as_str(),
                 serde_json::to_string(&mem.content).unwrap(),
@@ -292,9 +295,8 @@ impl StorageBackend for SqliteStorage {
                 mem.salience.effective_score,
                 now,
                 now,
-            ],
-        )
-        .map_err(|e| CortexError::Storage(e.to_string()))?;
+            ])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -316,9 +318,12 @@ impl StorageBackend for SqliteStorage {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
-        conn.execute(
-            "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, updated_at=?15 WHERE id=?1",
-            params![
+        let mut stmt = conn
+            .prepare_cached(
+                "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, updated_at=?15 WHERE id=?1",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        stmt.execute(params![
                 mem.id.to_string(),
                 mem.tier.as_str(),
                 serde_json::to_string(&mem.content).unwrap(),
@@ -334,15 +339,17 @@ impl StorageBackend for SqliteStorage {
                 mem.namespace,
                 mem.salience.effective_score,
                 now,
-            ],
-        )
-        .map_err(|e| CortexError::Storage(e.to_string()))?;
+            ])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
     }
 
     fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
-        conn.execute("DELETE FROM memories WHERE id = ?1", params![id.to_string()])
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM memories WHERE id = ?1")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        stmt.execute(params![id.to_string()])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -451,10 +458,10 @@ impl StorageBackend for SqliteStorage {
         strength: f32,
     ) -> Result<(), CortexError> {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)",
-            params![source_id.to_string(), target_id.to_string(), relation.as_str(), strength],
-        )
+        let mut stmt = conn
+            .prepare_cached("INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        stmt.execute(params![source_id.to_string(), target_id.to_string(), relation.as_str(), strength])
         .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -928,6 +935,55 @@ impl StorageBackend for SqliteStorage {
         let mut results = Vec::new();
         for row in rows {
             results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn search_episodic_by_terms(
+        &self,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<(Uuid, String)>, CortexError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.read_conn()?;
+        // Build OR-ed LIKE conditions for each term
+        let conditions: Vec<String> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("LOWER(content_json) LIKE ?{}", i + 2))
+            .collect();
+        let sql = format!(
+            "SELECT id, content_json FROM memories WHERE tier = ?1 AND ({}) ORDER BY created_at DESC LIMIT {}",
+            conditions.join(" OR "),
+            limit
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(terms.len() + 1);
+        params_vec.push(Box::new("episodic".to_string()));
+        for term in terms {
+            params_vec.push(Box::new(format!("%{}%", term.to_lowercase())));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let id_str: String = row.get(0)?;
+                let content_json: String = row.get(1)?;
+                Ok((id_str, content_json))
+            })
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (id_str, content_json) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
+            let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
+            // Extract text from content JSON
+            if let Ok(content) = serde_json::from_str::<crate::types::MemContent>(&content_json) {
+                if let crate::types::MemContent::Text(text) = content {
+                    results.push((id, text));
+                }
+            }
         }
         Ok(results)
     }
