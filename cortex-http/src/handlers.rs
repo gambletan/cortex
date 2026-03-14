@@ -399,82 +399,40 @@ pub async fn resolve_person(
 // ── Export/Import ────────────────────────────────────────────────────────────
 
 pub async fn export_all(State(state): State<Arc<AppState>>) -> AppResult {
-    let storage = state.cortex.storage();
-
-    let tiers = [MemoryTier::Episodic, MemoryTier::Semantic, MemoryTier::Procedural];
-    let mut memories = Vec::new();
-    for tier in &tiers {
-        let mems = storage.list_by_tier(*tier, 100_000).map_err(cortex_err)?;
-        memories.extend(mems);
-    }
-
-    let people = storage.list_people().map_err(cortex_err)?;
-    let beliefs = storage.list_beliefs_above(0.0).map_err(cortex_err)?;
-    let patterns = storage.list_patterns(0).map_err(cortex_err)?;
-
+    let data = cortex_core::export::export_all(state.cortex.storage()).map_err(cortex_err)?;
     Ok(Json(json!({
-        "version": "cortex-export-v1",
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "memories": memories,
-        "people": people,
-        "beliefs": beliefs,
-        "patterns": patterns,
+        "version": data.version,
+        "exported_at": data.exported_at,
+        "memories": data.memories,
+        "people": data.people,
+        "beliefs": data.beliefs,
+        "patterns": data.patterns,
         "stats": {
-            "memories": memories.len(),
-            "people": people.len(),
-            "beliefs": beliefs.len(),
-            "patterns": patterns.len(),
+            "memories": data.memories.len(),
+            "people": data.people.len(),
+            "beliefs": data.beliefs.len(),
+            "patterns": data.patterns.len(),
         }
     })))
 }
 
-#[derive(Deserialize)]
-pub struct ImportData {
-    #[allow(dead_code)]
-    pub version: Option<String>,
-    pub memories: Option<Vec<MemObject>>,
-    pub people: Option<Vec<cortex_core::people::Person>>,
-    pub beliefs: Option<Vec<cortex_core::belief::Belief>>,
-}
-
 pub async fn import_all(
     State(state): State<Arc<AppState>>,
-    Json(data): Json<ImportData>,
+    Json(data): Json<cortex_core::export::ImportData>,
 ) -> AppResult {
-    let storage = state.cortex.storage();
-    let mut imported = json!({ "memories": 0, "people": 0, "beliefs": 0 });
-
-    if let Some(memories) = data.memories {
-        let count = memories.len();
-        for mem in &memories {
-            storage.store_memory(mem).map_err(cortex_err)?;
-            // Re-index embeddings
-            if let Some(ref emb) = mem.embedding {
-                state.cortex.index().insert(mem.id, emb.clone());
-            }
-        }
-        imported["memories"] = json!(count);
-    }
-
-    if let Some(people) = data.people {
-        let count = people.len();
-        for person in &people {
-            storage.store_person(person).map_err(cortex_err)?;
-        }
-        imported["people"] = json!(count);
-    }
-
-    if let Some(beliefs) = data.beliefs {
-        let count = beliefs.len();
-        for belief in &beliefs {
-            storage.store_belief(belief).map_err(cortex_err)?;
-        }
-        imported["beliefs"] = json!(count);
-    }
+    let report = cortex_core::export::import_all(
+        state.cortex.storage(),
+        state.cortex.index(),
+        data,
+    ).map_err(cortex_err)?;
 
     Ok(Json(json!({
         "status": "imported",
-        "counts": imported,
+        "counts": {
+            "memories": report.memories,
+            "people": report.people,
+            "beliefs": report.beliefs,
+        },
     })))
 }
 

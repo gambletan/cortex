@@ -551,7 +551,8 @@ fn test_embedding_round_trip() {
     let got = s.get_memory(mem.id).unwrap().unwrap();
     let got_emb = got.embedding.unwrap();
     assert_eq!(got_emb.len(), 5);
+    // f16 quantization: precision loss < 0.01 (half-precision storage)
     for (a, b) in emb.iter().zip(got_emb.iter()) {
-        assert!((a - b).abs() < 1e-6);
+        assert!((a - b).abs() < 0.01, "f16 round-trip: {} vs {}", a, b);
     }
 }

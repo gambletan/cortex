@@ -158,10 +158,17 @@ impl MemoryIndex {
             || (inner.size_at_build > 0
                 && inner.removals_since_build as f32 > inner.size_at_build as f32 * inner.config.removal_ratio);
 
+        // Adaptive pending ratio: relax for small collections to avoid frequent rebuilds
+        let effective_pending_ratio = if total < 5000 {
+            inner.config.pending_ratio.max(0.5) // at least 50% for small sets
+        } else {
+            inner.config.pending_ratio
+        };
+
         // Check if pending buffer should be flushed into stable + rebuild
         let pending_overflow = inner.hnsw.is_some()
             && inner.size_at_build > 0
-            && inner.pending.len() as f32 > inner.size_at_build as f32 * inner.config.pending_ratio;
+            && inner.pending.len() as f32 > inner.size_at_build as f32 * effective_pending_ratio;
 
         if needs_rebuild || pending_overflow {
             flush_and_rebuild(&mut inner);
@@ -236,9 +243,18 @@ fn flush_and_rebuild(inner: &mut IndexInner) {
         inner.stable.insert(id, entry);
     }
 
+    let total = inner.stable.len();
+
+    // Adaptive ef_construction: lower for small collections (faster build)
+    let ef = if total < 10_000 {
+        inner.config.ef_construction.min(24)
+    } else {
+        inner.config.ef_construction
+    };
+
     let points: Vec<Point> = inner.stable.values().map(|e| Point::new(e.embedding.clone())).collect();
     let ids: Vec<Uuid> = inner.stable.keys().copied().collect();
-    let hnsw = Builder::default().ef_construction(inner.config.ef_construction).build(points, ids);
+    let hnsw = Builder::default().ef_construction(ef).build(points, ids);
     inner.hnsw = Some(hnsw);
     inner.removals_since_build = 0;
     inner.size_at_build = inner.stable.len();
@@ -334,8 +350,6 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// L2 norm — precomputed once per insert.
-#[inline]
 /// L2 norm — uses dot_product for consistent SIMD optimization.
 #[inline]
 fn l2_norm(v: &[f32]) -> f32 {

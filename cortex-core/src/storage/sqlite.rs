@@ -141,15 +141,35 @@ impl SqliteStorage {
     }
 }
 
+/// Magic prefix for f16-encoded embedding blobs (distinguishes from legacy f32).
+const F16_MAGIC: [u8; 2] = [0xF1, 0x6F];
+
+/// Serialize embedding as f16 (2 bytes/float) with magic prefix for ~50% storage reduction.
 fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(v.len() * 4);
+    use half::f16;
+    let mut buf = Vec::with_capacity(2 + v.len() * 2);
+    buf.extend_from_slice(&F16_MAGIC);
     for f in v {
-        buf.extend_from_slice(&f.to_le_bytes());
+        buf.extend_from_slice(&f16::from_f32(*f).to_le_bytes());
     }
     buf
 }
 
+/// Deserialize embedding — auto-detects f16 (magic prefix) vs legacy f32 (no prefix).
 fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
+    use half::f16;
+
+    // Check for f16 magic prefix
+    if b.len() >= 2 && b[0] == F16_MAGIC[0] && b[1] == F16_MAGIC[1] {
+        let data = &b[2..];
+        let mut result = Vec::with_capacity(data.len() / 2);
+        for chunk in data.chunks_exact(2) {
+            result.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+        }
+        return result;
+    }
+
+    // Legacy f32 format (no prefix)
     let mut result = Vec::with_capacity(b.len() / 4);
     for chunk in b.chunks_exact(4) {
         result.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
@@ -237,6 +257,27 @@ impl StorageBackend for SqliteStorage {
         )
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
+        // Migration: create FTS5 virtual table for full-text search
+        let has_fts: bool = conn
+            .prepare("SELECT * FROM memories_fts LIMIT 0")
+            .is_ok();
+        if !has_fts {
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                     id UNINDEXED, content, tokenize='unicode61'
+                 );",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+            // Backfill FTS5 from existing memories
+            conn.execute_batch(
+                "INSERT INTO memories_fts(id, content)
+                 SELECT id, content_json FROM memories
+                 WHERE id NOT IN (SELECT id FROM memories_fts);",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+
         // Migration: add content_hash and namespace columns if missing
         let has_content_hash: bool = conn
             .prepare("SELECT content_hash FROM memories LIMIT 0")
@@ -272,6 +313,8 @@ impl StorageBackend for SqliteStorage {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+        let content_json = serde_json::to_string(&mem.content).unwrap();
+        let id_str = mem.id.to_string();
         let mut stmt = conn
             .prepare_cached(
                 "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
@@ -279,9 +322,9 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![
-                mem.id.to_string(),
+                id_str,
                 mem.tier.as_str(),
-                serde_json::to_string(&mem.content).unwrap(),
+                content_json,
                 embedding_blob,
                 serde_json::to_string(&mem.temporal).unwrap(),
                 serde_json::to_string(&mem.source).unwrap(),
@@ -297,6 +340,12 @@ impl StorageBackend for SqliteStorage {
                 now,
             ])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Sync FTS5 index
+        let _ = conn.execute(
+            "INSERT INTO memories_fts(id, content) VALUES (?1, ?2)",
+            params![id_str, content_json],
+        );
         Ok(())
     }
 
@@ -318,15 +367,17 @@ impl StorageBackend for SqliteStorage {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+        let content_json = serde_json::to_string(&mem.content).unwrap();
+        let id_str = mem.id.to_string();
         let mut stmt = conn
             .prepare_cached(
                 "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, updated_at=?15 WHERE id=?1",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![
-                mem.id.to_string(),
+                id_str,
                 mem.tier.as_str(),
-                serde_json::to_string(&mem.content).unwrap(),
+                content_json,
                 embedding_blob,
                 serde_json::to_string(&mem.temporal).unwrap(),
                 serde_json::to_string(&mem.source).unwrap(),
@@ -341,16 +392,27 @@ impl StorageBackend for SqliteStorage {
                 now,
             ])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Sync FTS5 index (delete old, insert new)
+        let _ = conn.execute("DELETE FROM memories_fts WHERE id = ?1", params![id_str]);
+        let _ = conn.execute(
+            "INSERT INTO memories_fts(id, content) VALUES (?1, ?2)",
+            params![id_str, content_json],
+        );
         Ok(())
     }
 
     fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
         let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let id_str = id.to_string();
         let mut stmt = conn
             .prepare_cached("DELETE FROM memories WHERE id = ?1")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-        stmt.execute(params![id.to_string()])
+        stmt.execute(params![id_str])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Sync FTS5 index
+        let _ = conn.execute("DELETE FROM memories_fts WHERE id = ?1", params![id_str]);
         Ok(())
     }
 
@@ -857,13 +919,15 @@ impl StorageBackend for SqliteStorage {
         let mut count = 0;
         for mem in mems {
             let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+            let content_json = serde_json::to_string(&mem.content).unwrap();
+            let id_str = mem.id.to_string();
             let result = conn.execute(
                 "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
-                    mem.id.to_string(),
+                    id_str,
                     mem.tier.as_str(),
-                    serde_json::to_string(&mem.content).unwrap(),
+                    content_json,
                     embedding_blob,
                     serde_json::to_string(&mem.temporal).unwrap(),
                     serde_json::to_string(&mem.source).unwrap(),
@@ -880,6 +944,11 @@ impl StorageBackend for SqliteStorage {
                 ],
             );
             if result.is_ok() {
+                // Sync FTS5 index
+                let _ = conn.execute(
+                    "INSERT INTO memories_fts(id, content) VALUES (?1, ?2)",
+                    params![id_str, content_json],
+                );
                 count += 1;
             }
         }
@@ -979,13 +1048,15 @@ impl StorageBackend for SqliteStorage {
             let (id_str, content_json) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
             let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
             // Extract text from content JSON
-            if let Ok(content) = serde_json::from_str::<crate::types::MemContent>(&content_json) {
-                if let crate::types::MemContent::Text(text) = content {
-                    results.push((id, text));
-                }
+            if let Ok(crate::types::MemContent::Text(text)) = serde_json::from_str::<crate::types::MemContent>(&content_json) {
+                results.push((id, text));
             }
         }
         Ok(results)
+    }
+
+    fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(Uuid, f64)>, CortexError> {
+        SqliteStorage::fts_search(self, query, limit)
     }
 
     fn list_memories_by_source_identity(
@@ -1012,6 +1083,66 @@ impl StorageBackend for SqliteStorage {
 }
 
 impl SqliteStorage {
+    /// Full-text search using FTS5. Returns (id, BM25 rank) pairs.
+    /// Rank is normalized to 0.0–1.0 range.
+    pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(Uuid, f64)>, CortexError> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, rank FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // FTS5 match syntax: escape special chars, use implicit AND
+        let safe_query: String = query
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '*')
+            .collect();
+        if safe_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = stmt
+            .query_map(params![safe_query, limit as i64], |row| {
+                let id_str: String = row.get(0)?;
+                let rank: f64 = row.get(1)?;
+                Ok((id_str, rank))
+            })
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        let mut results = Vec::new();
+        let mut min_rank = 0.0_f64;
+        let mut max_rank = 0.0_f64;
+        let mut raw: Vec<(Uuid, f64)> = Vec::new();
+
+        for row in rows {
+            let (id_str, rank) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
+            if let Ok(id) = Uuid::parse_str(&id_str) {
+                if raw.is_empty() {
+                    min_rank = rank;
+                    max_rank = rank;
+                } else {
+                    min_rank = min_rank.min(rank);
+                    max_rank = max_rank.max(rank);
+                }
+                raw.push((id, rank));
+            }
+        }
+
+        // Normalize ranks to 0.0–1.0 (FTS5 ranks are negative, more negative = better match)
+        let range = (max_rank - min_rank).abs();
+        for (id, rank) in raw {
+            let normalized = if range > 0.0 {
+                (max_rank - rank) / range // invert: most negative becomes 1.0
+            } else {
+                1.0
+            };
+            results.push((id, normalized));
+        }
+
+        Ok(results)
+    }
+
     fn load_identities(
         &self,
         conn: &Connection,

@@ -70,6 +70,7 @@ pub struct ScoreBreakdown {
     pub salience: f32,
     pub social: f32,
     pub channel: f32,
+    pub fts: f32,
 }
 
 /// Configurable weights for multi-signal retrieval.
@@ -80,16 +81,18 @@ pub struct RetrievalWeights {
     pub salience: f32,
     pub social: f32,
     pub channel: f32,
+    pub fts: f32,
 }
 
 impl Default for RetrievalWeights {
     fn default() -> Self {
         Self {
-            similarity: 0.35,
-            temporal: 0.20,
-            salience: 0.25,
-            social: 0.10,
-            channel: 0.10,
+            similarity: 0.30,
+            temporal: 0.18,
+            salience: 0.22,
+            social: 0.08,
+            channel: 0.07,
+            fts: 0.15,
         }
     }
 }
@@ -172,6 +175,16 @@ impl<'a> RetrievalEngine<'a> {
             }
         }
 
+        // FTS5 full-text search: gather additional candidates via BM25 keyword matching
+        let fts_results = self.storage.fts_search(&query.text, query.limit * 3)?;
+        let mut fts_scores: HashMap<Uuid, f32> = HashMap::new();
+        for (id, score) in &fts_results {
+            fts_scores.insert(*id, *score as f32);
+            if !candidate_ids.iter().any(|(cid, _)| *cid == *id) {
+                candidate_ids.push((*id, 0.2)); // base similarity for FTS-only matches
+            }
+        }
+
         // Batch fetch all candidates in a single query
         let all_ids: Vec<Uuid> = candidate_ids.iter().map(|(id, _)| *id).collect();
         let memories = self.storage.get_memories_batch(&all_ids)?;
@@ -186,6 +199,7 @@ impl<'a> RetrievalEngine<'a> {
                 salience: self.weights.salience * 0.8,
                 social: self.weights.social,
                 channel: self.weights.channel,
+                fts: self.weights.fts,
             },
         };
 
@@ -198,6 +212,7 @@ impl<'a> RetrievalEngine<'a> {
                 salience: weights.salience,
                 social: weights.social * 3.0,
                 channel: weights.channel,
+                fts: weights.fts,
             },
             QueryType::FactQuery => RetrievalWeights {
                 similarity: weights.similarity * 1.3,
@@ -205,6 +220,7 @@ impl<'a> RetrievalEngine<'a> {
                 salience: weights.salience,
                 social: weights.social,
                 channel: weights.channel,
+                fts: weights.fts * 1.2,
             },
             QueryType::PreferenceQuery => RetrievalWeights {
                 similarity: weights.similarity,
@@ -212,6 +228,7 @@ impl<'a> RetrievalEngine<'a> {
                 salience: weights.salience * 1.5,
                 social: weights.social * 0.5,
                 channel: weights.channel,
+                fts: weights.fts,
             },
             QueryType::General | QueryType::Temporal => weights,
         };
@@ -232,12 +249,14 @@ impl<'a> RetrievalEngine<'a> {
                     continue;
                 }
 
-                let breakdown = self.compute_scores(mem, *sim_score, query, &temporal_intent);
+                let fts_score = fts_scores.get(id).copied().unwrap_or(0.0);
+                let breakdown = self.compute_scores(mem, *sim_score, query, &temporal_intent, fts_score);
                 let final_score = weights.similarity * breakdown.similarity
                     + weights.temporal * breakdown.temporal
                     + weights.salience * breakdown.salience
                     + weights.social * breakdown.social
-                    + weights.channel * breakdown.channel;
+                    + weights.channel * breakdown.channel
+                    + weights.fts * breakdown.fts;
 
                 results.push(RetrievalResult {
                     memory: Arc::clone(mem),
@@ -394,6 +413,7 @@ impl<'a> RetrievalEngine<'a> {
         similarity: f32,
         query: &RetrievalQuery,
         temporal_intent: &TemporalIntent,
+        fts: f32,
     ) -> ScoreBreakdown {
         // Temporal scoring — enhanced with intent awareness
         let hours_ago = (query.time_context - mem.temporal.ingestion_time)
@@ -462,6 +482,7 @@ impl<'a> RetrievalEngine<'a> {
             salience,
             social,
             channel,
+            fts,
         }
     }
 }

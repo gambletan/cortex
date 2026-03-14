@@ -203,6 +203,12 @@ pub trait StorageBackend: Send + Sync {
         Ok(results)
     }
 
+    /// Full-text search using FTS5. Returns (id, normalized BM25 score) pairs.
+    /// Default implementation returns empty results (no FTS5 support).
+    fn fts_search(&self, _query: &str, _limit: usize) -> Result<Vec<(uuid::Uuid, f64)>, crate::CortexError> {
+        Ok(Vec::new())
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

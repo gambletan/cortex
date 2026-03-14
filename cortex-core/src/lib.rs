@@ -5,6 +5,7 @@ pub mod context;
 pub mod embedder;
 pub mod episode;
 pub mod events;
+pub mod export;
 pub mod inference;
 pub mod people;
 pub mod plugin;
@@ -20,7 +21,7 @@ pub mod working;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -156,6 +157,8 @@ pub struct Cortex {
     dedup_config: DeduplicationConfig,
     /// LRU cache for retrieval results.
     retrieval_cache: Mutex<lru::LruCache<u64, Vec<RetrievalResult>>>,
+    /// Whether the vector index has been loaded from storage.
+    index_loaded: AtomicBool,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -167,21 +170,12 @@ impl Cortex {
     }
 
     /// Open or create a Cortex database with custom index configuration.
+    /// Vector index is lazily loaded on first retrieve/get_context call for fast startup.
     pub fn open_with_config(db_path: &str, index_config: IndexConfig) -> Result<Self, CortexError> {
         let storage = SqliteStorage::open(db_path)?;
         let index = MemoryIndex::with_config(index_config);
 
-        // Load existing embeddings into memory index
-        let all_tiers = [MemoryTier::Episodic, MemoryTier::Semantic, MemoryTier::Procedural];
-        for tier in &all_tiers {
-            let mems = storage.list_by_tier(*tier, 100_000)?;
-            for mem in mems {
-                if let Some(ref emb) = mem.embedding {
-                    index.insert(mem.id, emb.clone());
-                }
-            }
-        }
-
+        // Index is loaded lazily on first retrieve/get_context call
         Ok(Self {
             storage,
             index,
@@ -198,6 +192,7 @@ impl Cortex {
             retrieval_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(64).unwrap(),
             )),
+            index_loaded: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
@@ -222,6 +217,7 @@ impl Cortex {
             retrieval_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(64).unwrap(),
             )),
+            index_loaded: AtomicBool::new(true), // in-memory starts empty, no need to load
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
         })
@@ -279,6 +275,31 @@ impl Cortex {
     /// Get a snapshot of operation metrics.
     pub fn metrics(&self) -> MetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Lazily load vector index from storage on first retrieval call.
+    /// Uses compare_exchange to ensure only one thread loads the index.
+    fn ensure_index_loaded(&self) -> Result<(), CortexError> {
+        // Fast path: already loaded
+        if self.index_loaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Try to claim the loading responsibility (only one thread wins)
+        if self.index_loaded.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            // Another thread is loading or has loaded — we're done
+            return Ok(());
+        }
+        let all_tiers = [MemoryTier::Episodic, MemoryTier::Semantic, MemoryTier::Procedural];
+        for tier in &all_tiers {
+            let mems = self.storage.list_by_tier(*tier, 100_000)?;
+            for mem in mems {
+                if let Some(ref emb) = mem.embedding {
+                    self.index.insert(mem.id, emb.clone());
+                }
+            }
+        }
+        tracing::info!(index_size = self.index.len(), "Lazy-loaded vector index");
+        Ok(())
     }
 
     /// Auto-generate embedding if embedder is available and none provided.
@@ -627,6 +648,8 @@ impl Cortex {
         embedding: Option<Vec<f32>>,
         namespace: Option<&str>,
     ) -> Result<Vec<RetrievalResult>, CortexError> {
+        self.ensure_index_loaded()?;
+
         // ── Cache lookup ──────────────────────────────────────────────────
         let cache_key = {
             let mut h = DefaultHasher::new();
@@ -687,6 +710,7 @@ impl Cortex {
         channel: Option<&str>,
         person_id: Option<Uuid>,
     ) -> Result<String, CortexError> {
+        self.ensure_index_loaded()?;
         let mut config = ContextConfig::new(max_tokens);
         if let Some(ch) = channel {
             config = config.with_channel(ch);

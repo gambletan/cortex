@@ -7,6 +7,7 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
@@ -74,6 +75,42 @@ impl JsonRpcResponse {
 const SERVER_NAME: &str = "cortex-memory";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(
+    name = "cortex-mcp-server",
+    about = "Cortex memory engine — MCP server & CLI tools",
+    version
+)]
+struct Cli {
+    /// Path to the Cortex database file
+    #[arg(global = true)]
+    db_path: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Show memory statistics
+    Stats,
+    /// Export all data as JSON
+    Export {
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Import data from JSON file
+    Import {
+        /// Input JSON file
+        file: String,
+    },
+    /// Show version, DB path, and capabilities
+    Info,
+}
 
 // ── Server ──────────────────────────────────────────────────────────────────
 
@@ -173,9 +210,123 @@ impl McpServer {
     }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn resolve_db_path(cli_path: Option<&str>) -> String {
+    if let Some(p) = cli_path {
+        return p.to_string();
+    }
+    std::env::var("CORTEX_DB_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{home}/.cortex/memory.db")
+    })
+}
+
+fn ensure_db_dir(db_path: &str) {
+    if let Some(parent) = std::path::Path::new(db_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Stats) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+            let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
+                eprintln!("Error opening database: {e}");
+                std::process::exit(1);
+            });
+            let stats = cortex.stats().unwrap_or_else(|e| {
+                eprintln!("Error getting stats: {e}");
+                std::process::exit(1);
+            });
+
+            let db_size = std::fs::metadata(&db_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            println!("Cortex Memory Statistics");
+            println!("========================");
+            println!("Episodic:   {}", stats.episodic);
+            println!("Semantic:   {}", stats.semantic);
+            println!("Procedural: {}", stats.procedural);
+            println!("Archived:   {}", stats.archived);
+            println!("Total:      {}", stats.total);
+            println!("────────────────────────");
+            println!("People:     {}", stats.people);
+            println!("Beliefs:    {}", stats.beliefs);
+            println!("Index size: {}", stats.index_size);
+            println!("DB size:    {}", format_bytes(db_size));
+            println!("DB path:    {}", db_path);
+        }
+        Some(Command::Export { output }) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+            let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
+                eprintln!("Error opening database: {e}");
+                std::process::exit(1);
+            });
+            let data = cortex_core::export::export_all(cortex.storage()).unwrap_or_else(|e| {
+                eprintln!("Error exporting: {e}");
+                std::process::exit(1);
+            });
+            let json = serde_json::to_string_pretty(&data).unwrap();
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &json).unwrap_or_else(|e| {
+                        eprintln!("Error writing to {path}: {e}");
+                        std::process::exit(1);
+                    });
+                    eprintln!("Exported to {path}");
+                }
+                None => println!("{json}"),
+            }
+        }
+        Some(Command::Import { file }) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+            let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
+                eprintln!("Error opening database: {e}");
+                std::process::exit(1);
+            });
+            let json = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                eprintln!("Error reading {file}: {e}");
+                std::process::exit(1);
+            });
+            let data: cortex_core::export::ImportData = serde_json::from_str(&json).unwrap_or_else(|e| {
+                eprintln!("Error parsing JSON: {e}");
+                std::process::exit(1);
+            });
+            let report = cortex_core::export::import_all(cortex.storage(), cortex.index(), data)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error importing: {e}");
+                    std::process::exit(1);
+                });
+            println!("Import complete:");
+            println!("  Memories: {}", report.memories);
+            println!("  People:   {}", report.people);
+            println!("  Beliefs:  {}", report.beliefs);
+        }
+        Some(Command::Info) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            let has_embeddings = cfg!(feature = "embeddings");
+            println!("cortex-mcp-server {}", SERVER_VERSION);
+            println!("DB path:    {}", db_path);
+            println!("Embeddings: {}", if has_embeddings { "enabled" } else { "disabled (lite)" });
+        }
+        None => {
+            // Default: run MCP server (backward compatible)
+            run_mcp_server(cli.db_path.as_deref());
+        }
+    }
+}
+
+fn run_mcp_server(cli_db_path: Option<&str>) {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -184,18 +335,8 @@ fn main() {
         .with_writer(io::stderr)
         .init();
 
-    let db_path = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("CORTEX_DB_PATH").ok())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/.cortex/memory.db")
-        });
-
-    // Ensure parent directory exists
-    if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let db_path = resolve_db_path(cli_db_path);
+    ensure_db_dir(&db_path);
 
     info!(db = %db_path, "starting cortex-mcp-server");
 
@@ -239,5 +380,15 @@ fn main() {
             let _ = writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap());
             let _ = stdout.flush();
         }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }

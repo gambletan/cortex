@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cortex-memory": {
+      "command": "BINARY_PATH",
+      "args": ["DB_PATH"]
+    }
+  }
+}

@@ -529,6 +529,7 @@ fn test_zero_similarity_weight() {
             salience: 0.0,
             social: 0.0,
             channel: 0.0,
+            fts: 0.0,
         });
 
     let query = RetrievalQuery::new("test", 5)

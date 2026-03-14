@@ -1,5 +1,8 @@
 # Cortex
 
+[![GitHub stars](https://img.shields.io/github/stars/gambletan/cortex?style=social)](https://github.com/gambletan/cortex/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 [中文文档](README_CN.md)
 
 ### Memory for fully decentralized AI agents.
@@ -421,6 +424,12 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.4** ✅ — Incremental HNSW, SQL-indexed entity queries, LLM summarizer hook, 18 MCP tools, configurable decay, LLM-assisted inference, 131 tests
 - **v1.5** ✅ — Docker image (GHCR auto-publish), feature freeze
 - **v2.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile (iOS/Android)
+
+---
+
+If you find Cortex useful, please consider giving it a star ⭐ — it helps others discover the project and motivates continued development!
+
+[![Star History Chart](https://api.star-history.com/svg?repos=gambletan/cortex&type=Date)](https://star-history.com/#gambletan/cortex&Date)
 
 ## License
 

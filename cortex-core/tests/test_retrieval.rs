@@ -65,6 +65,7 @@ fn test_channel_boost() {
             salience: 0.1,
             social: 0.0,
             channel: 0.7, // heavy channel weight
+            fts: 0.0,
         });
 
     let query = RetrievalQuery::new("test", 2)
@@ -114,6 +115,7 @@ fn test_person_boost() {
             salience: 0.1,
             social: 0.6, // heavy social weight
             channel: 0.1,
+            fts: 0.0,
         });
 
     let query = RetrievalQuery::new("test", 2)

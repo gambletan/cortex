@@ -499,6 +499,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "fastembed",
+ "half",
  "instant-distance",
  "lru",
  "parking_lot",
@@ -534,6 +535,7 @@ name = "cortex-mcp-server"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "clap",
  "cortex-core",
  "serde",
  "serde_json",
