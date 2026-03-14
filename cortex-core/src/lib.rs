@@ -22,7 +22,6 @@ pub mod working;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::belief::BeliefEngine;
@@ -155,8 +154,8 @@ pub struct Cortex {
     event_bus: EventBus,
     /// Deduplication configuration.
     dedup_config: DeduplicationConfig,
-    /// LRU cache for retrieval results.
-    retrieval_cache: Mutex<lru::LruCache<u64, Vec<RetrievalResult>>>,
+    /// LRU cache for retrieval results (parking_lot::Mutex for faster lock/unlock).
+    retrieval_cache: parking_lot::Mutex<lru::LruCache<u64, Vec<RetrievalResult>>>,
     /// Whether the vector index has been loaded from storage.
     index_loaded: AtomicBool,
     #[cfg(feature = "embeddings")]
@@ -189,7 +188,7 @@ impl Cortex {
             metrics: CortexMetrics::default(),
             event_bus: EventBus::new(),
             dedup_config: DeduplicationConfig::default(),
-            retrieval_cache: Mutex::new(lru::LruCache::new(
+            retrieval_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(64).unwrap(),
             )),
             index_loaded: AtomicBool::new(false),
@@ -214,7 +213,7 @@ impl Cortex {
             metrics: CortexMetrics::default(),
             event_bus: EventBus::new(),
             dedup_config: DeduplicationConfig::default(),
-            retrieval_cache: Mutex::new(lru::LruCache::new(
+            retrieval_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(64).unwrap(),
             )),
             index_loaded: AtomicBool::new(true), // in-memory starts empty, no need to load
@@ -681,7 +680,8 @@ impl Cortex {
             h.finish()
         };
 
-        if let Ok(mut cache) = self.retrieval_cache.lock() {
+        {
+            let mut cache = self.retrieval_cache.lock();
             if let Some(cached) = cache.get(&cache_key) {
                 self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
                 return Ok(cached.clone());
@@ -715,7 +715,8 @@ impl Cortex {
         self.plugins.on_pre_retrieve(query, &mut results, &plugin_ctx);
 
         // ── Cache store ───────────────────────────────────────────────────
-        if let Ok(mut cache) = self.retrieval_cache.lock() {
+        {
+            let mut cache = self.retrieval_cache.lock();
             cache.put(cache_key, results.clone());
         }
 
@@ -1017,7 +1018,8 @@ impl Cortex {
 
     /// Clear the retrieval cache (call after any write operation).
     fn invalidate_retrieval_cache(&self) {
-        if let Ok(mut cache) = self.retrieval_cache.lock() {
+        {
+            let mut cache = self.retrieval_cache.lock();
             cache.clear();
         }
     }

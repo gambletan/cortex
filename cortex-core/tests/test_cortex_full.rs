@@ -16,6 +16,7 @@ fn test_open_with_config() {
         pending_ratio: 0.1,
         removal_ratio: 0.05,
         ef_construction: 40,
+        ..Default::default()
     };
     // Use a temp path
     let path = format!("/tmp/cortex_test_{}.db", uuid::Uuid::new_v4());

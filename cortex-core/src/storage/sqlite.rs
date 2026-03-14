@@ -5,8 +5,8 @@ use crate::storage::traits::StorageBackend;
 use crate::types::*;
 use crate::CortexError;
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::sync::Mutex;
 use uuid::Uuid;
 
 /// Number of read-only connections in the pool.
@@ -81,17 +81,17 @@ impl SqliteStorage {
     }
 
     /// Get a read connection. Tries each reader first, falls back to write conn.
-    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CortexError> {
+    fn read_conn(&self) -> Result<parking_lot::MutexGuard<'_, Connection>, CortexError> {
         for reader in &self.read_pool {
-            if let Ok(guard) = reader.try_lock() {
+            if let Some(guard) = reader.try_lock() {
                 return Ok(guard);
             }
         }
         // All readers busy or no readers (in-memory mode): use write conn
         if let Some(reader) = self.read_pool.first() {
-            return reader.lock().map_err(|e| CortexError::Storage(e.to_string()));
+            return Ok(reader.lock());
         }
-        self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))
+        Ok(self.write_conn.lock())
     }
 
     fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
@@ -195,7 +195,7 @@ fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
 
 impl StorageBackend for SqliteStorage {
     fn init(&self) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS memories (
@@ -326,7 +326,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn store_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         let content_json = serde_json::to_string(&mem.content).unwrap();
@@ -380,7 +380,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         let content_json = serde_json::to_string(&mem.content).unwrap();
@@ -419,7 +419,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         let id_str = id.to_string();
         let mut stmt = conn
             .prepare_cached("DELETE FROM memories WHERE id = ?1")
@@ -535,7 +535,7 @@ impl StorageBackend for SqliteStorage {
         relation: LinkRelation,
         strength: f32,
     ) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         let mut stmt = conn
             .prepare_cached("INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -575,7 +575,7 @@ impl StorageBackend for SqliteStorage {
 
     // People
     fn store_person(&self, person: &Person) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute(
             "INSERT INTO people (id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -666,7 +666,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_person(&self, person: &Person) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute(
             "UPDATE people SET display_name=?2, relationship=?3, first_seen=?4, last_seen=?5, interaction_count=?6, tags_json=?7, notes_json=?8, communication_style_json=?9 WHERE id=?1",
             params![
@@ -706,7 +706,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn delete_person(&self, id: Uuid) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute("DELETE FROM people WHERE id = ?1", params![id.to_string()])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
@@ -731,7 +731,7 @@ impl StorageBackend for SqliteStorage {
 
     // Beliefs
     fn store_belief(&self, belief: &Belief) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute(
             "INSERT INTO beliefs (id, key, probability, observations_json, last_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -761,7 +761,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_belief(&self, belief: &Belief) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute(
             "UPDATE beliefs SET probability=?2, observations_json=?3, last_updated=?4 WHERE id=?1",
             params![
@@ -792,7 +792,7 @@ impl StorageBackend for SqliteStorage {
 
     // Patterns
     fn store_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute(
             "INSERT INTO patterns (id, trigger, actions_json, frequency, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -822,7 +822,7 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn update_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute(
             "UPDATE patterns SET trigger=?2, actions_json=?3, frequency=?4, last_seen=?5 WHERE id=?1",
             params![
@@ -978,7 +978,7 @@ impl StorageBackend for SqliteStorage {
         if mems.is_empty() {
             return Ok(0);
         }
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute_batch("BEGIN TRANSACTION;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1155,7 +1155,7 @@ impl StorageBackend for SqliteStorage {
         if updates.is_empty() {
             return Ok(0);
         }
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute_batch("BEGIN TRANSACTION;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1183,7 +1183,7 @@ impl StorageBackend for SqliteStorage {
         if ids.is_empty() {
             return Ok(0);
         }
-        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = self.write_conn.lock();
         conn.execute_batch("BEGIN TRANSACTION;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
 

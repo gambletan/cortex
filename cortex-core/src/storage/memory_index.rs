@@ -1,6 +1,7 @@
 use instant_distance::{Builder, HnswMap, Search};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Pre-normalized point for HNSW — avoids redundant norm computation during build.
@@ -48,6 +49,8 @@ pub struct IndexConfig {
     pub removal_ratio: f32,
     /// HNSW ef_construction parameter (higher = better recall, slower build).
     pub ef_construction: usize,
+    /// Minimum seconds between HNSW rebuilds (debounce). Default: 5.
+    pub rebuild_cooldown_secs: u64,
 }
 
 impl Default for IndexConfig {
@@ -57,6 +60,7 @@ impl Default for IndexConfig {
             pending_ratio: HNSW_PENDING_RATIO,
             removal_ratio: HNSW_REMOVAL_RATIO,
             ef_construction: 40,
+            rebuild_cooldown_secs: 5,
         }
     }
 }
@@ -74,6 +78,8 @@ struct IndexInner {
     size_at_build: usize,
     /// Index configuration
     config: IndexConfig,
+    /// Last HNSW rebuild timestamp for debouncing
+    last_rebuild: Instant,
 }
 
 struct NormalizedEntry {
@@ -102,6 +108,7 @@ impl MemoryIndex {
                 removals_since_build: 0,
                 size_at_build: 0,
                 config,
+                last_rebuild: Instant::now(),
             }),
         }
     }
@@ -137,73 +144,56 @@ impl MemoryIndex {
     }
 
     /// Search for the top-k most similar vectors.
-    /// Merges HNSW results (stable) with brute-force results (pending).
+    /// Uses read lock for searches, only acquires write lock when HNSW rebuild is needed.
+    /// Rebuild is debounced by cooldown timer to prevent thrashing under burst search.
     pub fn search(&self, query: &[f32], limit: usize) -> Vec<(Uuid, f32)> {
-        let mut inner = self.inner.write();
-        let total = inner.stable.len() + inner.pending.len();
+        // Fast path: try read-only search first (no write lock contention)
+        {
+            let inner = self.inner.read();
+            let total = inner.stable.len() + inner.pending.len();
 
-        if total == 0 {
-            return Vec::new();
-        }
+            if total == 0 {
+                return Vec::new();
+            }
 
-        // Small collection: brute-force everything
-        if total < inner.config.min_size {
-            return brute_force_search_both(&inner.stable, &inner.pending, query, limit);
-        }
+            // Small collection: brute-force everything (read-only)
+            if total < inner.config.min_size {
+                return brute_force_search_both(&inner.stable, &inner.pending, query, limit);
+            }
 
-        // Check if HNSW needs a full rebuild:
-        // 1. No HNSW yet
-        // 2. Too many removals (stale entries in HNSW)
-        let needs_rebuild = inner.hnsw.is_none()
-            || (inner.size_at_build > 0
-                && inner.removals_since_build as f32 > inner.size_at_build as f32 * inner.config.removal_ratio);
+            // Check if rebuild is needed
+            let needs_rebuild = inner.hnsw.is_none()
+                || (inner.size_at_build > 0
+                    && inner.removals_since_build as f32 > inner.size_at_build as f32 * inner.config.removal_ratio);
 
-        // Adaptive pending ratio: relax for small collections to avoid frequent rebuilds
-        let effective_pending_ratio = if total < 5000 {
-            inner.config.pending_ratio.max(0.5) // at least 50% for small sets
-        } else {
-            inner.config.pending_ratio
-        };
+            let effective_pending_ratio = if total < 5000 {
+                inner.config.pending_ratio.max(0.5)
+            } else {
+                inner.config.pending_ratio
+            };
 
-        // Check if pending buffer should be flushed into stable + rebuild
-        let pending_overflow = inner.hnsw.is_some()
-            && inner.size_at_build > 0
-            && inner.pending.len() as f32 > inner.size_at_build as f32 * effective_pending_ratio;
+            let pending_overflow = inner.hnsw.is_some()
+                && inner.size_at_build > 0
+                && inner.pending.len() as f32 > inner.size_at_build as f32 * effective_pending_ratio;
 
-        if needs_rebuild || pending_overflow {
-            flush_and_rebuild(&mut inner);
-        }
+            // If no rebuild needed, search with read lock only
+            if !needs_rebuild && !pending_overflow {
+                return search_inner_readonly(&inner, query, limit);
+            }
 
-        // Merge: HNSW search on stable + brute-force on pending
-        let mut results: Vec<(Uuid, f32)> = Vec::new();
-
-        // HNSW search on stable entries
-        if let Some(ref hnsw) = inner.hnsw {
-            let query_point = Point::new(query.to_vec());
-            let mut search = Search::default();
-            let hnsw_results = hnsw.search(&query_point, &mut search);
-
-            for item in hnsw_results.take(limit * 2) {
-                let id = *item.value;
-                // Skip entries that were removed after the HNSW build
-                if inner.stable.contains_key(&id) {
-                    let similarity = 1.0 - item.distance;
-                    results.push((id, similarity));
-                }
+            // Rebuild needed but cooldown hasn't elapsed — search stale index instead of blocking
+            let cooldown = std::time::Duration::from_secs(inner.config.rebuild_cooldown_secs);
+            if inner.hnsw.is_some() && inner.last_rebuild.elapsed() < cooldown {
+                return search_inner_readonly(&inner, query, limit);
             }
         }
+        // Drop read lock before acquiring write lock
 
-        // Brute-force on pending buffer
-        if !inner.pending.is_empty() {
-            let pending_results = brute_force_search_map(&inner.pending, query, limit);
-            results.extend(pending_results);
-        }
+        // Slow path: acquire write lock and rebuild
+        let mut inner = self.inner.write();
+        flush_and_rebuild(&mut inner);
 
-        // Merge, deduplicate, sort, truncate
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.dedup_by_key(|r| r.0);
-        results.truncate(limit);
-        results
+        search_inner_readonly(&inner, query, limit)
     }
 
     /// Force HNSW rebuild (call after bulk operations).
@@ -236,6 +226,38 @@ impl Default for MemoryIndex {
     }
 }
 
+/// Search using existing HNSW + brute-force on pending (no mutation needed).
+fn search_inner_readonly(inner: &IndexInner, query: &[f32], limit: usize) -> Vec<(Uuid, f32)> {
+    let mut results: Vec<(Uuid, f32)> = Vec::new();
+
+    // HNSW search on stable entries
+    if let Some(ref hnsw) = inner.hnsw {
+        let query_point = Point::new(query.to_vec());
+        let mut search = Search::default();
+        let hnsw_results = hnsw.search(&query_point, &mut search);
+
+        for item in hnsw_results.take(limit * 2) {
+            let id = *item.value;
+            if inner.stable.contains_key(&id) {
+                let similarity = 1.0 - item.distance;
+                results.push((id, similarity));
+            }
+        }
+    }
+
+    // Brute-force on pending buffer
+    if !inner.pending.is_empty() {
+        let pending_results = brute_force_search_map(&inner.pending, query, limit);
+        results.extend(pending_results);
+    }
+
+    // Merge, deduplicate, sort, truncate
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.dedup_by_key(|r| r.0);
+    results.truncate(limit);
+    results
+}
+
 /// Flush pending entries into stable, then rebuild HNSW from all stable entries.
 fn flush_and_rebuild(inner: &mut IndexInner) {
     // Move all pending into stable
@@ -258,6 +280,7 @@ fn flush_and_rebuild(inner: &mut IndexInner) {
     inner.hnsw = Some(hnsw);
     inner.removals_since_build = 0;
     inner.size_at_build = inner.stable.len();
+    inner.last_rebuild = Instant::now();
 }
 
 /// Brute-force search across both stable and pending maps.
