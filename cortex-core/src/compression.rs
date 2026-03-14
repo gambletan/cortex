@@ -60,21 +60,33 @@ impl<'a> CompressionEngine<'a> {
         max_age: Duration,
     ) -> Result<Vec<ConversationSession>, CortexError> {
         let cutoff = Utc::now() - max_age;
-        let episodes = self
-            .storage
-            .list_by_tier_ordered_by_ingestion(MemoryTier::Episodic, 10_000)?;
 
-        // Group by (channel, date) to find sessions
+        // Group by (channel, date) to find sessions — paginated loading
         let mut sessions: std::collections::HashMap<String, Vec<MemObject>> =
             std::collections::HashMap::new();
+        let page_size = 1000;
+        let mut offset = 0;
 
-        for mem in episodes {
-            if mem.temporal.ingestion_time > cutoff {
-                continue; // too recent, don't compress yet
+        loop {
+            let episodes = self.storage.list_by_tier_paged(MemoryTier::Episodic, offset, page_size)?;
+            if episodes.is_empty() {
+                break;
             }
-            let date = mem.temporal.ingestion_time.format("%Y-%m-%d").to_string();
-            let key = format!("{}|{}", mem.source.channel, date);
-            sessions.entry(key).or_default().push(mem);
+            let page_len = episodes.len();
+
+            for mem in episodes {
+                if mem.temporal.ingestion_time > cutoff {
+                    continue; // too recent, don't compress yet
+                }
+                let date = mem.temporal.ingestion_time.format("%Y-%m-%d").to_string();
+                let key = format!("{}|{}", mem.source.channel, date);
+                sessions.entry(key).or_default().push(mem);
+            }
+
+            if page_len < page_size {
+                break;
+            }
+            offset += page_size;
         }
 
         let mut result = Vec::new();
@@ -185,10 +197,11 @@ impl<'a> CompressionEngine<'a> {
         // Store summary
         self.storage.store_memory(&summary_mem)?;
 
-        // Delete originals
-        for mem in &session.memories {
-            self.storage.delete_memory(mem.id)?;
-            self.index.remove(&mem.id);
+        // Delete originals in a single transaction
+        let ids: Vec<uuid::Uuid> = session.memories.iter().map(|m| m.id).collect();
+        self.storage.delete_memories_batch(&ids)?;
+        for id in &ids {
+            self.index.remove(id);
         }
 
         Ok(summary_mem)

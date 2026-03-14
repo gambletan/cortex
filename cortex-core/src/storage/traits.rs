@@ -242,6 +242,16 @@ pub trait StorageBackend: Send + Sync {
         Ok(count)
     }
 
+    /// Batch delete multiple memories in a single transaction.
+    fn delete_memories_batch(&self, ids: &[Uuid]) -> Result<usize, crate::CortexError> {
+        let mut count = 0;
+        for id in ids {
+            self.delete_memory(*id)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

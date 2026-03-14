@@ -1122,6 +1122,41 @@ impl StorageBackend for SqliteStorage {
         Ok(count)
     }
 
+    fn delete_memories_batch(&self, ids: &[Uuid]) -> Result<usize, CortexError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.write_conn.lock().map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        let mut count = 0;
+        {
+            let mut del_stmt = conn
+                .prepare_cached("DELETE FROM memories WHERE id = ?1")
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            for id in ids {
+                let id_str = id.to_string();
+                del_stmt.execute(params![id_str])
+                    .map_err(|e| CortexError::Storage(e.to_string()))?;
+                count += 1;
+            }
+        }
+        // Batch FTS cleanup
+        {
+            let mut fts_stmt = conn
+                .prepare_cached("DELETE FROM memories_fts WHERE id = ?1")
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            for id in ids {
+                let _ = fts_stmt.execute(params![id.to_string()]);
+            }
+        }
+
+        conn.execute_batch("COMMIT;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(count)
+    }
+
     fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(Uuid, f64)>, CortexError> {
         SqliteStorage::fts_search(self, query, limit)
     }

@@ -3,7 +3,6 @@ use uuid::Uuid;
 use crate::belief::BeliefEngine;
 use crate::people::PeopleGraph;
 use crate::procedural::ProceduralStore;
-use crate::semantic::SemanticStore;
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
 use crate::types::*;
@@ -135,7 +134,7 @@ impl ContextSection {
 pub fn generate_context(
     config: &ContextConfig,
     storage: &dyn StorageBackend,
-    index: &MemoryIndex,
+    _index: &MemoryIndex,
 ) -> Result<String, CortexError> {
     let chars_budget = config.max_tokens * 4; // ~1 token ≈ 4 chars
     let header = "[Cortex Memory Context]";
@@ -144,36 +143,34 @@ pub fn generate_context(
 
     let mut sections: Vec<ContextSection> = Vec::new();
 
-    // ── User preferences (weight 25%) ───────────────────────────────────
+    // ── User preferences + Semantic facts (single query) ──────────────
     if config.include_preferences {
-        let semantic = SemanticStore::new(storage, index);
-        let prefs = semantic.query_preferences("")?;
-        if !prefs.is_empty() {
-            let mut sec = ContextSection::new("\n## User Profile\n", 25.0);
-            for mem in &prefs {
-                if let MemContent::Preference { key, value, confidence } = &mem.content {
-                    let line = format!("- {} = {} (confidence: {:.0}%)\n", key, value, confidence * 100.0);
-                    sec.push(mem.salience.base_score, line);
-                }
-            }
-            sections.push(sec);
-        }
-    }
+        // Load all semantic memories once instead of two separate queries
+        let semantic_mems = storage.list_by_tier(MemoryTier::Semantic, 10_000)?;
 
-    // ── Semantic facts (weight 25%) ─────────────────────────────────────
-    if config.include_preferences {
-        let semantic = SemanticStore::new(storage, index);
-        let facts = semantic.query_facts("")?;
-        if !facts.is_empty() {
-            let mut sec = ContextSection::new("\n## Known Facts\n", 25.0);
-            for mem in &facts {
-                if let MemContent::Fact { subject, predicate, object } = &mem.content {
+        let mut pref_sec = ContextSection::new("\n## User Profile\n", 25.0);
+        let mut fact_sec = ContextSection::new("\n## Known Facts\n", 25.0);
+
+        for mem in &semantic_mems {
+            match &mem.content {
+                MemContent::Preference { key, value, confidence } => {
+                    let line = format!("- {} = {} (confidence: {:.0}%)\n", key, value, confidence * 100.0);
+                    pref_sec.push(mem.salience.base_score, line);
+                }
+                MemContent::Fact { subject, predicate, object } => {
                     let line = format!("- {} {} {} (confidence: {:.0}%)\n",
                         subject, predicate, object, mem.salience.base_score * 100.0);
-                    sec.push(mem.salience.base_score, line);
+                    fact_sec.push(mem.salience.base_score, line);
                 }
+                _ => {}
             }
-            sections.push(sec);
+        }
+
+        if !pref_sec.items.is_empty() {
+            sections.push(pref_sec);
+        }
+        if !fact_sec.items.is_empty() {
+            sections.push(fact_sec);
         }
     }
 

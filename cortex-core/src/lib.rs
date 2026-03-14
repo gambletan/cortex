@@ -523,12 +523,14 @@ impl Cortex {
             index: &self.index,
         };
 
+        // Create PeopleGraph once for the entire batch
+        let people = PeopleGraph::new(&self.storage);
+
         for item in &items {
             let mut source = MemSource::new(&item.channel);
             let embedding = self.auto_embed(&item.text, item.embedding.clone());
 
             if let Some(ref uid) = item.user_id {
-                let people = PeopleGraph::new(&self.storage);
                 if let Ok(person) = people.resolve_identity(&item.channel, uid, None, None) {
                     source.identity_id = Some(person.id);
                     let _ = people.record_interaction(person.id);

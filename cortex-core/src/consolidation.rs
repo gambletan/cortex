@@ -203,10 +203,10 @@ impl<'a> ConsolidationEngine<'a> {
         let decayed = self
             .storage
             .list_by_salience_below(MemoryTier::Episodic, threshold)?;
-        let count = decayed.len();
-        for mem in decayed {
-            self.storage.delete_memory(mem.id)?;
+        if decayed.is_empty() {
+            return Ok(0);
         }
-        Ok(count)
+        let ids: Vec<uuid::Uuid> = decayed.iter().map(|m| m.id).collect();
+        self.storage.delete_memories_batch(&ids)
     }
 }

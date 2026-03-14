@@ -171,6 +171,8 @@ impl<'a> PeopleGraph<'a> {
     /// Extracts relationship memories from the store.
     pub fn get_relationship_graph(&self) -> Result<Vec<(Person, Person, String)>, CortexError> {
         let people = self.storage.list_people()?;
+        // Build HashMap for O(1) lookups instead of O(N) linear search per relationship
+        let people_map: HashMap<Uuid, &Person> = people.iter().map(|p| (p.id, p)).collect();
         let mut graph = Vec::new();
 
         // Find Relationship content in semantic memories
@@ -186,10 +188,10 @@ impl<'a> PeopleGraph<'a> {
             } = mem.content
             {
                 if let (Some(pa), Some(pb)) = (
-                    people.iter().find(|p| p.id == person_a),
-                    people.iter().find(|p| p.id == person_b),
+                    people_map.get(&person_a),
+                    people_map.get(&person_b),
                 ) {
-                    graph.push((pa.clone(), pb.clone(), relation.clone()));
+                    graph.push(((*pa).clone(), (*pb).clone(), relation.clone()));
                 }
             }
         }
