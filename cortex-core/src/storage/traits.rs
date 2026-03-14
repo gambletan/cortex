@@ -118,6 +118,23 @@ pub trait StorageBackend: Send + Sync {
         }).collect())
     }
 
+    /// Query semantic facts where subject or object matches ANY of the given entities.
+    /// Single query instead of N individual query_facts_by_entity calls.
+    fn query_facts_by_entities(&self, entities: &[String]) -> Result<Vec<MemObject>, crate::CortexError> {
+        // Default: N individual queries (override for batched SQL)
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entity in entities {
+            let facts = self.query_facts_by_entity(entity)?;
+            for fact in facts {
+                if seen.insert(fact.id) {
+                    results.push(fact);
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Query semantic preferences where key contains the pattern string.
     fn query_preferences_by_key(&self, key_pattern: &str) -> Result<Vec<MemObject>, crate::CortexError> {
         let all = self.list_by_tier(MemoryTier::Semantic, 10_000)?;

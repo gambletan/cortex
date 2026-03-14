@@ -426,37 +426,55 @@ impl Cortex {
 
         // ── Auto-extract facts ───────────────────────────────────────────
         let semantic = SemanticStore::new(&self.storage, &self.index);
-        for fact in &inferred.facts {
-            // Check for contradictions before storing
-            let contradictions = semantic.find_contradictions(
-                &fact.subject, &fact.predicate, &fact.object,
-            )?;
+        if !inferred.facts.is_empty() {
+            // Batch-load all existing facts for relevant subjects in a single query
+            let subjects: Vec<String> = inferred.facts.iter()
+                .map(|f| f.subject.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let existing_facts = self.storage.query_facts_by_entities(&subjects)?;
 
-            if !contradictions.is_empty() {
-                // New fact contradicts existing — supersede the old ones
-                let new_fact = semantic.add_fact(
-                    &fact.subject, &fact.predicate, &fact.object,
-                    fact.confidence,
-                    MemSource::new(channel),
-                    None,
-                )?;
-                for (old, _score) in &contradictions {
-                    semantic.merge_facts(old.id, new_fact.id)?;
-                    tracing::info!(
-                        subject = %fact.subject,
-                        predicate = %fact.predicate,
-                        new = %fact.object,
-                        "Contradiction resolved: superseded old fact"
+            for fact in &inferred.facts {
+                // Check contradictions against preloaded facts (in-memory, no SQL)
+                let contradictions: Vec<(&MemObject, f32)> = existing_facts.iter()
+                    .filter_map(|m| {
+                        if let MemContent::Fact { subject: ref s, predicate: ref p, object: ref o } = m.content {
+                            if s.to_lowercase() == fact.subject.to_lowercase()
+                                && p.to_lowercase() == fact.predicate.to_lowercase()
+                                && o.to_lowercase() != fact.object.to_lowercase()
+                            {
+                                return Some((m, m.salience.effective_score));
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                if !contradictions.is_empty() {
+                    let new_fact = semantic.add_fact(
+                        &fact.subject, &fact.predicate, &fact.object,
+                        fact.confidence,
+                        MemSource::new(channel),
+                        None,
+                    )?;
+                    for (old, _score) in &contradictions {
+                        semantic.merge_facts(old.id, new_fact.id)?;
+                        tracing::info!(
+                            subject = %fact.subject,
+                            predicate = %fact.predicate,
+                            new = %fact.object,
+                            "Contradiction resolved: superseded old fact"
+                        );
+                    }
+                } else {
+                    let _ = semantic.add_fact(
+                        &fact.subject, &fact.predicate, &fact.object,
+                        fact.confidence,
+                        MemSource::new(channel),
+                        None,
                     );
                 }
-            } else {
-                // No contradiction — store normally
-                let _ = semantic.add_fact(
-                    &fact.subject, &fact.predicate, &fact.object,
-                    fact.confidence,
-                    MemSource::new(channel),
-                    None,
-                );
             }
         }
 

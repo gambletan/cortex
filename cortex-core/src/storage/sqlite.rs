@@ -117,11 +117,27 @@ impl SqliteStorage {
         let temporal: TemporalInfo = serde_json::from_str(&temporal_json).unwrap();
         let source: MemSource = serde_json::from_str(&source_json).unwrap();
         let salience: Salience = serde_json::from_str(&salience_json).unwrap();
-        let privacy: PrivacyLevel = serde_json::from_str(&privacy_json).unwrap();
-        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap();
-        let metadata: std::collections::HashMap<String, serde_json::Value> =
-            serde_json::from_str(&metadata_json).unwrap();
-        let links: Vec<MemLink> = serde_json::from_str(&links_json).unwrap();
+        // Fast-path: skip serde for common default values (avoids ~40% of JSON parsing)
+        let privacy: PrivacyLevel = if privacy_json == "\"Private\"" {
+            PrivacyLevel::Private
+        } else {
+            serde_json::from_str(&privacy_json).unwrap()
+        };
+        let tags: Vec<String> = if tags_json == "[]" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&tags_json).unwrap()
+        };
+        let metadata: std::collections::HashMap<String, serde_json::Value> = if metadata_json == "{}" {
+            std::collections::HashMap::new()
+        } else {
+            serde_json::from_str(&metadata_json).unwrap()
+        };
+        let links: Vec<MemLink> = if links_json == "[]" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&links_json).unwrap()
+        };
 
         Ok(MemObject {
             id,
@@ -875,6 +891,47 @@ impl StorageBackend for SqliteStorage {
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
             .query_map(params![pattern], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
+    fn query_facts_by_entities(&self, entities: &[String]) -> Result<Vec<MemObject>, CortexError> {
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.read_conn()?;
+        // Build OR conditions: (LOWER(subject) LIKE ?N OR LOWER(object) LIKE ?N) for each entity
+        let conditions: Vec<String> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let p = i + 1;
+                format!(
+                    "(LOWER(json_extract(content_json, '$.Fact.subject')) LIKE ?{p} \
+                     OR LOWER(json_extract(content_json, '$.Fact.object')) LIKE ?{p})"
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, \
+             salience_json, privacy_json, tags_json, metadata_json, links_json, \
+             content_hash, namespace \
+             FROM memories WHERE tier = 'semantic' AND ({}) \
+             ORDER BY created_at DESC",
+            conditions.join(" OR ")
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(entities.len());
+        for entity in entities {
+            params_vec.push(Box::new(format!("%{}%", entity.to_lowercase())));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), Self::parse_mem_row)
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut results = Vec::new();
         for row in rows {

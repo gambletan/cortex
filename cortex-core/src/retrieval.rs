@@ -360,12 +360,12 @@ impl<'a> RetrievalEngine<'a> {
             }
         }
 
-        // Query semantic store for facts mentioning these entities (indexed)
+        // Query semantic store for facts mentioning these entities (single batched query)
         let mut expanded: Vec<(Uuid, f32)> = Vec::new();
         let mut seen = HashSet::new();
 
-        for entity in &entities {
-            let facts = self.storage.query_facts_by_entity(entity)?;
+        if !entities.is_empty() {
+            let facts = self.storage.query_facts_by_entities(&entities)?;
             for mem in facts {
                 if seen.insert(mem.id) {
                     expanded.push((mem.id, 0.25)); // lower score for hop-2 results
