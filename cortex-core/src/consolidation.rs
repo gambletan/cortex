@@ -109,32 +109,44 @@ impl<'a> ConsolidationEngine<'a> {
 
     /// Find episodic memories that repeat (same content observed 3+ times).
     /// Groups by content text similarity (exact match for now).
+    /// Processes in pages to avoid loading all episodic memories at once.
     fn find_promotion_candidates(
         &self,
         min_occurrences: usize,
     ) -> Result<Vec<Vec<Uuid>>, CortexError> {
-        let episodes = self
-            .storage
-            .list_by_tier(MemoryTier::Episodic, 10_000)?;
-
-        // Group facts by (subject, predicate)
         let mut fact_groups: HashMap<String, Vec<Uuid>> = HashMap::new();
-        for mem in &episodes {
-            let key = match &mem.content {
-                MemContent::Fact {
-                    subject,
-                    predicate,
-                    object,
-                } => Some(format!("{}|{}|{}", subject.to_lowercase(), predicate.to_lowercase(), object.to_lowercase())),
-                MemContent::Preference { key, value, .. } => {
-                    Some(format!("pref|{}|{}", key.to_lowercase(), value.to_lowercase()))
-                }
-                MemContent::Text(t) => Some(format!("text|{}", t.to_lowercase())),
-                _ => None,
-            };
-            if let Some(k) = key {
-                fact_groups.entry(k).or_default().push(mem.id);
+        let page_size = 1000;
+        let mut offset = 0;
+
+        loop {
+            let episodes = self.storage.list_by_tier_paged(MemoryTier::Episodic, offset, page_size)?;
+            if episodes.is_empty() {
+                break;
             }
+            let page_len = episodes.len();
+
+            for mem in &episodes {
+                let key = match &mem.content {
+                    MemContent::Fact {
+                        subject,
+                        predicate,
+                        object,
+                    } => Some(format!("{}|{}|{}", subject.to_lowercase(), predicate.to_lowercase(), object.to_lowercase())),
+                    MemContent::Preference { key, value, .. } => {
+                        Some(format!("pref|{}|{}", key.to_lowercase(), value.to_lowercase()))
+                    }
+                    MemContent::Text(t) => Some(format!("text|{}", t.to_lowercase())),
+                    _ => None,
+                };
+                if let Some(k) = key {
+                    fact_groups.entry(k).or_default().push(mem.id);
+                }
+            }
+
+            if page_len < page_size {
+                break;
+            }
+            offset += page_size;
         }
 
         Ok(fact_groups

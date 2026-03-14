@@ -209,6 +209,39 @@ pub trait StorageBackend: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Paginated list by tier — for chunked processing of large collections.
+    /// Returns memories ordered by created_at DESC, skipping `offset` rows.
+    /// Does NOT load embedding blobs (set to None) for lighter memory footprint.
+    fn list_by_tier_paged(
+        &self,
+        tier: MemoryTier,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemObject>, crate::CortexError> {
+        // Default: fall back to unpaginated (override for SQL OFFSET support)
+        let all = self.list_by_tier(tier, offset + limit)?;
+        Ok(all.into_iter().skip(offset).collect())
+    }
+
+    /// Batch-update salience fields for multiple memories in a single transaction.
+    /// Each tuple is (id, salience_json, salience_score).
+    fn batch_update_salience(
+        &self,
+        updates: &[(Uuid, String, f32)],
+    ) -> Result<usize, crate::CortexError> {
+        // Default: N individual updates
+        let mut count = 0;
+        for (id, _salience_json, _score) in updates {
+            if let Some(mut mem) = self.get_memory(*id)? {
+                mem.salience = serde_json::from_str(_salience_json)
+                    .map_err(|e| crate::CortexError::Serialization(e.to_string()))?;
+                self.update_memory(&mem)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

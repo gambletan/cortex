@@ -147,54 +147,73 @@ impl<'a> EpisodeStore<'a> {
     }
 
     /// Apply decay with a specific reference time (useful for testing).
+    /// Processes memories in pages of 1000 to avoid loading all into memory at once.
+    /// Uses batch_update_salience for transactional bulk writes.
     pub fn decay_tick_at(&self, now: DateTime<Utc>) -> Result<usize, CortexError> {
-        let mems = self
-            .storage
-            .list_by_tier(MemoryTier::Episodic, 10_000)?;
-        let mut updated = 0;
-
         // Use custom config or hardcoded defaults
         let default_config = DecayConfig::default();
         let cfg = self.decay_config.unwrap_or(&default_config);
 
-        for mut mem in mems {
-            // Permanent memories never decay below a floor
-            if mem.temporal.durability == MemoryDurability::Permanent {
-                if mem.salience.decay_factor < cfg.permanent_floor {
-                    mem.salience.decay_factor = cfg.permanent_floor;
+        let mut updated = 0;
+        let page_size = 1000;
+        let mut offset = 0;
+
+        loop {
+            let mems = self.storage.list_by_tier_paged(MemoryTier::Episodic, offset, page_size)?;
+            if mems.is_empty() {
+                break;
+            }
+            let page_len = mems.len();
+
+            // Collect batch updates for this page
+            let mut batch: Vec<(Uuid, String, f32)> = Vec::new();
+
+            for mut mem in mems {
+                // Permanent memories never decay below a floor
+                if mem.temporal.durability == MemoryDurability::Permanent {
+                    if mem.salience.decay_factor < cfg.permanent_floor {
+                        mem.salience.decay_factor = cfg.permanent_floor;
+                        mem.salience.recompute();
+                        let salience_json = serde_json::to_string(&mem.salience).unwrap();
+                        batch.push((mem.id, salience_json, mem.salience.effective_score));
+                    }
+                    continue;
+                }
+
+                let hours_since_access = (now - mem.temporal.last_accessed)
+                    .num_hours()
+                    .max(0) as f32;
+
+                let half_life_hours = match mem.temporal.durability {
+                    MemoryDurability::Temporary => {
+                        cfg.temp_half_life_hours + (mem.salience.base_score * cfg.temp_importance_scale)
+                    }
+                    _ => {
+                        cfg.normal_half_life_hours + (mem.salience.base_score * cfg.normal_importance_scale)
+                    }
+                };
+
+                let decay = (-hours_since_access * 0.693 / half_life_hours).exp();
+                let new_decay = decay.clamp(0.01, 1.0);
+
+                if (mem.salience.decay_factor - new_decay).abs() > 0.001 {
+                    mem.salience.decay_factor = new_decay;
                     mem.salience.recompute();
-                    self.storage.update_memory(&mem)?;
-                    updated += 1;
+                    let salience_json = serde_json::to_string(&mem.salience).unwrap();
+                    batch.push((mem.id, salience_json, mem.salience.effective_score));
                 }
-                continue;
             }
 
-            let hours_since_access = (now - mem.temporal.last_accessed)
-                .num_hours()
-                .max(0) as f32;
-
-            // Durability-aware half-life (configurable):
-            //   Temporary: base + importance scaling
-            //   Normal: base + importance scaling
-            let half_life_hours = match mem.temporal.durability {
-                MemoryDurability::Temporary => {
-                    cfg.temp_half_life_hours + (mem.salience.base_score * cfg.temp_importance_scale)
-                }
-                _ => {
-                    cfg.normal_half_life_hours + (mem.salience.base_score * cfg.normal_importance_scale)
-                }
-            };
-
-            // Exponential decay: salience halves every half_life_hours of non-access
-            let decay = (-hours_since_access * 0.693 / half_life_hours).exp();
-            let new_decay = decay.clamp(0.01, 1.0);
-
-            if (mem.salience.decay_factor - new_decay).abs() > 0.001 {
-                mem.salience.decay_factor = new_decay;
-                mem.salience.recompute();
-                self.storage.update_memory(&mem)?;
-                updated += 1;
+            // Flush batch in a single transaction
+            if !batch.is_empty() {
+                updated += self.storage.batch_update_salience(&batch)?;
             }
+
+            // If we got fewer than page_size, we've reached the end
+            if page_len < page_size {
+                break;
+            }
+            offset += page_size;
         }
         Ok(updated)
     }
