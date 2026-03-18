@@ -155,7 +155,11 @@ pub struct Cortex {
     /// Deduplication configuration.
     dedup_config: DeduplicationConfig,
     /// LRU cache for retrieval results (parking_lot::Mutex for faster lock/unlock).
-    retrieval_cache: parking_lot::Mutex<lru::LruCache<u64, Vec<RetrievalResult>>>,
+    /// Cache entries are tagged with write_generation; stale entries are evicted on read.
+    retrieval_cache: parking_lot::Mutex<lru::LruCache<u64, (u64, Vec<RetrievalResult>)>>,
+    /// Monotonic counter incremented on content-changing writes (ingest, delete, promote).
+    /// Decay/salience-only updates don't bump this — cached rankings stay approximately valid.
+    write_generation: AtomicU64,
     /// Whether the vector index has been loaded from storage.
     index_loaded: AtomicBool,
     #[cfg(feature = "embeddings")]
@@ -191,6 +195,7 @@ impl Cortex {
             retrieval_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(64).unwrap(),
             )),
+            write_generation: AtomicU64::new(0),
             index_loaded: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
@@ -216,6 +221,7 @@ impl Cortex {
             retrieval_cache: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(64).unwrap(),
             )),
+            write_generation: AtomicU64::new(0),
             index_loaded: AtomicBool::new(true), // in-memory starts empty, no need to load
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
@@ -516,7 +522,7 @@ impl Cortex {
             }
         }
 
-        self.invalidate_retrieval_cache();
+        self.bump_write_generation();
         Ok(result)
     }
 
@@ -639,7 +645,7 @@ impl Cortex {
             }
         }
 
-        self.invalidate_retrieval_cache();
+        self.bump_write_generation();
         Ok(report)
     }
 
@@ -680,11 +686,15 @@ impl Cortex {
             h.finish()
         };
 
+        let current_gen = self.write_generation.load(Ordering::Acquire);
         {
             let mut cache = self.retrieval_cache.lock();
-            if let Some(cached) = cache.get(&cache_key) {
-                self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
-                return Ok(cached.clone());
+            if let Some((gen, cached)) = cache.get(&cache_key) {
+                if *gen == current_gen {
+                    self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
+                    return Ok(cached.clone());
+                }
+                // Stale entry — generation mismatch, treat as miss
             }
         }
 
@@ -714,10 +724,10 @@ impl Cortex {
         };
         self.plugins.on_pre_retrieve(query, &mut results, &plugin_ctx);
 
-        // ── Cache store ───────────────────────────────────────────────────
+        // ── Cache store (tagged with current generation) ─────────────────
         {
             let mut cache = self.retrieval_cache.lock();
-            cache.put(cache_key, results.clone());
+            cache.put(cache_key, (current_gen, results.clone()));
         }
 
         self.metrics.retrievals.fetch_add(1, Ordering::Relaxed);
@@ -769,7 +779,7 @@ impl Cortex {
         let actions = self.plugins.on_consolidation(&report, &plugin_ctx);
         self.apply_plugin_side_effects(&actions, "consolidation");
 
-        self.invalidate_retrieval_cache();
+        self.bump_write_generation();
         self.metrics.consolidations.fetch_add(1, Ordering::Relaxed);
         self.event_bus.emit(&CortexEvent::ConsolidationCompleted {
             report: format!("{:?}", report),
@@ -793,7 +803,9 @@ impl Cortex {
         };
         self.plugins.on_decay(count, &plugin_ctx);
 
-        self.invalidate_retrieval_cache();
+        // Decay only adjusts salience scores — cached retrieval rankings stay approximately
+        // valid, so we skip bumping write_generation here. Saves cache thrashing during
+        // auto-consolidation cycles that run decay on every 100 ingests.
         self.metrics.decay_runs.fetch_add(1, Ordering::Relaxed);
         self.event_bus.emit(&CortexEvent::DecayCompleted { count });
         Ok(count)
@@ -930,7 +942,7 @@ impl Cortex {
     pub fn archive_memory(&self, id: Uuid) -> Result<(), CortexError> {
         self.storage.archive_memory(id)?;
         self.index.remove(&id);
-        self.invalidate_retrieval_cache();
+        self.bump_write_generation();
         self.metrics.archives.fetch_add(1, Ordering::Relaxed);
         self.event_bus.emit(&CortexEvent::MemoryArchived { id });
         Ok(())
@@ -945,7 +957,7 @@ impl Cortex {
                 self.index.insert(id, emb.clone());
             }
         }
-        self.invalidate_retrieval_cache();
+        self.bump_write_generation();
         Ok(())
     }
 
@@ -1016,12 +1028,11 @@ impl Cortex {
         }
     }
 
-    /// Clear the retrieval cache (call after any write operation).
-    fn invalidate_retrieval_cache(&self) {
-        {
-            let mut cache = self.retrieval_cache.lock();
-            cache.clear();
-        }
+    /// Bump the write generation, lazily invalidating all cached retrieval results.
+    /// Use for content-changing writes (ingest, delete, promote, compress).
+    /// Does NOT lock the cache — stale entries are evicted on next read.
+    fn bump_write_generation(&self) {
+        self.write_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Apply side-effect actions (facts, preferences, beliefs) from plugins.
