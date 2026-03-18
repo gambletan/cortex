@@ -551,8 +551,51 @@ fn test_embedding_round_trip() {
     let got = s.get_memory(mem.id).unwrap().unwrap();
     let got_emb = got.embedding.unwrap();
     assert_eq!(got_emb.len(), 5);
-    // f16 quantization: precision loss < 0.01 (half-precision storage)
+    // int8 quantization: precision loss < 0.005 for small vectors with narrow range
     for (a, b) in emb.iter().zip(got_emb.iter()) {
-        assert!((a - b).abs() < 0.01, "f16 round-trip: {} vs {}", a, b);
+        assert!((a - b).abs() < 0.01, "int8 round-trip: {} vs {}", a, b);
     }
+}
+
+#[test]
+fn test_embedding_int8_all_same_values() {
+    let s = storage();
+    let emb = vec![0.5, 0.5, 0.5, 0.5];
+    let mem = MemObjectBuilder::new(
+        MemoryTier::Episodic,
+        MemContent::Text("constant embedding".into()),
+        MemSource::new("test"),
+    )
+    .embedding(emb.clone())
+    .build();
+    s.store_memory(&mem).unwrap();
+    let got = s.get_memory(mem.id).unwrap().unwrap();
+    let got_emb = got.embedding.unwrap();
+    for (a, b) in emb.iter().zip(got_emb.iter()) {
+        assert!((a - b).abs() < 1e-6, "constant round-trip: {} vs {}", a, b);
+    }
+}
+
+#[test]
+fn test_embedding_int8_cosine_accuracy() {
+    let s = storage();
+    // Typical embedding range: small values around 0
+    let emb: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let mem = MemObjectBuilder::new(
+        MemoryTier::Episodic,
+        MemContent::Text("384-dim embedding".into()),
+        MemSource::new("test"),
+    )
+    .embedding(emb.clone())
+    .build();
+    s.store_memory(&mem).unwrap();
+    let got = s.get_memory(mem.id).unwrap().unwrap();
+    let got_emb = got.embedding.unwrap();
+    assert_eq!(got_emb.len(), 384);
+    // Cosine similarity between original and quantized should be > 0.99
+    let dot: f32 = emb.iter().zip(got_emb.iter()).map(|(a, b)| a * b).sum();
+    let norm_a: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = got_emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let cosine = dot / (norm_a * norm_b);
+    assert!(cosine > 0.99, "int8 cosine accuracy: {}", cosine);
 }

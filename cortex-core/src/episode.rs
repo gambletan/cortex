@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
+use rayon::prelude::*;
 use uuid::Uuid;
 
 use crate::storage::memory_index::MemoryIndex;
@@ -165,44 +166,46 @@ impl<'a> EpisodeStore<'a> {
             }
             let page_len = mems.len();
 
-            // Collect batch updates for this page
-            let mut batch: Vec<(Uuid, String, f32)> = Vec::new();
+            // Compute decay updates in parallel across the page using rayon
+            let batch: Vec<(Uuid, String, f32)> = mems.into_par_iter()
+                .filter_map(|mut mem| {
+                    // Permanent memories never decay below a floor
+                    if mem.temporal.durability == MemoryDurability::Permanent {
+                        if mem.salience.decay_factor < cfg.permanent_floor {
+                            mem.salience.decay_factor = cfg.permanent_floor;
+                            mem.salience.recompute();
+                            let salience_json = serde_json::to_string(&mem.salience).unwrap();
+                            return Some((mem.id, salience_json, mem.salience.effective_score));
+                        }
+                        return None;
+                    }
 
-            for mut mem in mems {
-                // Permanent memories never decay below a floor
-                if mem.temporal.durability == MemoryDurability::Permanent {
-                    if mem.salience.decay_factor < cfg.permanent_floor {
-                        mem.salience.decay_factor = cfg.permanent_floor;
+                    let hours_since_access = (now - mem.temporal.last_accessed)
+                        .num_hours()
+                        .max(0) as f32;
+
+                    let half_life_hours = match mem.temporal.durability {
+                        MemoryDurability::Temporary => {
+                            cfg.temp_half_life_hours + (mem.salience.base_score * cfg.temp_importance_scale)
+                        }
+                        _ => {
+                            cfg.normal_half_life_hours + (mem.salience.base_score * cfg.normal_importance_scale)
+                        }
+                    };
+
+                    let decay = (-hours_since_access * 0.693 / half_life_hours).exp();
+                    let new_decay = decay.clamp(0.01, 1.0);
+
+                    if (mem.salience.decay_factor - new_decay).abs() > 0.001 {
+                        mem.salience.decay_factor = new_decay;
                         mem.salience.recompute();
                         let salience_json = serde_json::to_string(&mem.salience).unwrap();
-                        batch.push((mem.id, salience_json, mem.salience.effective_score));
+                        Some((mem.id, salience_json, mem.salience.effective_score))
+                    } else {
+                        None
                     }
-                    continue;
-                }
-
-                let hours_since_access = (now - mem.temporal.last_accessed)
-                    .num_hours()
-                    .max(0) as f32;
-
-                let half_life_hours = match mem.temporal.durability {
-                    MemoryDurability::Temporary => {
-                        cfg.temp_half_life_hours + (mem.salience.base_score * cfg.temp_importance_scale)
-                    }
-                    _ => {
-                        cfg.normal_half_life_hours + (mem.salience.base_score * cfg.normal_importance_scale)
-                    }
-                };
-
-                let decay = (-hours_since_access * 0.693 / half_life_hours).exp();
-                let new_decay = decay.clamp(0.01, 1.0);
-
-                if (mem.salience.decay_factor - new_decay).abs() > 0.001 {
-                    mem.salience.decay_factor = new_decay;
-                    mem.salience.recompute();
-                    let salience_json = serde_json::to_string(&mem.salience).unwrap();
-                    batch.push((mem.id, salience_json, mem.salience.effective_score));
-                }
-            }
+                })
+                .collect();
 
             // Flush batch in a single transaction
             if !batch.is_empty() {

@@ -503,6 +503,7 @@ dependencies = [
  "instant-distance",
  "lru",
  "parking_lot",
+ "rayon",
  "rusqlite",
  "semver",
  "serde",

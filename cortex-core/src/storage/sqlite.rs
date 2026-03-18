@@ -7,16 +7,24 @@ use crate::CortexError;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Number of read-only connections in the pool.
 const READ_POOL_SIZE: usize = 4;
 
+/// Number of entries in the memory object cache.
+const MEM_CACHE_SIZE: usize = 2048;
+
 /// SQLite-backed storage for Cortex. Local-first, zero-config.
 /// Uses WAL mode with separate read/write connections for concurrency.
+/// Includes an LRU cache for deserialized MemObjects to avoid repeated
+/// JSON parsing and f16 embedding deserialization on hot-path lookups.
 pub struct SqliteStorage {
     write_conn: Mutex<Connection>,
     read_pool: Vec<Mutex<Connection>>,
+    /// LRU cache for deserialized MemObjects — avoids repeated JSON + embedding blob parsing.
+    mem_cache: Mutex<lru::LruCache<Uuid, Arc<MemObject>>>,
 }
 
 impl SqliteStorage {
@@ -61,6 +69,9 @@ impl SqliteStorage {
         let storage = Self {
             write_conn: Mutex::new(conn),
             read_pool,
+            mem_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MEM_CACHE_SIZE).unwrap(),
+            )),
         };
         storage.init()?;
         Ok(storage)
@@ -75,6 +86,9 @@ impl SqliteStorage {
         let storage = Self {
             write_conn: Mutex::new(conn),
             read_pool: Vec::new(),
+            mem_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MEM_CACHE_SIZE).unwrap(),
+            )),
         };
         storage.init()?;
         Ok(storage)
@@ -92,6 +106,22 @@ impl SqliteStorage {
             return Ok(reader.lock());
         }
         Ok(self.write_conn.lock())
+    }
+
+    /// Invalidate a single entry from the memory cache.
+    fn cache_evict(&self, id: &Uuid) {
+        self.mem_cache.lock().pop(id);
+    }
+
+    /// Invalidate all entries from the memory cache.
+    #[allow(dead_code)]
+    fn cache_clear(&self) {
+        self.mem_cache.lock().clear();
+    }
+
+    /// Put a MemObject into the cache.
+    fn cache_put(&self, mem: &MemObject) {
+        self.mem_cache.lock().put(mem.id, Arc::new(mem.clone()));
     }
 
     fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
@@ -157,23 +187,77 @@ impl SqliteStorage {
     }
 }
 
+/// Extract materialized column values from memory content.
+/// Returns (fact_subject, fact_object, pref_key) — all lowercased for indexed LIKE queries.
+fn extract_materialized_columns(content: &MemContent) -> (Option<String>, Option<String>, Option<String>) {
+    match content {
+        MemContent::Fact { subject, object, .. } => {
+            (Some(subject.to_lowercase()), Some(object.to_lowercase()), None)
+        }
+        MemContent::Preference { key, .. } => {
+            (None, None, Some(key.to_lowercase()))
+        }
+        _ => (None, None, None),
+    }
+}
+
 /// Magic prefix for f16-encoded embedding blobs (distinguishes from legacy f32).
 const F16_MAGIC: [u8; 2] = [0xF1, 0x6F];
 
-/// Serialize embedding as f16 (2 bytes/float) with magic prefix for ~50% storage reduction.
+/// Magic prefix for int8-quantized embedding blobs.
+/// Format: [0xI8, 0xQT] + 4 bytes min_f32 + 4 bytes max_f32 + N bytes quantized.
+const I8_MAGIC: [u8; 2] = [0x18, 0xC7];
+
+/// Serialize embedding as int8 quantized (1 byte/float + 8 bytes header) for ~75% storage reduction.
+/// Uses linear quantization: value = min + (byte / 255.0) * (max - min).
 fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
-    use half::f16;
-    let mut buf = Vec::with_capacity(2 + v.len() * 2);
-    buf.extend_from_slice(&F16_MAGIC);
-    for f in v {
-        buf.extend_from_slice(&f16::from_f32(*f).to_le_bytes());
+    // Header: magic(2) + min(4) + max(4) = 10 bytes overhead
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    for &f in v {
+        if f < min_val { min_val = f; }
+        if f > max_val { max_val = f; }
+    }
+    let range = max_val - min_val;
+
+    let mut buf = Vec::with_capacity(10 + v.len());
+    buf.extend_from_slice(&I8_MAGIC);
+    buf.extend_from_slice(&min_val.to_le_bytes());
+    buf.extend_from_slice(&max_val.to_le_bytes());
+
+    if range == 0.0 {
+        // All values identical — quantize to 128
+        buf.resize(10 + v.len(), 128);
+    } else {
+        let scale = 255.0 / range;
+        for &f in v {
+            buf.push(((f - min_val) * scale + 0.5) as u8);
+        }
     }
     buf
 }
 
-/// Deserialize embedding — auto-detects f16 (magic prefix) vs legacy f32 (no prefix).
+/// Deserialize embedding — auto-detects int8 (I8 magic) vs f16 (F1 magic) vs legacy f32.
 fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
     use half::f16;
+
+    // Check for int8 magic prefix
+    if b.len() >= 10 && b[0] == I8_MAGIC[0] && b[1] == I8_MAGIC[1] {
+        let min_val = f32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+        let max_val = f32::from_le_bytes([b[6], b[7], b[8], b[9]]);
+        let range = max_val - min_val;
+        let data = &b[10..];
+        let mut result = Vec::with_capacity(data.len());
+        if range == 0.0 {
+            result.resize(data.len(), min_val);
+        } else {
+            let inv_scale = range / 255.0;
+            for &byte in data {
+                result.push(min_val + byte as f32 * inv_scale);
+            }
+        }
+        return result;
+    }
 
     // Check for f16 magic prefix
     if b.len() >= 2 && b[0] == F16_MAGIC[0] && b[1] == F16_MAGIC[1] {
@@ -322,6 +406,33 @@ impl StorageBackend for SqliteStorage {
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         }
 
+        // Migration: add materialized columns for fact subject/object and preference key
+        // Replaces json_extract() in WHERE clauses with indexed column lookups.
+        let has_fact_subject: bool = conn
+            .prepare("SELECT fact_subject FROM memories LIMIT 0")
+            .is_ok();
+        if !has_fact_subject {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN fact_subject TEXT;
+                 ALTER TABLE memories ADD COLUMN fact_object TEXT;
+                 ALTER TABLE memories ADD COLUMN pref_key TEXT;
+                 ALTER TABLE memories ADD COLUMN source_channel TEXT;
+                 ALTER TABLE memories ADD COLUMN source_identity_id TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_memories_fact_subject ON memories(fact_subject) WHERE fact_subject IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_memories_fact_object ON memories(fact_object) WHERE fact_object IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_memories_pref_key ON memories(pref_key) WHERE pref_key IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_memories_source_channel_mat ON memories(source_channel);
+                 CREATE INDEX IF NOT EXISTS idx_memories_source_identity ON memories(source_identity_id) WHERE source_identity_id IS NOT NULL;
+                 UPDATE memories SET
+                     fact_subject = LOWER(json_extract(content_json, '$.Fact.subject')),
+                     fact_object = LOWER(json_extract(content_json, '$.Fact.object')),
+                     pref_key = LOWER(json_extract(content_json, '$.Preference.key')),
+                     source_channel = json_extract(source_json, '$.channel'),
+                     source_identity_id = json_extract(source_json, '$.identity_id');",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -331,10 +442,11 @@ impl StorageBackend for SqliteStorage {
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         let content_json = serde_json::to_string(&mem.content).unwrap();
         let id_str = mem.id.to_string();
+        let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
         let mut stmt = conn
             .prepare_cached(
-                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, fact_subject, fact_object, pref_key, source_channel, source_identity_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![
@@ -352,6 +464,11 @@ impl StorageBackend for SqliteStorage {
                 mem.content_hash,
                 mem.namespace,
                 mem.salience.effective_score,
+                fact_subject,
+                fact_object,
+                pref_key,
+                mem.source.channel,
+                mem.source.identity_id.map(|id| id.to_string()),
                 now,
                 now,
             ])
@@ -362,10 +479,18 @@ impl StorageBackend for SqliteStorage {
             "INSERT INTO memories_fts(id, content) VALUES (?1, ?2)",
             params![id_str, content_json],
         );
+        self.cache_put(mem);
         Ok(())
     }
 
     fn get_memory(&self, id: Uuid) -> Result<Option<MemObject>, CortexError> {
+        // Check cache first
+        {
+            let mut cache = self.mem_cache.lock();
+            if let Some(cached) = cache.get(&id) {
+                return Ok(Some((**cached).clone()));
+            }
+        }
         let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
@@ -376,6 +501,9 @@ impl StorageBackend for SqliteStorage {
             .query_row(params![id.to_string()], Self::parse_mem_row)
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        if let Some(ref mem) = result {
+            self.cache_put(mem);
+        }
         Ok(result)
     }
 
@@ -385,9 +513,10 @@ impl StorageBackend for SqliteStorage {
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         let content_json = serde_json::to_string(&mem.content).unwrap();
         let id_str = mem.id.to_string();
+        let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
         let mut stmt = conn
             .prepare_cached(
-                "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, updated_at=?15 WHERE id=?1",
+                "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, fact_subject=?15, fact_object=?16, pref_key=?17, source_channel=?18, source_identity_id=?19, updated_at=?20 WHERE id=?1",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![
@@ -405,6 +534,11 @@ impl StorageBackend for SqliteStorage {
                 mem.content_hash,
                 mem.namespace,
                 mem.salience.effective_score,
+                fact_subject,
+                fact_object,
+                pref_key,
+                mem.source.channel,
+                mem.source.identity_id.map(|id| id.to_string()),
                 now,
             ])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -415,6 +549,7 @@ impl StorageBackend for SqliteStorage {
             "INSERT INTO memories_fts(id, content) VALUES (?1, ?2)",
             params![id_str, content_json],
         );
+        self.cache_put(mem);
         Ok(())
     }
 
@@ -429,6 +564,7 @@ impl StorageBackend for SqliteStorage {
 
         // Sync FTS5 index
         let _ = conn.execute("DELETE FROM memories_fts WHERE id = ?1", params![id_str]);
+        self.cache_evict(&id);
         Ok(())
     }
 
@@ -469,7 +605,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE json_extract(source_json, '$.channel') = ?1 ORDER BY created_at DESC LIMIT ?2",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE source_channel = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
@@ -856,21 +992,39 @@ impl StorageBackend for SqliteStorage {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.read_conn()?;
-        let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
-        let sql = format!(
-            "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id IN ({})",
-            placeholders.join(", ")
-        );
-        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
-        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-        let params: Vec<&dyn rusqlite::types::ToSql> = id_strings.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-        let rows = stmt
-            .query_map(params.as_slice(), Self::parse_mem_row)
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // Partition into cache hits and misses
         let mut results = Vec::with_capacity(ids.len());
-        for row in rows {
-            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        let mut miss_ids: Vec<Uuid> = Vec::new();
+        {
+            let mut cache = self.mem_cache.lock();
+            for id in ids {
+                if let Some(cached) = cache.get(id) {
+                    results.push((**cached).clone());
+                } else {
+                    miss_ids.push(*id);
+                }
+            }
+        }
+        // Fetch misses from SQLite
+        if !miss_ids.is_empty() {
+            let conn = self.read_conn()?;
+            let placeholders: Vec<&str> = miss_ids.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
+            let id_strings: Vec<String> = miss_ids.iter().map(|id| id.to_string()).collect();
+            let params: Vec<&dyn rusqlite::types::ToSql> = id_strings.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt
+                .query_map(params.as_slice(), Self::parse_mem_row)
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            let mut cache = self.mem_cache.lock();
+            for row in rows {
+                let mem = row.map_err(|e| CortexError::Storage(e.to_string()))?;
+                cache.put(mem.id, Arc::new(mem.clone()));
+                results.push(mem);
+            }
         }
         Ok(results)
     }
@@ -884,8 +1038,7 @@ impl StorageBackend for SqliteStorage {
                  salience_json, privacy_json, tags_json, metadata_json, links_json, \
                  content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
-                 AND (LOWER(json_extract(content_json, '$.Fact.subject')) LIKE ?1 \
-                   OR LOWER(json_extract(content_json, '$.Fact.object')) LIKE ?1) \
+                 AND (fact_subject LIKE ?1 OR fact_object LIKE ?1) \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -904,16 +1057,13 @@ impl StorageBackend for SqliteStorage {
             return Ok(Vec::new());
         }
         let conn = self.read_conn()?;
-        // Build OR conditions: (LOWER(subject) LIKE ?N OR LOWER(object) LIKE ?N) for each entity
+        // Build OR conditions using materialized columns
         let conditions: Vec<String> = entities
             .iter()
             .enumerate()
             .map(|(i, _)| {
                 let p = i + 1;
-                format!(
-                    "(LOWER(json_extract(content_json, '$.Fact.subject')) LIKE ?{p} \
-                     OR LOWER(json_extract(content_json, '$.Fact.object')) LIKE ?{p})"
-                )
+                format!("(fact_subject LIKE ?{p} OR fact_object LIKE ?{p})")
             })
             .collect();
         let sql = format!(
@@ -949,7 +1099,7 @@ impl StorageBackend for SqliteStorage {
                  salience_json, privacy_json, tags_json, metadata_json, links_json, \
                  content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
-                 AND LOWER(json_extract(content_json, '$.Preference.key')) LIKE ?1 \
+                 AND pref_key LIKE ?1 \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -988,9 +1138,10 @@ impl StorageBackend for SqliteStorage {
             let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
             let content_json = serde_json::to_string(&mem.content).unwrap();
             let id_str = mem.id.to_string();
+            let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
             let result = conn.execute(
-                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, fact_subject, fact_object, pref_key, source_channel, source_identity_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     id_str,
                     mem.tier.as_str(),
@@ -1006,6 +1157,11 @@ impl StorageBackend for SqliteStorage {
                     mem.content_hash,
                     mem.namespace,
                     mem.salience.effective_score,
+                    fact_subject,
+                    fact_object,
+                    pref_key,
+                    mem.source.channel,
+                    mem.source.identity_id.map(|id| id.to_string()),
                     now,
                     now,
                 ],
@@ -1022,6 +1178,13 @@ impl StorageBackend for SqliteStorage {
 
         conn.execute_batch("COMMIT;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // Populate cache for batch-stored memories
+        {
+            let mut cache = self.mem_cache.lock();
+            for mem in mems {
+                cache.put(mem.id, Arc::new(mem.clone()));
+            }
+        }
         Ok(count)
     }
 
@@ -1176,6 +1339,13 @@ impl StorageBackend for SqliteStorage {
 
         conn.execute_batch("COMMIT;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // Evict updated entries from cache (salience changed)
+        {
+            let mut cache = self.mem_cache.lock();
+            for (id, _, _) in updates {
+                cache.pop(id);
+            }
+        }
         Ok(count)
     }
 
@@ -1211,6 +1381,13 @@ impl StorageBackend for SqliteStorage {
 
         conn.execute_batch("COMMIT;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // Evict deleted entries from cache
+        {
+            let mut cache = self.mem_cache.lock();
+            for id in ids {
+                cache.pop(id);
+            }
+        }
         Ok(count)
     }
 
@@ -1226,12 +1403,11 @@ impl StorageBackend for SqliteStorage {
         let id_str = identity_id.to_string();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE json_extract(source_json, '$.identity_id') = ?1 OR json_extract(source_json, '$.identity_id') = ?2 ORDER BY created_at DESC",
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE source_identity_id = ?1 ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-        let quoted_id_str = format!("\"{}\"", id_str);
         let rows = stmt
-            .query_map(params![id_str, quoted_id_str], Self::parse_mem_row)
+            .query_map(params![id_str], Self::parse_mem_row)
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut results = Vec::new();
         for row in rows {
