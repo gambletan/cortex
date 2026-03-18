@@ -61,8 +61,14 @@ impl<'a> CompressionEngine<'a> {
     ) -> Result<Vec<ConversationSession>, CortexError> {
         let cutoff = Utc::now() - max_age;
 
-        // Group by (channel, date) to find sessions — paginated loading
-        let mut sessions: std::collections::HashMap<String, Vec<MemObject>> =
+        // Group by (channel, date) to find sessions — paginated loading.
+        // Track min/max timestamps inline to avoid re-iteration.
+        struct SessionAccum {
+            memories: Vec<MemObject>,
+            min_time: DateTime<Utc>,
+            max_time: DateTime<Utc>,
+        }
+        let mut sessions: std::collections::HashMap<String, SessionAccum> =
             std::collections::HashMap::new();
         let page_size = 1000;
         let mut offset = 0;
@@ -80,7 +86,15 @@ impl<'a> CompressionEngine<'a> {
                 }
                 let date = mem.temporal.ingestion_time.format("%Y-%m-%d").to_string();
                 let key = format!("{}|{}", mem.source.channel, date);
-                sessions.entry(key).or_default().push(mem);
+                let t = mem.temporal.ingestion_time;
+                let accum = sessions.entry(key).or_insert_with(|| SessionAccum {
+                    memories: Vec::new(),
+                    min_time: t,
+                    max_time: t,
+                });
+                if t < accum.min_time { accum.min_time = t; }
+                if t > accum.max_time { accum.max_time = t; }
+                accum.memories.push(mem);
             }
 
             if page_len < page_size {
@@ -90,28 +104,17 @@ impl<'a> CompressionEngine<'a> {
         }
 
         let mut result = Vec::new();
-        for (key, memories) in sessions {
-            if memories.len() < min_messages {
+        for (key, accum) in sessions {
+            if accum.memories.len() < min_messages {
                 continue;
             }
-            let parts: Vec<&str> = key.splitn(2, '|').collect();
-            let channel = parts[0].to_string();
-            let start = memories
-                .iter()
-                .map(|m| m.temporal.ingestion_time)
-                .min()
-                .unwrap();
-            let end = memories
-                .iter()
-                .map(|m| m.temporal.ingestion_time)
-                .max()
-                .unwrap();
+            let channel = key.splitn(2, '|').next().unwrap_or("").to_string();
 
             result.push(ConversationSession {
                 channel,
-                start,
-                end,
-                memories,
+                start: accum.min_time,
+                end: accum.max_time,
+                memories: accum.memories,
             });
         }
 

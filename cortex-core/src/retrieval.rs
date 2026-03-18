@@ -126,15 +126,17 @@ impl<'a> RetrievalEngine<'a> {
         // Query expansion: find related entities from semantic store
         let expanded_entities = self.expand_query(&query.text)?;
 
-        // Gather candidates from vector similarity (if embedding provided)
-        let mut candidate_ids: Vec<(Uuid, f32)> = Vec::new();
+        // Gather candidates using HashMap for O(1) dedup instead of O(N) linear scan
+        let mut candidate_scores: HashMap<Uuid, f32> = HashMap::new();
 
         if let Some(ref embedding) = query.embedding {
-            candidate_ids = self.index.search(embedding, query.limit * 5);
+            for (id, score) in self.index.search(embedding, query.limit * 5) {
+                candidate_scores.insert(id, score);
+            }
         }
 
         // If no embedding, fall back to recent memories
-        if candidate_ids.is_empty() {
+        if candidate_scores.is_empty() {
             let recent = self
                 .storage
                 .list_by_tier(MemoryTier::Episodic, query.limit * 3)?;
@@ -143,7 +145,7 @@ impl<'a> RetrievalEngine<'a> {
                 .list_by_tier(MemoryTier::Semantic, query.limit * 3)?;
 
             for mem in recent.iter().chain(semantic.iter()) {
-                candidate_ids.push((mem.id, 0.5)); // neutral similarity
+                candidate_scores.entry(mem.id).or_insert(0.5);
             }
         }
 
@@ -151,9 +153,7 @@ impl<'a> RetrievalEngine<'a> {
         if !expanded_entities.is_empty() {
             let expansion_ids = self.get_expansion_candidates(&expanded_entities, query.limit)?;
             for (id, score) in expansion_ids {
-                if !candidate_ids.iter().any(|(cid, _)| *cid == id) {
-                    candidate_ids.push((id, score));
-                }
+                candidate_scores.entry(id).or_insert(score);
             }
         }
 
@@ -161,18 +161,15 @@ impl<'a> RetrievalEngine<'a> {
         if temporal_intent != TemporalIntent::None {
             let time_ordered = self.get_temporal_candidates(&temporal_intent, query.limit * 3)?;
             for mem in time_ordered {
-                if !candidate_ids.iter().any(|(id, _)| *id == mem.id) {
-                    candidate_ids.push((mem.id, 0.3)); // lower base similarity
-                }
+                candidate_scores.entry(mem.id).or_insert(0.3);
             }
         }
 
         // Multi-hop expansion: extract entities from top candidates and pull related facts
-        let hop_ids = self.multi_hop_expand(&candidate_ids, query.limit)?;
+        let candidate_ids_vec: Vec<(Uuid, f32)> = candidate_scores.iter().map(|(&id, &s)| (id, s)).collect();
+        let hop_ids = self.multi_hop_expand(&candidate_ids_vec, query.limit)?;
         for (id, score) in hop_ids {
-            if !candidate_ids.iter().any(|(cid, _)| *cid == id) {
-                candidate_ids.push((id, score));
-            }
+            candidate_scores.entry(id).or_insert(score);
         }
 
         // FTS5 full-text search: gather additional candidates via BM25 keyword matching
@@ -180,13 +177,11 @@ impl<'a> RetrievalEngine<'a> {
         let mut fts_scores: HashMap<Uuid, f32> = HashMap::new();
         for (id, score) in &fts_results {
             fts_scores.insert(*id, *score as f32);
-            if !candidate_ids.iter().any(|(cid, _)| *cid == *id) {
-                candidate_ids.push((*id, 0.2)); // base similarity for FTS-only matches
-            }
+            candidate_scores.entry(*id).or_insert(0.2);
         }
 
         // Batch fetch all candidates in a single query
-        let all_ids: Vec<Uuid> = candidate_ids.iter().map(|(id, _)| *id).collect();
+        let all_ids: Vec<Uuid> = candidate_scores.keys().copied().collect();
         let memories = self.storage.get_memories_batch(&all_ids)?;
         let mem_map: HashMap<Uuid, Arc<MemObject>> = memories.into_iter().map(|m| (m.id, Arc::new(m))).collect();
 
@@ -235,8 +230,8 @@ impl<'a> RetrievalEngine<'a> {
 
         // Score each candidate
         let mut results = Vec::new();
-        for (id, sim_score) in &candidate_ids {
-            if let Some(mem) = mem_map.get(id) {
+        for (&id, &sim_score) in &candidate_scores {
+            if let Some(mem) = mem_map.get(&id) {
                 // Namespace isolation: skip memories that don't match requested namespace
                 if let Some(ref ns) = query.namespace {
                     if mem.namespace.as_deref() != Some(ns.as_str()) {
@@ -249,8 +244,8 @@ impl<'a> RetrievalEngine<'a> {
                     continue;
                 }
 
-                let fts_score = fts_scores.get(id).copied().unwrap_or(0.0);
-                let breakdown = self.compute_scores(mem, *sim_score, query, &temporal_intent, fts_score);
+                let fts_score = fts_scores.get(&id).copied().unwrap_or(0.0);
+                let breakdown = self.compute_scores(mem, sim_score, query, &temporal_intent, fts_score);
                 let final_score = weights.similarity * breakdown.similarity
                     + weights.temporal * breakdown.temporal
                     + weights.salience * breakdown.salience

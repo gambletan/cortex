@@ -333,15 +333,31 @@ fn summarize_content(content: &MemContent) -> String {
     }
 }
 
-/// Normalize a line for deduplication: lowercase, strip punctuation/numbers/whitespace.
+/// Normalize a line for deduplication: lowercase, strip punctuation, collapse whitespace.
 fn normalize_for_dedup(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == ' ')
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut result = String::with_capacity(s.len());
+    let mut last_was_space = true; // start true to skip leading spaces
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            // Inline lowercase for ASCII fast path
+            if c.is_ascii() {
+                result.push(c.to_ascii_lowercase());
+            } else {
+                for lc in c.to_lowercase() {
+                    result.push(lc);
+                }
+            }
+            last_was_space = false;
+        } else if !last_was_space {
+            result.push(' ');
+            last_was_space = true;
+        }
+    }
+    // Trim trailing space
+    if result.ends_with(' ') {
+        result.pop();
+    }
+    result
 }
 
 /// Two normalized strings are near-duplicates if they share >80% of their words.
