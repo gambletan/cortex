@@ -16,6 +16,9 @@ const READ_POOL_SIZE: usize = 4;
 /// Number of entries in the memory object cache.
 const MEM_CACHE_SIZE: usize = 2048;
 
+/// Number of entries in the entity-facts query cache.
+const ENTITY_CACHE_SIZE: usize = 256;
+
 /// SQLite-backed storage for Cortex. Local-first, zero-config.
 /// Uses WAL mode with separate read/write connections for concurrency.
 /// Includes an LRU cache for deserialized MemObjects to avoid repeated
@@ -25,6 +28,9 @@ pub struct SqliteStorage {
     read_pool: Vec<Mutex<Connection>>,
     /// LRU cache for deserialized MemObjects — avoids repeated JSON + embedding blob parsing.
     mem_cache: Mutex<lru::LruCache<Uuid, Arc<MemObject>>>,
+    /// LRU cache for entity→facts query results. Keyed by lowercased entity pattern.
+    /// Invalidated on any semantic tier write (store/update/delete).
+    entity_cache: Mutex<lru::LruCache<String, Vec<MemObject>>>,
 }
 
 impl SqliteStorage {
@@ -72,6 +78,9 @@ impl SqliteStorage {
             mem_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MEM_CACHE_SIZE).unwrap(),
             )),
+            entity_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(ENTITY_CACHE_SIZE).unwrap(),
+            )),
         };
         storage.init()?;
         Ok(storage)
@@ -88,6 +97,9 @@ impl SqliteStorage {
             read_pool: Vec::new(),
             mem_cache: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MEM_CACHE_SIZE).unwrap(),
+            )),
+            entity_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(ENTITY_CACHE_SIZE).unwrap(),
             )),
         };
         storage.init()?;
@@ -119,9 +131,13 @@ impl SqliteStorage {
         self.mem_cache.lock().clear();
     }
 
-    /// Put a MemObject into the cache.
+    /// Put a MemObject into the cache. Also invalidates entity cache for semantic writes.
     fn cache_put(&self, mem: &MemObject) {
         self.mem_cache.lock().put(mem.id, Arc::new(mem.clone()));
+        // Invalidate entity cache when semantic facts/prefs change
+        if mem.tier == MemoryTier::Semantic {
+            self.entity_cache.lock().clear();
+        }
     }
 
     fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
@@ -143,7 +159,7 @@ impl SqliteStorage {
         let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
         let tier = MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Episodic);
         let content: MemContent = serde_json::from_str(&content_json).unwrap();
-        let embedding = embedding_blob.map(|b| bytes_to_f32_vec(&b));
+        let embedding = embedding_blob.map(|b| std::sync::Arc::new(bytes_to_f32_vec(&b)));
         let temporal: TemporalInfo = serde_json::from_str(&temporal_json).unwrap();
         let source: MemSource = serde_json::from_str(&source_json).unwrap();
         let salience: Salience = serde_json::from_str(&salience_json).unwrap();
@@ -1083,8 +1099,16 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn query_facts_by_entity(&self, entity: &str) -> Result<Vec<MemObject>, CortexError> {
+        let cache_key = entity.to_lowercase();
+        // Check entity cache first
+        {
+            let mut cache = self.entity_cache.lock();
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
         let conn = self.read_conn()?;
-        let pattern = format!("%{}%", entity.to_lowercase());
+        let pattern = format!("%{}%", cache_key);
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, \
@@ -1102,6 +1126,8 @@ impl StorageBackend for SqliteStorage {
         for row in rows {
             results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
         }
+        // Populate entity cache
+        self.entity_cache.lock().put(cache_key, results.clone());
         Ok(results)
     }
 

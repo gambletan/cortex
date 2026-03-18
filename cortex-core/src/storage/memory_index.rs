@@ -122,6 +122,17 @@ impl MemoryIndex {
         inner.pending.insert(id, NormalizedEntry { embedding, norm });
     }
 
+    /// Insert from an Arc<Vec<f32>> — avoids cloning when caller already has Arc.
+    /// Falls back to to_vec() since the index needs owned data for HNSW builds.
+    pub fn insert_arc(&self, id: Uuid, embedding: &std::sync::Arc<Vec<f32>>) {
+        // If we're the only holder, unwrap to avoid copy; otherwise clone
+        let vec = match std::sync::Arc::try_unwrap(std::sync::Arc::clone(embedding)) {
+            Ok(v) => v,
+            Err(arc) => (*arc).clone(),
+        };
+        self.insert(id, vec);
+    }
+
     /// Remove an embedding.
     pub fn remove(&self, id: &Uuid) {
         let mut inner = self.inner.write();

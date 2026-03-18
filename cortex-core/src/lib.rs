@@ -299,7 +299,7 @@ impl Cortex {
             let mems = self.storage.list_by_tier(*tier, 100_000)?;
             for mem in mems {
                 if let Some(ref emb) = mem.embedding {
-                    self.index.insert(mem.id, emb.clone());
+                    self.index.insert_arc(mem.id, emb);
                 }
             }
         }
@@ -954,7 +954,7 @@ impl Cortex {
         // Re-index if it has an embedding
         if let Some(mem) = self.storage.get_memory(id)? {
             if let Some(ref emb) = mem.embedding {
-                self.index.insert(id, emb.clone());
+                self.index.insert_arc(id, emb);
             }
         }
         self.bump_write_generation();

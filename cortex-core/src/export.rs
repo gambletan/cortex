@@ -81,7 +81,7 @@ pub fn import_all(
         for mem in &memories {
             storage.store_memory(mem)?;
             if let Some(ref emb) = mem.embedding {
-                index.insert(mem.id, emb.clone());
+                index.insert_arc(mem.id, emb);
             }
         }
     }

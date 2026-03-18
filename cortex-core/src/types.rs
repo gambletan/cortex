@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Whether a memory is temporary (will decay fast) or permanent (should persist).
@@ -40,7 +41,9 @@ pub struct MemObject {
     pub id: Uuid,
     pub tier: MemoryTier,
     pub content: MemContent,
-    pub embedding: Option<Vec<f32>>,
+    /// Embedding vector wrapped in Arc for cheap cloning (768-dim = 3KiB).
+    #[serde(serialize_with = "serialize_arc_embedding", deserialize_with = "deserialize_arc_embedding")]
+    pub embedding: Option<Arc<Vec<f32>>>,
     pub temporal: TemporalInfo,
     pub source: MemSource,
     pub salience: Salience,
@@ -256,7 +259,7 @@ pub struct MemObjectBuilder {
     tier: MemoryTier,
     content: MemContent,
     source: MemSource,
-    embedding: Option<Vec<f32>>,
+    embedding: Option<Arc<Vec<f32>>>,
     salience: Salience,
     privacy: PrivacyLevel,
     tags: Vec<String>,
@@ -284,7 +287,7 @@ impl MemObjectBuilder {
     }
 
     pub fn embedding(mut self, embedding: Vec<f32>) -> Self {
-        self.embedding = Some(embedding);
+        self.embedding = Some(Arc::new(embedding));
         self
     }
 
@@ -349,6 +352,25 @@ impl MemObjectBuilder {
             namespace: self.namespace,
         }
     }
+}
+
+/// Serde helper: serialize Arc<Vec<f32>> as Option<Vec<f32>>.
+fn serialize_arc_embedding<S: serde::Serializer>(
+    val: &Option<Arc<Vec<f32>>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match val {
+        Some(arc) => serializer.serialize_some(arc.as_ref()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Serde helper: deserialize Option<Vec<f32>> into Option<Arc<Vec<f32>>>.
+fn deserialize_arc_embedding<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Arc<Vec<f32>>>, D::Error> {
+    let opt: Option<Vec<f32>> = Option::deserialize(deserializer)?;
+    Ok(opt.map(Arc::new))
 }
 
 /// Compute SHA-256 hash of memory content for deduplication.
