@@ -670,6 +670,37 @@ fn extract_chinese_preferences(text: &str, knowledge: &mut InferredKnowledge) {
         }
     }
 
+    // "我觉得X很好", "X很好用"
+    if let Some(rest) = text.strip_prefix("我觉得") {
+        for suffix in &["很好", "不错", "好用", "方便"] {
+            if let Some(pos) = rest.find(suffix) {
+                let value = clean_zh_value(&rest[..pos]);
+                if !value.is_empty() && value.len() < 50 {
+                    knowledge.preferences.push(InferredPreference {
+                        key: "likes".into(),
+                        value,
+                        confidence: 0.70,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    // "我擅长X", "我熟悉X"
+    for (prefix, key) in &[("我擅长", "skill"), ("我熟悉", "familiar_with"), ("我精通", "skill")] {
+        if let Some(obj) = extract_zh_prefix(text, prefix) {
+            if !obj.is_empty() && obj.len() < 100 {
+                knowledge.preferences.push(InferredPreference {
+                    key: key.to_string(),
+                    value: obj,
+                    confidence: 0.80,
+                });
+                break;
+            }
+        }
+    }
+
     // "我主要用X", "我经常用X"
     for prefix in &["我主要用", "我经常用"] {
         if let Some(obj) = extract_zh_prefix(text, prefix) {

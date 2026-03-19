@@ -269,6 +269,11 @@ pub trait StorageBackend: Send + Sync {
         Ok(count)
     }
 
+    /// List all distinct namespaces with memory counts.
+    fn list_namespaces(&self) -> Result<Vec<(String, usize)>, crate::CortexError> {
+        Ok(Vec::new()) // Default: no namespace support
+    }
+
     // Bulk operations
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, crate::CortexError>;
     fn list_memories_by_source_identity(

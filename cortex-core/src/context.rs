@@ -17,6 +17,7 @@ pub struct ContextConfig {
     pub include_patterns: bool,
     pub channel: Option<String>,
     pub person_id: Option<Uuid>,
+    pub namespace: Option<String>,
 }
 
 impl Default for ContextConfig {
@@ -29,6 +30,7 @@ impl Default for ContextConfig {
             include_patterns: true,
             channel: None,
             person_id: None,
+            namespace: None,
         }
     }
 }
@@ -53,6 +55,11 @@ impl ContextConfig {
 
     pub fn with_recent_episodes(mut self, count: usize) -> Self {
         self.include_recent_episodes = count;
+        self
+    }
+
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
         self
     }
 }
@@ -145,8 +152,12 @@ pub fn generate_context(
 
     // ── User preferences + Semantic facts (single query) ──────────────
     if config.include_preferences {
-        // Load all semantic memories once instead of two separate queries
-        let semantic_mems = storage.list_by_tier(MemoryTier::Semantic, 10_000)?;
+        // Load semantic memories — filtered by namespace if set
+        let semantic_mems = storage.list_by_tier_and_namespace(
+            MemoryTier::Semantic,
+            config.namespace.as_deref(),
+            10_000,
+        )?;
 
         let mut pref_sec = ContextSection::new("\n## User Profile\n", 25.0);
         let mut fact_sec = ContextSection::new("\n## Known Facts\n", 25.0);
@@ -201,6 +212,12 @@ pub fn generate_context(
     if config.include_recent_episodes > 0 {
         let recent = if let Some(ref ch) = config.channel {
             storage.list_by_channel(ch, config.include_recent_episodes)?
+        } else if config.namespace.is_some() {
+            storage.list_by_tier_and_namespace(
+                MemoryTier::Episodic,
+                config.namespace.as_deref(),
+                config.include_recent_episodes,
+            )?
         } else {
             storage.list_by_tier_ordered_by_ingestion(
                 MemoryTier::Episodic,

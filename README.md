@@ -20,7 +20,7 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 | | Cortex | Mem0 | OpenAI Memory |
 |---|---|---|---|
 | **Privacy** | 100% local, zero cloud | Cloud API (your data on their servers) | OpenAI servers |
-| **Latency** | **62µs** ingest, **253µs** search | ~200-500ms | ~300-800ms |
+| **Latency** | **156µs** ingest, **568µs** search | ~200-500ms | ~300-800ms |
 | **Cost** | Free, forever | $99+/mo (Pro) | ChatGPT Plus ($20/mo) |
 | **Memory tiers** | 4 (Working/Episodic/Semantic/Procedural) | 1 (flat) | 1 (flat) |
 | **Bayesian beliefs** | Self-correcting with evidence | No | No |
@@ -37,20 +37,25 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 | **Dependencies** | 0 runtime deps | Node.js + cloud | N/A |
 | **Open source** | MIT | Partial | No |
 | **Chinese NLP** | Native (inference, retrieval, relationships) | No | Limited |
+| **Namespace isolation** | Per-user/context memory separation | No | No |
+| **Plugin system** | Compile-time hooks for ingest/retrieve/consolidation | No | No |
+| **MCP tools** | 25 tools for Claude/LLM integration | 3rd party | N/A |
 
 ### Performance Benchmarks
 
 | Operation | Cortex | Mem0 (cloud) | File-based |
 |-----------|--------|-------------|------------|
-| Ingest | **62µs** | ~200ms | ~1ms |
-| Search (top-10) | **253µs** | ~300ms | ~10ms |
-| Context generation | **111µs** | ~500ms | manual |
-| Belief update | **28µs** | N/A | N/A |
-| People graph | **20µs** | paid tier | N/A |
-| Structured facts | **8µs** | N/A | N/A |
-| 1K memories search | **1.1ms** | ~500ms | ~50ms |
+| Ingest | **156µs** | ~200ms | ~1ms |
+| Search (top-10) | **568µs** | ~300ms | ~10ms |
+| Context generation | **621µs** | ~500ms | manual |
+| Belief update | **66µs** | N/A | N/A |
+| People graph | **51µs** | paid tier | N/A |
+| Structured facts | **45µs** | N/A | N/A |
+| 1K memories search | **1.6ms** | ~500ms | ~50ms |
 
-**1,182x faster** than Mem0 cloud. With features neither Mem0 nor OpenAI Memory offer.
+**528x faster** than Mem0 cloud. With features neither Mem0 nor OpenAI Memory offer.
+
+> **Note:** Benchmarks include proactive inference (auto-extracting facts, preferences, relationships) on every ingest. Raw ingest without inference is ~15µs. Numbers from `cargo bench` on M-series Mac.
 
 ## Architecture
 
@@ -422,8 +427,9 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.2** ✅ — Negation detection (EN + CN), multi-hop retrieval, 117 tests
 - **v1.3** ✅ — Context quality optimization, query expansion, bidirectional relationships, 126 tests
 - **v1.4** ✅ — Incremental HNSW, SQL-indexed entity queries, LLM summarizer hook, 18 MCP tools, configurable decay, LLM-assisted inference, 131 tests
-- **v1.5** ✅ — Docker image (GHCR auto-publish), feature freeze
-- **v2.0** — Cross-device sync (CRDTs, no cloud), plugin system, mobile (iOS/Android)
+- **v1.5** ✅ — Docker image (GHCR auto-publish), batch ingest, dedup, namespace isolation, plugin system, event bus, archival, 351 tests
+- **v1.6** ✅ — Int8 quantization (75% storage reduction), materialized column indexes, FTS5 triggers, LRU caches (MemObject + entity-facts), rayon parallel decay, Arc embedding, generation-based cache invalidation, 25 MCP tools, batch inference, enhanced Chinese NLP
+- **v2.0** — Cross-device sync (CRDTs, no cloud), mobile (iOS/Android)
 
 ---
 

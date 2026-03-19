@@ -349,6 +349,19 @@ impl Cortex {
         salience_hint: Option<f32>,
         embedding: Option<Vec<f32>>,
     ) -> Result<MemObject, CortexError> {
+        self.ingest_with_namespace(text, channel, user_id, salience_hint, embedding, None)
+    }
+
+    /// Ingest a new memory with explicit namespace isolation.
+    pub fn ingest_with_namespace(
+        &self,
+        text: &str,
+        channel: &str,
+        user_id: Option<&str>,
+        salience_hint: Option<f32>,
+        embedding: Option<Vec<f32>>,
+        namespace: Option<&str>,
+    ) -> Result<MemObject, CortexError> {
         let mut source = MemSource::new(channel);
         let embedding = self.auto_embed(text, embedding);
 
@@ -380,6 +393,9 @@ impl Cortex {
 
         if let Some(emb) = embedding.clone() {
             builder = builder.embedding(emb);
+        }
+        if let Some(ns) = namespace {
+            builder = builder.namespace(ns.to_string());
         }
 
         let mut mem = builder.build();
@@ -540,6 +556,7 @@ impl Cortex {
 
         let mut mems_to_store: Vec<MemObject> = Vec::with_capacity(items.len());
         let mut embeddings_to_index: Vec<(Uuid, Vec<f32>)> = Vec::new();
+        let mut batch_inferred: Vec<(String, inference::InferredKnowledge)> = Vec::new();
 
         let plugin_ctx = PluginContext {
             storage: &self.storage,
@@ -611,6 +628,10 @@ impl Cortex {
             if let Some(emb) = embedding {
                 embeddings_to_index.push((mem.id, emb));
             }
+            // Collect inferred knowledge for post-batch fact/preference extraction
+            if !inferred.facts.is_empty() || !inferred.preferences.is_empty() {
+                batch_inferred.push((item.channel.clone(), inferred));
+            }
             mems_to_store.push(mem);
         }
 
@@ -629,6 +650,24 @@ impl Cortex {
                 id: mem.id,
                 tier: mem.tier,
             });
+        }
+
+        // Auto-extract facts and preferences from batch (like single ingest)
+        if !batch_inferred.is_empty() {
+            let semantic = SemanticStore::new(&self.storage, &self.index);
+            for (channel, inferred) in &batch_inferred {
+                for fact in &inferred.facts {
+                    let _ = semantic.add_fact(
+                        &fact.subject, &fact.predicate, &fact.object,
+                        fact.confidence,
+                        MemSource::new(channel.as_str()),
+                        None,
+                    );
+                }
+                for pref in &inferred.preferences {
+                    let _ = semantic.add_preference(&pref.key, &pref.value, pref.confidence);
+                }
+            }
         }
 
         self.metrics.batch_ingests.fetch_add(1, Ordering::Relaxed);
@@ -741,6 +780,17 @@ impl Cortex {
         channel: Option<&str>,
         person_id: Option<Uuid>,
     ) -> Result<String, CortexError> {
+        self.get_context_with_namespace(max_tokens, channel, person_id, None)
+    }
+
+    /// Generate LLM-ready context with namespace isolation.
+    pub fn get_context_with_namespace(
+        &self,
+        max_tokens: usize,
+        channel: Option<&str>,
+        person_id: Option<Uuid>,
+        namespace: Option<&str>,
+    ) -> Result<String, CortexError> {
         self.ensure_index_loaded()?;
         let mut config = ContextConfig::new(max_tokens);
         if let Some(ch) = channel {
@@ -748,6 +798,9 @@ impl Cortex {
         }
         if let Some(pid) = person_id {
             config = config.with_person(pid);
+        }
+        if let Some(ns) = namespace {
+            config = config.with_namespace(ns);
         }
         generate_context(&config, &self.storage, &self.index)
     }
@@ -1003,6 +1056,29 @@ impl Cortex {
     /// Access to working memory.
     pub fn working_memory(&mut self) -> &mut WorkingMemory {
         &mut self.working
+    }
+
+    /// Delete a memory permanently.
+    pub fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
+        self.storage.delete_memory(id)?;
+        self.index.remove(&id);
+        self.bump_write_generation();
+        self.event_bus.emit(&CortexEvent::MemoryDeleted { id });
+        Ok(())
+    }
+
+    /// List all distinct namespaces with memory counts.
+    pub fn list_namespaces(&self) -> Result<Vec<(String, usize)>, CortexError> {
+        self.storage.list_namespaces()
+    }
+
+    /// Merge two person identities — moves all identities/notes/tags from
+    /// `source_id` to `target_id`, then deletes the source person.
+    pub fn merge_people(&self, target_id: Uuid, source_id: Uuid) -> Result<crate::people::Person, CortexError> {
+        let people = PeopleGraph::new(&self.storage);
+        let merged = people.merge_identities(target_id, source_id)?;
+        self.bump_write_generation();
+        Ok(merged)
     }
 
     /// Get the underlying storage (for advanced use).

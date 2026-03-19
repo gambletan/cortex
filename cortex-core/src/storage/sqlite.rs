@@ -1192,6 +1192,27 @@ impl StorageBackend for SqliteStorage {
         Ok(results)
     }
 
+    fn list_namespaces(&self) -> Result<Vec<(String, usize)>, CortexError> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT COALESCE(namespace, '(default)'), COUNT(*) FROM memories GROUP BY namespace ORDER BY COUNT(*) DESC",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let ns: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((ns, count as usize))
+            })
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
     fn count_by_tier(&self, tier: MemoryTier) -> Result<usize, CortexError> {
         let conn = self.read_conn()?;
         let mut stmt = conn

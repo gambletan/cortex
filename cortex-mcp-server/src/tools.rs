@@ -51,6 +51,10 @@ fn list_tools_builtin() -> Value {
                         "type": "array",
                         "items": { "type": "number" },
                         "description": "Pre-computed embedding vector (optional)"
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Namespace for isolation (optional, e.g. 'user_123')"
                     }
                 },
                 "required": ["text", "channel"]
@@ -394,6 +398,64 @@ fn list_tools_builtin() -> Value {
                 "type": "object",
                 "properties": {}
             }
+        },
+        {
+            "name": "memory_delete",
+            "description": "Permanently delete a memory by ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "UUID of the memory to delete"
+                    }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "memory_restore",
+            "description": "Restore an archived memory back to an active tier.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "UUID of the archived memory"
+                    },
+                    "tier": {
+                        "type": "string",
+                        "description": "Target tier: 'episodic', 'semantic', or 'procedural' (default: 'episodic')"
+                    }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "namespace_list",
+            "description": "List all namespaces with memory counts. Useful for multi-user/multi-context isolation overview.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "person_merge",
+            "description": "Merge two person identities into one. Moves all identities, notes, and tags from source to target, then deletes the source person.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target_id": {
+                        "type": "string",
+                        "description": "UUID of the person to keep (primary)"
+                    },
+                    "source_id": {
+                        "type": "string",
+                        "description": "UUID of the person to merge into target (will be deleted)"
+                    }
+                },
+                "required": ["target_id", "source_id"]
+            }
         }
     ])
 }
@@ -422,6 +484,10 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_archive" => tool_memory_archive(cortex, args),
         "memory_ingest_batch" => tool_memory_ingest_batch(cortex, args),
         "tag_list_taxonomy" => tool_tag_list_taxonomy(cortex),
+        "memory_delete" => tool_memory_delete(cortex, args),
+        "memory_restore" => tool_memory_restore(cortex, args),
+        "namespace_list" => tool_namespace_list(cortex),
+        "person_merge" => tool_person_merge(cortex, args),
         _ => {
             // Fallback to plugin-registered tools
             let ctx = cortex.plugin_context();
@@ -465,9 +531,10 @@ fn tool_memory_ingest(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Stri
     let user_id = get_str(args, "user_id");
     let salience = args.get("salience").and_then(|v| v.as_f64()).map(|v| v as f32);
     let embedding = get_embedding(args);
+    let namespace = get_str(args, "namespace");
 
     let mem = cortex
-        .ingest(text, channel, user_id, salience, embedding)
+        .ingest_with_namespace(text, channel, user_id, salience, embedding, namespace)
         .map_err(|e| e.to_string())?;
 
     Ok(json!({
@@ -546,9 +613,10 @@ fn tool_memory_context(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Str
     let channel = get_str(args, "channel");
     let person_id = get_str(args, "person_id")
         .and_then(|s| Uuid::parse_str(s).ok());
+    let namespace = get_str(args, "namespace");
 
     let context = cortex
-        .get_context(max_tokens, channel, person_id)
+        .get_context_with_namespace(max_tokens, channel, person_id, namespace)
         .map_err(|e| e.to_string())?;
 
     Ok(context)
@@ -933,5 +1001,62 @@ fn tool_tag_list_taxonomy(cortex: &Arc<Cortex>) -> Result<String, String> {
     Ok(json!({
         "tags": items,
         "total_unique": items.len(),
+    }).to_string())
+}
+
+fn tool_memory_delete(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let id_str = get_str(args, "id").ok_or("missing 'id'")?;
+    let id = Uuid::parse_str(id_str).map_err(|e| format!("Invalid UUID: {}", e))?;
+
+    cortex.delete_memory(id).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "id": id_str,
+        "status": "deleted",
+    }).to_string())
+}
+
+fn tool_memory_restore(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let id_str = get_str(args, "id").ok_or("missing 'id'")?;
+    let id = Uuid::parse_str(id_str).map_err(|e| format!("Invalid UUID: {}", e))?;
+    let tier_str = get_str(args, "tier").unwrap_or("episodic");
+    let tier = cortex_core::types::MemoryTier::parse(tier_str)
+        .ok_or_else(|| format!("Invalid tier: {}", tier_str))?;
+
+    cortex.restore_memory(id, tier).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "id": id_str,
+        "restored_to": tier_str,
+        "status": "restored",
+    }).to_string())
+}
+
+fn tool_namespace_list(cortex: &Arc<Cortex>) -> Result<String, String> {
+    let namespaces = cortex.list_namespaces().map_err(|e| e.to_string())?;
+
+    let items: Vec<Value> = namespaces.iter().map(|(ns, count)| {
+        json!({ "namespace": ns, "count": count })
+    }).collect();
+
+    Ok(json!({
+        "namespaces": items,
+        "total": items.len(),
+    }).to_string())
+}
+
+fn tool_person_merge(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let target_str = get_str(args, "target_id").ok_or("missing 'target_id'")?;
+    let source_str = get_str(args, "source_id").ok_or("missing 'source_id'")?;
+    let target_id = Uuid::parse_str(target_str).map_err(|e| format!("Invalid target UUID: {}", e))?;
+    let source_id = Uuid::parse_str(source_str).map_err(|e| format!("Invalid source UUID: {}", e))?;
+
+    let merged = cortex.merge_people(target_id, source_id).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "merged_id": merged.id.to_string(),
+        "display_name": merged.display_name,
+        "identities": merged.identities.len(),
+        "status": "merged",
     }).to_string())
 }
