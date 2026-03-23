@@ -391,12 +391,32 @@ Working across multiple projects? Use **separate databases** for physical memory
 }
 ```
 
-Then in your project's `CLAUDE.md`:
+Then add these memory isolation rules to your project's `CLAUDE.md`:
+
 ```markdown
-## Memory
-- `cortex-project` tools → project architecture, decisions, code context
-- `cortex-global` tools → user preferences, personal facts, people
-- Default to cortex-project when uncertain
+## Memory Isolation
+
+Two Cortex MCP servers: `cortex-project` (project DB) and `cortex-global` (global DB).
+
+### Write Policy
+- Save to `cortex-project` if the memory is about this repo's architecture, code,
+  modules, tests, workflows, configs, bugs, decisions, or terminology.
+- Save to `cortex-global` only for long-term user preferences, communication style,
+  cross-project habits, or personal background useful across repos.
+- **Default: if uncertain, save to `cortex-project`.**
+
+### Read Policy
+1. Query `cortex-project` first.
+2. Query `cortex-global` second, only for user-level preferences.
+3. Prefer project memory when they conflict.
+
+### Anti-Leak Rules
+- Never auto-copy from `cortex-project` into `cortex-global`.
+- Never store repo-specific paths, module names, or account names in `cortex-global`.
+- Never treat project implementation details as user-global preferences.
+
+### Update Rule
+- Cortex is append-only. To update: search old entry → delete → ingest new.
 ```
 
 This gives you two independent Cortex instances per project — complete isolation with shared user knowledge.

@@ -395,12 +395,30 @@ Claude Desktop — 添加到 `~/Library/Application Support/Claude/claude_deskto
 }
 ```
 
-然后在项目的 `CLAUDE.md` 中添加：
+然后将以下记忆隔离规则添加到项目的 `CLAUDE.md` 中：
+
 ```markdown
-## 记忆
-- `cortex-project` 工具 → 项目架构、决策、代码上下文
-- `cortex-global` 工具 → 用户偏好、个人信息、人脉
-- 不确定时默认存 cortex-project
+## 记忆隔离
+
+两个 Cortex MCP 服务：`cortex-project`（项目 DB）和 `cortex-global`（全局 DB）。
+
+### 写入策略
+- 存到 `cortex-project`：本仓库的架构、代码、模块、测试、工作流、配置、Bug、决策、术语。
+- 存到 `cortex-global`：仅限长期用户偏好、沟通风格、跨项目习惯、跨仓库通用的个人背景。
+- **默认：不确定时存 `cortex-project`。**
+
+### 读取策略
+1. 先查 `cortex-project`。
+2. 再查 `cortex-global`，仅用于用户级偏好。
+3. 冲突时以项目记忆为准。
+
+### 防泄漏规则
+- 禁止自动将 `cortex-project` 的记忆复制到 `cortex-global`。
+- 禁止将仓库特有的路径、模块名、账户名存入 `cortex-global`。
+- 禁止将项目实现细节当作用户级全局偏好。
+
+### 更新规则
+- Cortex 是追加写入的。更新方式：搜索旧条目 → 删除 → 写入新条目。
 ```
 
 这样每个项目拥有两个独立的 Cortex 实例 — 完全隔离，同时共享用户级知识。
