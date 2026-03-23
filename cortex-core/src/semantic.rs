@@ -16,6 +16,41 @@ impl<'a> SemanticStore<'a> {
         Self { storage, index }
     }
 
+    /// Build a fact MemObject without storing it (for batch inserts).
+    pub fn build_fact_mem(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        confidence: f32,
+        source: MemSource,
+        embedding: Option<Vec<f32>>,
+    ) -> MemObject {
+        let content = MemContent::Fact {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+        };
+        let mut builder = MemObjectBuilder::new(MemoryTier::Semantic, content, source)
+            .salience(Salience::new(confidence));
+        if let Some(emb) = embedding {
+            builder = builder.embedding(emb);
+        }
+        builder.build()
+    }
+
+    /// Build a preference MemObject without storing it (for batch inserts).
+    pub fn build_preference_mem(&self, key: &str, value: &str, confidence: f32) -> MemObject {
+        let content = MemContent::Preference {
+            key: key.to_string(),
+            value: value.to_string(),
+            confidence,
+        };
+        MemObjectBuilder::new(MemoryTier::Semantic, content, MemSource::new("system"))
+            .salience(Salience::new(confidence))
+            .build()
+    }
+
     /// Add a semantic fact (subject-predicate-object triple).
     pub fn add_fact(
         &self,

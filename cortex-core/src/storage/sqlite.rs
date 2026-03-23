@@ -995,6 +995,25 @@ impl StorageBackend for SqliteStorage {
         Ok(results)
     }
 
+    fn list_beliefs_confident(&self, threshold: f32) -> Result<Vec<Belief>, CortexError> {
+        let conn = self.read_conn()?;
+        let low = 1.0 - threshold;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, key, probability, observations_json, last_updated FROM beliefs \
+                 WHERE probability >= ?1 OR probability <= ?2 ORDER BY ABS(probability - 0.5) DESC",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![threshold, low], parse_belief_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
     // Patterns
     fn store_pattern(&self, pattern: &Pattern) -> Result<(), CortexError> {
         let conn = self.write_conn.lock();

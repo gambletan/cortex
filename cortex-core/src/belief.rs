@@ -108,16 +108,6 @@ impl<'a> BeliefEngine<'a> {
     /// Get all beliefs above a confidence threshold.
     /// "Confident" means probability is either very high (>threshold) or very low (<1-threshold).
     pub fn get_confident_beliefs(&self, threshold: f32) -> Result<Vec<Belief>, CortexError> {
-        let high = self.storage.list_beliefs_above(threshold)?;
-        // Also get strongly negative beliefs (probability < 1-threshold)
-        let all = self.storage.list_beliefs_above(0.0)?;
-        let low_threshold = 1.0 - threshold;
-        let mut results: Vec<Belief> = high;
-        for b in all {
-            if b.probability < low_threshold {
-                results.push(b);
-            }
-        }
-        Ok(results)
+        self.storage.list_beliefs_confident(threshold)
     }
 }

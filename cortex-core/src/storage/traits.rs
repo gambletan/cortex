@@ -269,6 +269,21 @@ pub trait StorageBackend: Send + Sync {
         Ok(count)
     }
 
+    /// List beliefs where probability >= threshold OR probability <= (1-threshold).
+    /// Single query instead of two list_beliefs_above calls.
+    fn list_beliefs_confident(&self, threshold: f32) -> Result<Vec<crate::belief::Belief>, crate::CortexError> {
+        let high = self.list_beliefs_above(threshold)?;
+        let all = self.list_beliefs_above(0.0)?;
+        let low_threshold = 1.0 - threshold;
+        let mut results = high;
+        for b in all {
+            if b.probability < low_threshold && !results.iter().any(|r| r.id == b.id) {
+                results.push(b);
+            }
+        }
+        Ok(results)
+    }
+
     /// List all distinct namespaces with memory counts.
     fn list_namespaces(&self) -> Result<Vec<(String, usize)>, crate::CortexError> {
         Ok(Vec::new()) // Default: no namespace support
