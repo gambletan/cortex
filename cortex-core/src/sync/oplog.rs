@@ -19,11 +19,11 @@ use uuid::Uuid;
 const MAX_FILE_SIZE: u64 = 1_048_576;
 
 /// A single sync operation — one line in the JSONL file.
+/// Device ID is embedded in `hlc.device_id` — no separate field needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncOp {
     pub op_id: Uuid,
     pub hlc: HlcTimestamp,
-    pub device_id: String,
     pub payload: SyncPayload,
 }
 
@@ -41,7 +41,7 @@ pub enum SyncPayload {
     LinkUpsert {
         source_id: Uuid,
         target_id: Uuid,
-        relation: String,
+        relation: crate::types::LinkRelation,
         strength: f32,
     },
 }
@@ -71,8 +71,14 @@ impl OpLogWriter {
         Ok(writer)
     }
 
-    /// Append a SyncOp to the current oplog file.
+    /// Append a SyncOp to the current oplog file and flush.
     pub fn append(&mut self, op: &SyncOp) -> Result<(), CortexError> {
+        self.append_buffered(op)?;
+        self.flush()
+    }
+
+    /// Append without flushing — use with `flush()` after a batch.
+    pub fn append_buffered(&mut self, op: &SyncOp) -> Result<(), CortexError> {
         self.rotate_if_needed()?;
 
         let line = serde_json::to_string(op)
@@ -82,9 +88,16 @@ impl OpLogWriter {
             .ok_or_else(|| CortexError::Storage("No open oplog file".into()))?;
         writeln!(file, "{}", line)
             .map_err(|e| CortexError::Storage(format!("Failed to write oplog: {}", e)))?;
-        file.flush()
-            .map_err(|e| CortexError::Storage(format!("Failed to flush oplog: {}", e)))?;
 
+        Ok(())
+    }
+
+    /// Flush the oplog file to disk.
+    pub fn flush(&mut self) -> Result<(), CortexError> {
+        if let Some(ref mut file) = self.current_file {
+            file.flush()
+                .map_err(|e| CortexError::Storage(format!("Failed to flush oplog: {}", e)))?;
+        }
         Ok(())
     }
 
@@ -212,7 +225,6 @@ mod tests {
         SyncOp {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(wall_ms, 0, device_id),
-            device_id: device_id.to_string(),
             payload: SyncPayload::MemoryDelete { id: Uuid::new_v4() },
         }
     }
@@ -286,7 +298,6 @@ mod tests {
         let op = SyncOp {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(1000, 0, "device-a"),
-            device_id: "device-a".into(),
             payload: SyncPayload::MemoryUpsert { memory: mem },
         };
 

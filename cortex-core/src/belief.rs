@@ -28,6 +28,26 @@ pub enum Evidence {
     Contradicts(f32),
 }
 
+/// Single-step Bayesian update: compute posterior from prior + evidence.
+/// P(H|E) = P(E|H)*P(H) / [P(E|H)*P(H) + P(E|~H)*P(~H)]
+pub fn bayesian_update(prior: f32, evidence: &Evidence) -> f32 {
+    let strength = match evidence {
+        Evidence::Supports(s) | Evidence::Contradicts(s) => *s,
+    };
+    let likelihood_h = match evidence {
+        Evidence::Supports(_) => 0.5 + strength * 0.5,
+        Evidence::Contradicts(_) => 0.5 - strength * 0.5,
+    };
+    let likelihood_not_h = 1.0 - likelihood_h;
+    let numerator = likelihood_h * prior;
+    let denominator = numerator + likelihood_not_h * (1.0 - prior);
+    if denominator > 0.0 {
+        (numerator / denominator).clamp(0.001, 0.999)
+    } else {
+        prior
+    }
+}
+
 /// Bayesian belief update system.
 pub struct BeliefEngine<'a> {
     storage: &'a dyn StorageBackend,
@@ -57,33 +77,7 @@ impl<'a> BeliefEngine<'a> {
         };
 
         let prior = belief.probability;
-
-        // Bayesian update using evidence strength as likelihood ratio
-        let posterior = match &evidence {
-            Evidence::Supports(strength) => {
-                // P(H|E) = P(E|H)*P(H) / [P(E|H)*P(H) + P(E|~H)*P(~H)]
-                let likelihood_h = 0.5 + strength * 0.5; // higher strength = higher likelihood
-                let likelihood_not_h = 1.0 - likelihood_h;
-                let numerator = likelihood_h * prior;
-                let denominator = numerator + likelihood_not_h * (1.0 - prior);
-                if denominator > 0.0 {
-                    (numerator / denominator).clamp(0.001, 0.999)
-                } else {
-                    prior
-                }
-            }
-            Evidence::Contradicts(strength) => {
-                let likelihood_h = 0.5 - strength * 0.5; // higher strength = lower likelihood
-                let likelihood_not_h = 1.0 - likelihood_h;
-                let numerator = likelihood_h * prior;
-                let denominator = numerator + likelihood_not_h * (1.0 - prior);
-                if denominator > 0.0 {
-                    (numerator / denominator).clamp(0.001, 0.999)
-                } else {
-                    prior
-                }
-            }
-        };
+        let posterior = bayesian_update(prior, &evidence);
 
         let observation = Observation {
             timestamp: Utc::now(),

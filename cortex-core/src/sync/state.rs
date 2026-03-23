@@ -5,7 +5,30 @@
 use crate::sync::hlc::HlcTimestamp;
 use crate::CortexError;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// ── Entity type enum (avoids stringly-typed entity references) ───────────────
+
+/// Entity types tracked by the sync system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntityType {
+    Memory,
+    Person,
+    Belief,
+    Pattern,
+}
+
+impl EntityType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Person => "person",
+            Self::Belief => "belief",
+            Self::Pattern => "pattern",
+        }
+    }
+}
 
 // ── HLC serde helpers ────────────────────────────────────────────────────────
 
@@ -74,13 +97,13 @@ pub fn get_or_create_device(
 /// Get the HLC for an entity, if tracked.
 pub fn get_entity_hlc(
     conn: &Connection,
-    entity_type: &str,
+    entity_type: EntityType,
     entity_id: Uuid,
 ) -> Result<Option<HlcTimestamp>, CortexError> {
     let result = conn
         .query_row(
             "SELECT last_hlc FROM sync_hlc WHERE entity_type = ?1 AND entity_id = ?2",
-            params![entity_type, entity_id.to_string()],
+            params![entity_type.as_str(), entity_id.to_string()],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -92,13 +115,13 @@ pub fn get_entity_hlc(
 /// Set the HLC for an entity.
 pub fn set_entity_hlc(
     conn: &Connection,
-    entity_type: &str,
+    entity_type: EntityType,
     entity_id: Uuid,
     hlc: &HlcTimestamp,
 ) -> Result<(), CortexError> {
     conn.execute(
         "INSERT OR REPLACE INTO sync_hlc (entity_type, entity_id, last_hlc) VALUES (?1, ?2, ?3)",
-        params![entity_type, entity_id.to_string(), hlc_to_json(hlc)?],
+        params![entity_type.as_str(), entity_id.to_string(), hlc_to_json(hlc)?],
     )
     .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(())
@@ -143,13 +166,13 @@ pub fn set_cursor(
 /// Check if an entity has a tombstone (was deleted).
 pub fn is_tombstoned(
     conn: &Connection,
-    entity_type: &str,
+    entity_type: EntityType,
     entity_id: Uuid,
 ) -> Result<Option<HlcTimestamp>, CortexError> {
     let result = conn
         .query_row(
             "SELECT deleted_hlc FROM sync_tombstones WHERE entity_type = ?1 AND entity_id = ?2",
-            params![entity_type, entity_id.to_string()],
+            params![entity_type.as_str(), entity_id.to_string()],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -161,13 +184,13 @@ pub fn is_tombstoned(
 /// Record a tombstone for a deleted entity.
 pub fn set_tombstone(
     conn: &Connection,
-    entity_type: &str,
+    entity_type: EntityType,
     entity_id: Uuid,
     hlc: &HlcTimestamp,
 ) -> Result<(), CortexError> {
     conn.execute(
         "INSERT OR REPLACE INTO sync_tombstones (entity_type, entity_id, deleted_hlc, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![entity_type, entity_id.to_string(), hlc_to_json(hlc)?, chrono::Utc::now().to_rfc3339()],
+        params![entity_type.as_str(), entity_id.to_string(), hlc_to_json(hlc)?, chrono::Utc::now().to_rfc3339()],
     )
     .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(())

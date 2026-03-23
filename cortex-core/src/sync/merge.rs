@@ -7,7 +7,7 @@ use crate::storage::memory_index::MemoryIndex;
 use crate::storage::sqlite::SqliteStorage;
 use crate::storage::traits::StorageBackend;
 use crate::sync::oplog::{SyncOp, SyncPayload};
-use crate::sync::state;
+use crate::sync::state::{self, EntityType};
 use crate::CortexError;
 
 /// Result of merging a single operation.
@@ -32,7 +32,7 @@ pub fn apply_op(
 ) -> Result<MergeResult, CortexError> {
     match &op.payload {
         SyncPayload::MemoryUpsert { memory } => {
-            let entity_type = "memory";
+            let entity_type = EntityType::Memory;
             let entity_id = memory.id;
 
             // Check tombstone (sync state query)
@@ -57,6 +57,8 @@ pub fn apply_op(
             if !exists {
                 if let Some(ref hash) = memory.content_hash {
                     if let Ok(Some(_)) = storage.find_by_content_hash(hash) {
+                        // Still record HLC so future ops with lower HLC are correctly skipped
+                        storage.with_write_conn(|c| state::set_entity_hlc(c, entity_type, entity_id, &op.hlc))?;
                         return Ok(MergeResult::Deduplicated);
                     }
                 }
@@ -78,7 +80,7 @@ pub fn apply_op(
         }
 
         SyncPayload::MemoryDelete { id } => {
-            let entity_type = "memory";
+            let entity_type = EntityType::Memory;
 
             let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, *id))?;
             if let Some(local_hlc) = local {
@@ -98,7 +100,7 @@ pub fn apply_op(
         }
 
         SyncPayload::PersonUpsert { person } => {
-            let entity_type = "person";
+            let entity_type = EntityType::Person;
 
             let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, person.id))?;
             if let Some(local_hlc) = local {
@@ -128,7 +130,7 @@ pub fn apply_op(
         }
 
         SyncPayload::PersonDelete { id } => {
-            let entity_type = "person";
+            let entity_type = EntityType::Person;
             let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, *id))?;
             if let Some(local_hlc) = local {
                 if local_hlc >= op.hlc {
@@ -144,7 +146,7 @@ pub fn apply_op(
         }
 
         SyncPayload::BeliefUpsert { belief } => {
-            let entity_type = "belief";
+            let entity_type = EntityType::Belief;
 
             if let Ok(Some(local_belief)) = storage.get_belief(&belief.key) {
                 let mut merged = local_belief.clone();
@@ -178,7 +180,7 @@ pub fn apply_op(
         }
 
         SyncPayload::PatternUpsert { pattern } => {
-            let entity_type = "pattern";
+            let entity_type = EntityType::Pattern;
 
             if let Ok(Some(mut local_pattern)) = storage.get_pattern(&pattern.trigger) {
                 for action in &pattern.actions {
@@ -205,9 +207,7 @@ pub fn apply_op(
             relation,
             strength,
         } => {
-            let link_relation = crate::types::LinkRelation::parse(relation)
-                .unwrap_or(crate::types::LinkRelation::RelatedTo);
-            storage.store_link(*source_id, *target_id, link_relation, *strength)?;
+            storage.store_link(*source_id, *target_id, *relation, *strength)?;
             Ok(MergeResult::Applied)
         }
     }
@@ -218,31 +218,9 @@ fn recompute_belief_probability(observations: &[crate::belief::Observation]) -> 
     let mut prob = 0.5_f32;
     let mut sorted = observations.to_vec();
     sorted.sort_by_key(|o| o.timestamp);
-
     for obs in &sorted {
-        let strength = match &obs.evidence {
-            crate::belief::Evidence::Supports(s) => *s,
-            crate::belief::Evidence::Contradicts(s) => *s,
-        };
-
-        let (likelihood_h, likelihood_not_h) = match &obs.evidence {
-            crate::belief::Evidence::Supports(_) => {
-                let lh = 0.5 + strength * 0.5;
-                (lh, 1.0 - lh)
-            }
-            crate::belief::Evidence::Contradicts(_) => {
-                let lh = 0.5 - strength * 0.5;
-                (lh, 1.0 - lh)
-            }
-        };
-
-        let numerator = likelihood_h * prob;
-        let denominator = numerator + likelihood_not_h * (1.0 - prob);
-        if denominator > 0.0 {
-            prob = (numerator / denominator).clamp(0.001, 0.999);
-        }
+        prob = crate::belief::bayesian_update(prob, &obs.evidence);
     }
-
     prob
 }
 

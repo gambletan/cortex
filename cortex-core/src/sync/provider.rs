@@ -37,20 +37,7 @@ pub struct DetectedProvider {
 /// Detect available cloud storage providers and return the first available one.
 /// Checks: iCloud Drive → Google Drive → OneDrive → Dropbox.
 pub fn detect_provider() -> Option<DetectedProvider> {
-    let home = dirs::home_dir()?;
-    let candidates = provider_candidates(&home);
-
-    for (provider, path) in candidates {
-        if path.exists() && path.is_dir() {
-            let sync_dir = path.join("cortex-sync");
-            return Some(DetectedProvider {
-                provider,
-                sync_dir,
-            });
-        }
-    }
-
-    None
+    detect_all_providers().into_iter().next()
 }
 
 /// List all available providers (not just the first).

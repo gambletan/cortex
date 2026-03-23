@@ -144,7 +144,6 @@ impl SyncEngine {
         let op = SyncOp {
             op_id: Uuid::new_v4(),
             hlc,
-            device_id: self.config.device_id.clone(),
             payload,
         };
         self.writer.append(&op)
@@ -241,7 +240,7 @@ impl SyncEngine {
                             total_applied += 1;
                             tracing::debug!(
                                 op_id = %op.op_id,
-                                device = %op.device_id,
+                                device = %op.hlc.device_id,
                                 "Sync: applied remote op"
                             );
                         }

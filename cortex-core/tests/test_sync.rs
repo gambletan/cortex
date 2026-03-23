@@ -4,7 +4,7 @@ use cortex_core::sync::hlc::{HlcClock, HlcTimestamp};
 use cortex_core::sync::merge;
 use cortex_core::sync::oplog::{self, SyncOp, SyncPayload};
 use cortex_core::sync::provider;
-use cortex_core::sync::state;
+use cortex_core::sync::state::{self, EntityType};
 use cortex_core::sync::{SyncConfig, SyncEngine};
 use cortex_core::types::*;
 use cortex_core::Cortex;
@@ -123,7 +123,7 @@ fn test_lww_conflict_resolution() {
     let old_hlc = HlcTimestamp::new(1000, 0, "device-a");
     cortex_a.storage().store_memory(&mem_a).unwrap();
     cortex_a.sqlite_storage().with_write_conn(|conn| {
-        state::set_entity_hlc(conn, "memory", mem_a.id, &old_hlc)
+        state::set_entity_hlc(conn, EntityType::Memory, mem_a.id, &old_hlc)
     }).unwrap();
 
     // B writes a newer version with same ID
@@ -135,7 +135,6 @@ fn test_lww_conflict_resolution() {
     let op_b = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: new_hlc,
-        device_id: "device-b".into(),
         payload: SyncPayload::MemoryUpsert { memory: mem_b },
     };
 
@@ -214,13 +213,12 @@ fn test_person_merge_max_interaction_count() {
 
     // Set local HLC to be newer
     cortex.sqlite_storage().with_write_conn(|conn| {
-        state::set_entity_hlc(conn, "person", person.id, &new_hlc)
+        state::set_entity_hlc(conn, EntityType::Person, person.id, &new_hlc)
     }).unwrap();
 
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: old_hlc,
-        device_id: "device-b".into(),
         payload: SyncPayload::PersonUpsert { person: remote_person },
     };
 
@@ -253,7 +251,6 @@ fn test_belief_crdt_merge() {
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(2000, 0, "device-b"),
-        device_id: "device-b".into(),
         payload: SyncPayload::BeliefUpsert { belief: remote_belief },
     };
 
@@ -291,7 +288,6 @@ fn test_pattern_merge_union_actions() {
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(2000, 0, "device-b"),
-        device_id: "device-b".into(),
         payload: SyncPayload::PatternUpsert { pattern: remote_pattern },
     };
 
@@ -314,11 +310,10 @@ fn test_link_add_wins() {
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
-        device_id: "device-b".into(),
         payload: SyncPayload::LinkUpsert {
             source_id: id_a,
             target_id: id_b,
-            relation: "related_to".into(),
+            relation: LinkRelation::RelatedTo,
             strength: 0.8,
         },
     };
@@ -349,8 +344,8 @@ fn test_delete_then_recreate() {
     cortex.storage().store_memory(&mem).unwrap();
     let delete_hlc = HlcTimestamp::new(1000, 0, "device-a");
     cortex.sqlite_storage().with_write_conn(|conn| {
-        state::set_tombstone(conn, "memory", mem_id, &delete_hlc)?;
-        state::set_entity_hlc(conn, "memory", mem_id, &delete_hlc)
+        state::set_tombstone(conn, EntityType::Memory, mem_id, &delete_hlc)?;
+        state::set_entity_hlc(conn, EntityType::Memory, mem_id, &delete_hlc)
     }).unwrap();
     cortex.storage().delete_memory(mem_id).unwrap();
 
@@ -363,7 +358,6 @@ fn test_delete_then_recreate() {
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: recreate_hlc,
-        device_id: "device-b".into(),
         payload: SyncPayload::MemoryUpsert { memory: recreated },
     };
 
@@ -399,7 +393,7 @@ fn test_tombstone_gc() {
 
     // Verify it's gone
     let still_there = cortex.sqlite_storage().with_write_conn(|conn| {
-        state::is_tombstoned(conn, "memory", mem_id)
+        state::is_tombstoned(conn, EntityType::Memory, mem_id)
     }).unwrap();
     assert!(still_there.is_none(), "Tombstone should be removed after GC");
 }
@@ -430,7 +424,6 @@ fn test_oplog_partial_line_recovery() {
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-a"),
-        device_id: "device-a".into(),
         payload: SyncPayload::MemoryDelete { id: Uuid::new_v4() },
     };
     let valid_line = serde_json::to_string(&op).unwrap();
