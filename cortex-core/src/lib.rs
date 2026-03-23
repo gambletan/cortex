@@ -163,6 +163,8 @@ pub struct Cortex {
     write_generation: AtomicU64,
     /// Whether the vector index has been loaded from storage.
     index_loaded: AtomicBool,
+    /// Cloud sync engine (opt-in, default disabled).
+    sync_engine: parking_lot::Mutex<Option<crate::sync::SyncEngine>>,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -198,6 +200,7 @@ impl Cortex {
             )),
             write_generation: AtomicU64::new(0),
             index_loaded: AtomicBool::new(false),
+            sync_engine: parking_lot::Mutex::new(None),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         })
@@ -224,9 +227,42 @@ impl Cortex {
             )),
             write_generation: AtomicU64::new(0),
             index_loaded: AtomicBool::new(true), // in-memory starts empty, no need to load
+            sync_engine: parking_lot::Mutex::new(None),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Enable cloud sync. Creates sync folder structure and subscribes to events.
+    pub fn enable_sync(&self, config: crate::sync::SyncConfig) -> Result<(), CortexError> {
+        let engine = crate::sync::SyncEngine::new(config, &self.storage)?;
+        *self.sync_engine.lock() = Some(engine);
+        Ok(())
+    }
+
+    /// Pull remote sync changes from other devices.
+    /// Returns the number of operations applied.
+    pub fn sync_pull(&self) -> Result<usize, CortexError> {
+        let mut guard = self.sync_engine.lock();
+        let engine = guard.as_mut()
+            .ok_or_else(|| CortexError::InvalidInput("Sync not enabled".into()))?;
+        engine.pull_remote(&self.storage, &self.index)
+    }
+
+    /// Get sync status. Returns None if sync is not enabled.
+    pub fn sync_status(&self) -> Option<crate::sync::SyncStatus> {
+        let guard = self.sync_engine.lock();
+        guard.as_ref().and_then(|e| e.status().ok())
+    }
+
+    /// Record a sync operation for a memory event (called internally after mutations).
+    fn sync_record_event(&self, event: &CortexEvent) {
+        let mut guard = self.sync_engine.lock();
+        if let Some(ref mut engine) = *guard {
+            if let Err(e) = engine.record_memory_event(event, &self.storage) {
+                tracing::warn!(error = %e, "Failed to record sync event");
+            }
+        }
     }
 
     /// Enable custom decay configuration (opt-in).
@@ -436,11 +472,13 @@ impl Cortex {
         }
         let result = mem.clone();
 
-        // Emit event
-        self.event_bus.emit(&CortexEvent::MemoryCreated {
+        // Emit event + sync
+        let event = CortexEvent::MemoryCreated {
             id: result.id,
             tier: result.tier,
-        });
+        };
+        self.event_bus.emit(&event);
+        self.sync_record_event(&event);
         self.metrics.ingests.fetch_add(1, Ordering::Relaxed);
 
         // ── Plugin: on_post_ingest ────────────────────────────────────────
@@ -645,12 +683,14 @@ impl Cortex {
             self.index.insert(id, emb);
         }
 
-        // Emit events
+        // Emit events + sync
         for mem in &mems_to_store {
-            self.event_bus.emit(&CortexEvent::MemoryCreated {
+            let event = CortexEvent::MemoryCreated {
                 id: mem.id,
                 tier: mem.tier,
-            });
+            };
+            self.event_bus.emit(&event);
+            self.sync_record_event(&event);
         }
 
         // Auto-extract facts and preferences from batch (like single ingest)
@@ -998,7 +1038,9 @@ impl Cortex {
         self.index.remove(&id);
         self.bump_write_generation();
         self.metrics.archives.fetch_add(1, Ordering::Relaxed);
-        self.event_bus.emit(&CortexEvent::MemoryArchived { id });
+        let event = CortexEvent::MemoryArchived { id };
+        self.event_bus.emit(&event);
+        self.sync_record_event(&event);
         Ok(())
     }
 
@@ -1064,7 +1106,9 @@ impl Cortex {
         self.storage.delete_memory(id)?;
         self.index.remove(&id);
         self.bump_write_generation();
-        self.event_bus.emit(&CortexEvent::MemoryDeleted { id });
+        let event = CortexEvent::MemoryDeleted { id };
+        self.event_bus.emit(&event);
+        self.sync_record_event(&event);
         Ok(())
     }
 
@@ -1082,8 +1126,13 @@ impl Cortex {
         Ok(merged)
     }
 
-    /// Get the underlying storage (for advanced use).
+    /// Get the underlying storage as a trait object (for advanced use).
     pub fn storage(&self) -> &dyn StorageBackend {
+        &self.storage
+    }
+
+    /// Get the underlying SQLite storage (for sync and advanced use).
+    pub fn sqlite_storage(&self) -> &SqliteStorage {
         &self.storage
     }
 

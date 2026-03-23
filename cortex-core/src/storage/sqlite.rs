@@ -120,6 +120,16 @@ impl SqliteStorage {
         Ok(self.write_conn.lock())
     }
 
+    /// Execute a closure with access to the write connection.
+    /// Used by the sync module to run state operations on the same DB.
+    pub fn with_write_conn<F, R>(&self, f: F) -> Result<R, CortexError>
+    where
+        F: FnOnce(&Connection) -> Result<R, CortexError>,
+    {
+        let conn = self.write_conn.lock();
+        f(&conn)
+    }
+
     /// Invalidate a single entry from the memory cache.
     fn cache_evict(&self, id: &Uuid) {
         self.mem_cache.lock().pop(id);
@@ -511,6 +521,9 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         }
+
+        // Migration: sync tables (for cloud sync feature)
+        crate::sync::state::init_sync_tables(&conn)?;
 
         Ok(())
     }

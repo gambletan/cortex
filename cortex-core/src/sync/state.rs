@@ -4,8 +4,20 @@
 
 use crate::sync::hlc::HlcTimestamp;
 use crate::CortexError;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
+
+// ── HLC serde helpers ────────────────────────────────────────────────────────
+
+fn hlc_to_json(hlc: &HlcTimestamp) -> Result<String, CortexError> {
+    serde_json::to_string(hlc).map_err(|e| CortexError::Serialization(e.to_string()))
+}
+
+fn hlc_from_json(json: &str) -> Result<HlcTimestamp, CortexError> {
+    serde_json::from_str(json).map_err(|e| CortexError::Serialization(e.to_string()))
+}
+
+// ── Table initialization ─────────────────────────────────────────────────────
 
 /// Initialize sync tables in the Cortex database. Idempotent.
 pub fn init_sync_tables(conn: &Connection) -> Result<(), CortexError> {
@@ -41,6 +53,8 @@ pub fn init_sync_tables(conn: &Connection) -> Result<(), CortexError> {
     .map_err(|e| CortexError::Storage(format!("Failed to init sync tables: {}", e)))
 }
 
+// ── Device identity ──────────────────────────────────────────────────────────
+
 /// Get or create this device's identity.
 pub fn get_or_create_device(
     conn: &Connection,
@@ -55,6 +69,8 @@ pub fn get_or_create_device(
     Ok(())
 }
 
+// ── HLC per entity ───────────────────────────────────────────────────────────
+
 /// Get the HLC for an entity, if tracked.
 pub fn get_entity_hlc(
     conn: &Connection,
@@ -65,22 +81,12 @@ pub fn get_entity_hlc(
         .query_row(
             "SELECT last_hlc FROM sync_hlc WHERE entity_type = ?1 AND entity_id = ?2",
             params![entity_type, entity_id.to_string()],
-            |row| {
-                let hlc_json: String = row.get(0)?;
-                Ok(hlc_json)
-            },
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
-    match result {
-        Some(json) => {
-            let hlc: HlcTimestamp = serde_json::from_str(&json)
-                .map_err(|e| CortexError::Serialization(e.to_string()))?;
-            Ok(Some(hlc))
-        }
-        None => Ok(None),
-    }
+    result.map(|json| hlc_from_json(&json)).transpose()
 }
 
 /// Set the HLC for an entity.
@@ -90,15 +96,15 @@ pub fn set_entity_hlc(
     entity_id: Uuid,
     hlc: &HlcTimestamp,
 ) -> Result<(), CortexError> {
-    let hlc_json = serde_json::to_string(hlc)
-        .map_err(|e| CortexError::Serialization(e.to_string()))?;
     conn.execute(
         "INSERT OR REPLACE INTO sync_hlc (entity_type, entity_id, last_hlc) VALUES (?1, ?2, ?3)",
-        params![entity_type, entity_id.to_string(), hlc_json],
+        params![entity_type, entity_id.to_string(), hlc_to_json(hlc)?],
     )
     .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(())
 }
+
+// ── Read cursors ─────────────────────────────────────────────────────────────
 
 /// Get the read cursor (byte offset) for a remote device's oplog file.
 pub fn get_cursor(
@@ -132,6 +138,8 @@ pub fn set_cursor(
     Ok(())
 }
 
+// ── Tombstones ───────────────────────────────────────────────────────────────
+
 /// Check if an entity has a tombstone (was deleted).
 pub fn is_tombstoned(
     conn: &Connection,
@@ -142,22 +150,12 @@ pub fn is_tombstoned(
         .query_row(
             "SELECT deleted_hlc FROM sync_tombstones WHERE entity_type = ?1 AND entity_id = ?2",
             params![entity_type, entity_id.to_string()],
-            |row| {
-                let hlc_json: String = row.get(0)?;
-                Ok(hlc_json)
-            },
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
-    match result {
-        Some(json) => {
-            let hlc: HlcTimestamp = serde_json::from_str(&json)
-                .map_err(|e| CortexError::Serialization(e.to_string()))?;
-            Ok(Some(hlc))
-        }
-        None => Ok(None),
-    }
+    result.map(|json| hlc_from_json(&json)).transpose()
 }
 
 /// Record a tombstone for a deleted entity.
@@ -167,11 +165,9 @@ pub fn set_tombstone(
     entity_id: Uuid,
     hlc: &HlcTimestamp,
 ) -> Result<(), CortexError> {
-    let hlc_json = serde_json::to_string(hlc)
-        .map_err(|e| CortexError::Serialization(e.to_string()))?;
     conn.execute(
         "INSERT OR REPLACE INTO sync_tombstones (entity_type, entity_id, deleted_hlc, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![entity_type, entity_id.to_string(), hlc_json, chrono::Utc::now().to_rfc3339()],
+        params![entity_type, entity_id.to_string(), hlc_to_json(hlc)?, chrono::Utc::now().to_rfc3339()],
     )
     .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(())
@@ -188,5 +184,3 @@ pub fn gc_tombstones(conn: &Connection, max_age_days: i64) -> Result<usize, Cort
         .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(count)
 }
-
-use rusqlite::OptionalExtension;

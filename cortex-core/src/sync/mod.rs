@@ -11,12 +11,12 @@ pub mod provider;
 pub mod state;
 
 use crate::storage::memory_index::MemoryIndex;
+use crate::storage::sqlite::SqliteStorage;
 use crate::storage::traits::StorageBackend;
 use crate::sync::hlc::HlcClock;
 use crate::sync::oplog::{OpLogWriter, SyncOp, SyncPayload};
 use crate::types::*;
 use crate::CortexError;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -93,8 +93,9 @@ pub struct SyncEngine {
 }
 
 impl SyncEngine {
-    /// Initialize the sync engine. Creates sync folder structure and local sync tables.
-    pub fn new(config: SyncConfig, sync_conn: &Connection) -> Result<Self, CortexError> {
+    /// Initialize the sync engine. Creates sync folder structure.
+    /// Sync tables are initialized in SqliteStorage::init() — no separate connection needed.
+    pub fn new(config: SyncConfig, storage: &SqliteStorage) -> Result<Self, CortexError> {
         // Create sync directory structure
         let my_dir = config.my_device_dir();
         fs::create_dir_all(&my_dir)
@@ -126,9 +127,10 @@ impl SyncEngine {
         )
         .map_err(|e| CortexError::Storage(format!("Failed to write device.json: {}", e)))?;
 
-        // Init local sync tables
-        state::init_sync_tables(sync_conn)?;
-        state::get_or_create_device(sync_conn, &config.device_id, &config.device_name)?;
+        // Register device in sync tables (tables created during SqliteStorage::init)
+        storage.with_write_conn(|conn| {
+            state::get_or_create_device(conn, &config.device_id, &config.device_name)
+        })?;
 
         let hlc = HlcClock::new(&config.device_id);
         let writer = OpLogWriter::new(my_dir)?;
@@ -179,9 +181,8 @@ impl SyncEngine {
     /// Returns the number of operations applied.
     pub fn pull_remote(
         &mut self,
-        storage: &dyn StorageBackend,
+        storage: &SqliteStorage,
         index: &MemoryIndex,
-        sync_conn: &Connection,
     ) -> Result<usize, CortexError> {
         let devices_dir = self.config.devices_dir();
         if !devices_dir.exists() {
@@ -217,7 +218,9 @@ impl SyncEngine {
                     .to_string();
 
                 // Get cursor for this file
-                let cursor = state::get_cursor(sync_conn, &dir_name, &file_name)?;
+                let cursor = storage.with_write_conn(|conn| {
+                    state::get_cursor(conn, &dir_name, &file_name)
+                })?;
 
                 // Read new operations from cursor
                 let (ops, new_offset) = oplog::read_oplog(file_path, cursor)?;
@@ -231,7 +234,9 @@ impl SyncEngine {
                     // Advance local HLC past remote
                     self.hlc.update(&op.hlc);
 
-                    match merge::apply_op(op, storage, index, sync_conn) {
+                    let result = merge::apply_op(op, storage, index);
+
+                    match result {
                         Ok(merge::MergeResult::Applied) => {
                             total_applied += 1;
                             tracing::debug!(
@@ -258,12 +263,16 @@ impl SyncEngine {
                 }
 
                 // Update cursor
-                state::set_cursor(sync_conn, &dir_name, &file_name, new_offset)?;
+                storage.with_write_conn(|conn| {
+                    state::set_cursor(conn, &dir_name, &file_name, new_offset)
+                })?;
             }
         }
 
         // Periodic tombstone GC
-        let _ = state::gc_tombstones(sync_conn, self.config.tombstone_ttl_days);
+        let _ = storage.with_write_conn(|conn| {
+            state::gc_tombstones(conn, self.config.tombstone_ttl_days)
+        });
 
         Ok(total_applied)
     }

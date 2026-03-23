@@ -4,11 +4,11 @@
 //! Tombstones prevent deleted entities from being recreated by stale ops.
 
 use crate::storage::memory_index::MemoryIndex;
+use crate::storage::sqlite::SqliteStorage;
 use crate::storage::traits::StorageBackend;
 use crate::sync::oplog::{SyncOp, SyncPayload};
 use crate::sync::state;
 use crate::CortexError;
-use rusqlite::Connection;
 
 /// Result of merging a single operation.
 #[derive(Debug)]
@@ -24,39 +24,39 @@ pub enum MergeResult {
 }
 
 /// Apply a single SyncOp to the local database.
+/// Uses `with_write_conn` for sync state (HLC, tombstones) and StorageBackend for data.
 pub fn apply_op(
     op: &SyncOp,
-    storage: &dyn StorageBackend,
+    storage: &SqliteStorage,
     index: &MemoryIndex,
-    sync_conn: &Connection,
 ) -> Result<MergeResult, CortexError> {
     match &op.payload {
         SyncPayload::MemoryUpsert { memory } => {
             let entity_type = "memory";
             let entity_id = memory.id;
 
-            // Check tombstone
-            if let Some(tomb_hlc) = state::is_tombstoned(sync_conn, entity_type, entity_id)? {
+            // Check tombstone (sync state query)
+            let tomb = storage.with_write_conn(|c| state::is_tombstoned(c, entity_type, entity_id))?;
+            if let Some(tomb_hlc) = tomb {
                 if tomb_hlc >= op.hlc {
                     return Ok(MergeResult::Tombstoned);
                 }
-                // Op is newer than tombstone — allow recreation
             }
 
-            // LWW check
-            if let Some(local_hlc) = state::get_entity_hlc(sync_conn, entity_type, entity_id)? {
+            // LWW check (sync state query)
+            let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, entity_id))?;
+            if let Some(local_hlc) = local {
                 if local_hlc >= op.hlc {
                     return Ok(MergeResult::Skipped);
                 }
             }
 
-            // Apply: upsert memory
+            // Apply: upsert memory (storage operations)
             let exists = storage.get_memory(entity_id)?.is_some();
 
-            // Content-hash dedup: only for new memories (not updates to existing ones)
             if !exists {
                 if let Some(ref hash) = memory.content_hash {
-                    if let Ok(Some(_existing)) = storage.find_by_content_hash(hash) {
+                    if let Ok(Some(_)) = storage.find_by_content_hash(hash) {
                         return Ok(MergeResult::Deduplicated);
                     }
                 }
@@ -68,42 +68,41 @@ pub fn apply_op(
                 storage.store_memory(memory)?;
             }
 
-            // Update vector index
             if let Some(ref emb) = memory.embedding {
                 index.insert_arc(entity_id, emb);
             }
 
-            // Record HLC
-            state::set_entity_hlc(sync_conn, entity_type, entity_id, &op.hlc)?;
+            // Record HLC (sync state update)
+            storage.with_write_conn(|c| state::set_entity_hlc(c, entity_type, entity_id, &op.hlc))?;
             Ok(MergeResult::Applied)
         }
 
         SyncPayload::MemoryDelete { id } => {
             let entity_type = "memory";
 
-            // LWW: only delete if this op is newer
-            if let Some(local_hlc) = state::get_entity_hlc(sync_conn, entity_type, *id)? {
+            let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, *id))?;
+            if let Some(local_hlc) = local {
                 if local_hlc >= op.hlc {
                     return Ok(MergeResult::Skipped);
                 }
             }
 
-            // Apply delete
             storage.delete_memory(*id)?;
             index.remove(id);
 
-            // Record tombstone and HLC
-            state::set_tombstone(sync_conn, entity_type, *id, &op.hlc)?;
-            state::set_entity_hlc(sync_conn, entity_type, *id, &op.hlc)?;
+            storage.with_write_conn(|c| {
+                state::set_tombstone(c, entity_type, *id, &op.hlc)?;
+                state::set_entity_hlc(c, entity_type, *id, &op.hlc)
+            })?;
             Ok(MergeResult::Applied)
         }
 
         SyncPayload::PersonUpsert { person } => {
             let entity_type = "person";
 
-            if let Some(local_hlc) = state::get_entity_hlc(sync_conn, entity_type, person.id)? {
+            let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, person.id))?;
+            if let Some(local_hlc) = local {
                 if local_hlc >= op.hlc {
-                    // Merge interaction_count: take max
                     if let Ok(Some(local_person)) = storage.get_person(person.id) {
                         if person.interaction_count > local_person.interaction_count {
                             let mut merged = local_person;
@@ -124,29 +123,30 @@ pub fn apply_op(
                 storage.store_person(person)?;
             }
 
-            state::set_entity_hlc(sync_conn, entity_type, person.id, &op.hlc)?;
+            storage.with_write_conn(|c| state::set_entity_hlc(c, entity_type, person.id, &op.hlc))?;
             Ok(MergeResult::Applied)
         }
 
         SyncPayload::PersonDelete { id } => {
             let entity_type = "person";
-            if let Some(local_hlc) = state::get_entity_hlc(sync_conn, entity_type, *id)? {
+            let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, *id))?;
+            if let Some(local_hlc) = local {
                 if local_hlc >= op.hlc {
                     return Ok(MergeResult::Skipped);
                 }
             }
             storage.delete_person(*id)?;
-            state::set_tombstone(sync_conn, entity_type, *id, &op.hlc)?;
-            state::set_entity_hlc(sync_conn, entity_type, *id, &op.hlc)?;
+            storage.with_write_conn(|c| {
+                state::set_tombstone(c, entity_type, *id, &op.hlc)?;
+                state::set_entity_hlc(c, entity_type, *id, &op.hlc)
+            })?;
             Ok(MergeResult::Applied)
         }
 
         SyncPayload::BeliefUpsert { belief } => {
             let entity_type = "belief";
 
-            // Beliefs use CRDT merge: union observations, recompute probability
             if let Ok(Some(local_belief)) = storage.get_belief(&belief.key) {
-                // Merge observation lists (add-only set by timestamp)
                 let mut merged = local_belief.clone();
                 let local_timestamps: std::collections::HashSet<_> = merged
                     .observations
@@ -160,7 +160,6 @@ pub fn apply_op(
                     }
                 }
 
-                // Recompute probability from merged observations
                 if !merged.observations.is_empty() {
                     merged.probability = recompute_belief_probability(&merged.observations);
                 }
@@ -174,7 +173,7 @@ pub fn apply_op(
                 storage.store_belief(belief)?;
             }
 
-            state::set_entity_hlc(sync_conn, entity_type, belief.id, &op.hlc)?;
+            storage.with_write_conn(|c| state::set_entity_hlc(c, entity_type, belief.id, &op.hlc))?;
             Ok(MergeResult::Applied)
         }
 
@@ -182,7 +181,6 @@ pub fn apply_op(
             let entity_type = "pattern";
 
             if let Ok(Some(mut local_pattern)) = storage.get_pattern(&pattern.trigger) {
-                // Merge: union actions, max frequency
                 for action in &pattern.actions {
                     if !local_pattern.actions.contains(action) {
                         local_pattern.actions.push(action.clone());
@@ -197,7 +195,7 @@ pub fn apply_op(
                 storage.store_pattern(pattern)?;
             }
 
-            state::set_entity_hlc(sync_conn, entity_type, pattern.id, &op.hlc)?;
+            storage.with_write_conn(|c| state::set_entity_hlc(c, entity_type, pattern.id, &op.hlc))?;
             Ok(MergeResult::Applied)
         }
 
@@ -207,7 +205,6 @@ pub fn apply_op(
             relation,
             strength,
         } => {
-            // Add-wins: store link, strength = max
             let link_relation = crate::types::LinkRelation::parse(relation)
                 .unwrap_or(crate::types::LinkRelation::RelatedTo);
             storage.store_link(*source_id, *target_id, link_relation, *strength)?;
