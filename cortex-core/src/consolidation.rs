@@ -171,10 +171,13 @@ impl<'a> ConsolidationEngine<'a> {
 
         // Create semantic memory with boosted salience
         let salience = Salience::new((first.salience.base_score * self.config.salience_boost).min(1.0));
-        let mem = MemObjectBuilder::new(MemoryTier::Semantic, first.content.clone(), first.source.clone())
+        let mut builder = MemObjectBuilder::new(MemoryTier::Semantic, first.content.clone(), first.source.clone())
             .salience(salience)
-            .tags(first.tags.clone())
-            .build();
+            .tags(first.tags.clone());
+        if let Some(ref ns) = first.namespace {
+            builder = builder.namespace(ns.clone());
+        }
+        let mem = builder.build();
 
         self.storage.store_memory(&mem)?;
 

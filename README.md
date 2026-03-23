@@ -355,7 +355,53 @@ Add to `~/.claude/settings.json`:
 
 Now every new Claude Code session automatically loads your memory context — **zero manual effort**. Claude learns as you work and remembers across sessions.
 
-### 18 Tools
+### Multi-Project Isolation
+
+Working across multiple projects? Use **separate databases** for physical memory isolation — no cross-project leakage, zero code changes needed.
+
+```
+~/.cortex/
+├── global.db          # User preferences, people graph, cross-project knowledge
+├── my-app.db          # Project A memories
+└── my-api.db          # Project B memories
+```
+
+**Global config** (`~/.claude/settings.json`) — user-level knowledge:
+```json
+{
+  "mcpServers": {
+    "cortex-global": {
+      "command": "~/.local/bin/cortex-mcp-server",
+      "args": ["~/.cortex/global.db"]
+    }
+  },
+  "permissions": { "allow": ["mcp__cortex-global__*", "mcp__cortex-project__*"] }
+}
+```
+
+**Per-project config** (`~/.claude/projects/<path>/settings.json`) — project-specific:
+```json
+{
+  "mcpServers": {
+    "cortex-project": {
+      "command": "~/.local/bin/cortex-mcp-server",
+      "args": ["~/.cortex/my-app.db"]
+    }
+  }
+}
+```
+
+Then in your project's `CLAUDE.md`:
+```markdown
+## Memory
+- `cortex-project` tools → project architecture, decisions, code context
+- `cortex-global` tools → user preferences, personal facts, people
+- Default to cortex-project when uncertain
+```
+
+This gives you two independent Cortex instances per project — complete isolation with shared user knowledge.
+
+### 25 Tools
 
 | Tool | Purpose |
 |------|---------|

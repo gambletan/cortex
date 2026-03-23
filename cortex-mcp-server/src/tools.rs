@@ -112,6 +112,10 @@ fn list_tools_builtin() -> Value {
                     "person_id": {
                         "type": "string",
                         "description": "Filter by person UUID (optional)"
+                    },
+                    "namespace": {
+                        "type": "string",
+                        "description": "Filter by namespace for isolation (optional)"
                     }
                 }
             }

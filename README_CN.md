@@ -359,7 +359,53 @@ Claude Desktop — 添加到 `~/Library/Application Support/Claude/claude_deskto
 - 定期：调用 memory_consolidate 清理过期记忆
 ```
 
-### 18 个工具
+### 多项目隔离
+
+跨多个项目工作？使用**独立数据库**实现物理级记忆隔离 — 零跨项目泄漏，无需改代码。
+
+```
+~/.cortex/
+├── global.db          # 用户偏好、人脉图谱、跨项目知识
+├── my-app.db          # 项目 A 的记忆
+└── my-api.db          # 项目 B 的记忆
+```
+
+**全局配置**（`~/.claude/settings.json`）— 用户级知识：
+```json
+{
+  "mcpServers": {
+    "cortex-global": {
+      "command": "~/.local/bin/cortex-mcp-server",
+      "args": ["~/.cortex/global.db"]
+    }
+  },
+  "permissions": { "allow": ["mcp__cortex-global__*", "mcp__cortex-project__*"] }
+}
+```
+
+**项目配置**（`~/.claude/projects/<path>/settings.json`）— 项目专属：
+```json
+{
+  "mcpServers": {
+    "cortex-project": {
+      "command": "~/.local/bin/cortex-mcp-server",
+      "args": ["~/.cortex/my-app.db"]
+    }
+  }
+}
+```
+
+然后在项目的 `CLAUDE.md` 中添加：
+```markdown
+## 记忆
+- `cortex-project` 工具 → 项目架构、决策、代码上下文
+- `cortex-global` 工具 → 用户偏好、个人信息、人脉
+- 不确定时默认存 cortex-project
+```
+
+这样每个项目拥有两个独立的 Cortex 实例 — 完全隔离，同时共享用户级知识。
+
+### 25 个工具
 
 | 工具 | 用途 |
 |------|------|
