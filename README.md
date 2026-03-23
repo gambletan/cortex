@@ -3,6 +3,8 @@
 [![GitHub stars](https://img.shields.io/github/stars/gambletan/cortex?style=social)](https://github.com/gambletan/cortex/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **If Cortex helps your AI remember, [give it a ⭐](https://github.com/gambletan/cortex/stargazers)** — it takes 1 second and helps others discover the project.
+
 [中文文档](README_CN.md)
 
 ### Memory for fully decentralized AI agents.
@@ -129,6 +131,58 @@ Verify:
 ```bash
 cargo --version
 ```
+
+## Real-World Example: A Personal AI That Actually Remembers
+
+Imagine your AI assistant across a week of real conversations:
+
+```
+# Day 1 — You chat on Telegram
+You: "Meeting with Sarah from Stripe went well. She's interested in our API."
+
+  Cortex auto-extracts:
+  ├── episodic memory stored (156µs)
+  ├── fact: Sarah → works_at → Stripe (confidence: 0.85)
+  ├── fact: Sarah → interested_in → our API
+  └── person resolved: sarah_telegram
+
+# Day 2 — Sarah emails you
+From: sarah@stripe.com
+"Here's the technical spec we discussed."
+
+  Cortex:
+  ├── person resolved: sarah@stripe.com → merged with sarah_telegram
+  │   (same person, different channel — automatic identity resolution)
+  └── fact: Sarah → sent → technical spec
+
+# Day 3 — You ask your AI
+You: "What's the status with Stripe?"
+
+  Cortex retrieves (568µs):
+  ├── Sarah works at Stripe (semantic fact)
+  ├── Meeting went well, interested in API (episodic, Day 1)
+  ├── She sent technical spec (episodic, Day 2)
+  └── Cross-channel context: Telegram + Email unified under one person
+
+  Your AI responds with full context — no "sorry, I don't remember" 🎯
+
+# Day 5 — New information arrives
+You: "Turns out Sarah moved to Anthropic last month."
+
+  Cortex:
+  ├── contradiction detected: Sarah works_at Stripe vs Sarah works_at Anthropic
+  ├── old fact confidence decayed: Stripe (0.85 → 0.15)
+  ├── new fact stored: Sarah → works_at → Anthropic (0.90)
+  └── belief updated via Bayesian inference — self-correcting, no manual cleanup
+
+# Day 7 — Consolidation runs
+  Cortex auto-consolidation:
+  ├── 3 episodic memories about Sarah → promoted to semantic summary
+  ├── stale memories from other topics → decayed
+  └── pattern detected: you have recurring Monday meetings
+```
+
+All of this happens **locally in <1ms per operation**. No cloud. No API calls. No one else sees your data.
 
 ## Quick Start
 
