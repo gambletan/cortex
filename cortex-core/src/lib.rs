@@ -16,6 +16,7 @@ pub mod relationship;
 pub mod retrieval;
 pub mod semantic;
 pub mod storage;
+pub mod sync;
 pub mod types;
 pub mod working;
 

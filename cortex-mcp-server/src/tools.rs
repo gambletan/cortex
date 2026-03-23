@@ -460,6 +460,22 @@ fn list_tools_builtin() -> Value {
                 },
                 "required": ["target_id", "source_id"]
             }
+        },
+        {
+            "name": "sync_status",
+            "description": "Show cloud sync status: enabled/disabled, provider, connected devices, pending operations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "sync_providers",
+            "description": "Detect available cloud storage providers (iCloud Drive, Google Drive, OneDrive, Dropbox) on this machine.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -492,6 +508,8 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_restore" => tool_memory_restore(cortex, args),
         "namespace_list" => tool_namespace_list(cortex),
         "person_merge" => tool_person_merge(cortex, args),
+        "sync_status" => tool_sync_status(),
+        "sync_providers" => tool_sync_providers(),
         _ => {
             // Fallback to plugin-registered tools
             let ctx = cortex.plugin_context();
@@ -1062,5 +1080,48 @@ fn tool_person_merge(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Strin
         "display_name": merged.display_name,
         "identities": merged.identities.len(),
         "status": "merged",
+    }).to_string())
+}
+
+// ── Sync tools ───────────────────────────────────────────────────────────────
+
+fn tool_sync_status() -> Result<String, String> {
+    // For Phase 1: report detected providers and sync readiness
+    let providers = cortex_core::sync::provider::detect_all_providers();
+    if providers.is_empty() {
+        Ok(json!({
+            "enabled": false,
+            "status": "no_providers_detected",
+            "message": "No cloud storage providers found. Install iCloud Drive, Google Drive, OneDrive, or Dropbox.",
+        }).to_string())
+    } else {
+        let detected: Vec<serde_json::Value> = providers.iter().map(|p| {
+            json!({
+                "provider": p.provider.as_str(),
+                "sync_dir": p.sync_dir.display().to_string(),
+            })
+        }).collect();
+        Ok(json!({
+            "enabled": false,
+            "status": "ready",
+            "message": "Cloud providers detected. Use sync_enable to start syncing.",
+            "available_providers": detected,
+        }).to_string())
+    }
+}
+
+fn tool_sync_providers() -> Result<String, String> {
+    let providers = cortex_core::sync::provider::detect_all_providers();
+    let items: Vec<serde_json::Value> = providers.iter().map(|p| {
+        json!({
+            "provider": p.provider.as_str(),
+            "sync_dir": p.sync_dir.display().to_string(),
+            "exists": p.sync_dir.exists(),
+        })
+    }).collect();
+
+    Ok(json!({
+        "providers": items,
+        "total": items.len(),
     }).to_string())
 }
