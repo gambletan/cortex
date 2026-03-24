@@ -497,7 +497,38 @@ This gives you two independent Cortex instances per project — complete isolati
 
 ## OpenClaw Plugin
 
-Also ships as an OpenClaw memory plugin with auto-recall and auto-capture hooks. See `openclaw-plugin/` for the full integration.
+Give your OpenClaw agent persistent memory with auto-recall and auto-capture.
+
+**Install:**
+
+```bash
+# 1. Install Cortex binary
+curl -fsSL https://raw.githubusercontent.com/gambletan/cortex/main/install.sh | bash
+
+# 2. Install the OpenClaw plugin
+openclaw plugin add @cortex-ai-memory/cortex-memory
+```
+
+**Configure** (optional — works with defaults):
+
+```json
+{
+  "plugins": {
+    "@cortex-ai-memory/cortex-memory": {
+      "autoCapture": true,
+      "autoRecall": true,
+      "topK": 10
+    }
+  }
+}
+```
+
+**What it does:**
+- `autoCapture`: Automatically stores conversation context after each turn
+- `autoRecall`: Injects relevant memories before each turn (your agent "remembers")
+- 7 tools: memory_search, memory_store, fact_add, belief_observe, person_resolve, and more
+
+See `openclaw-plugin/README.md` for full configuration options.
 
 ## Project Structure
 

@@ -497,7 +497,38 @@ Claude Desktop — 添加到 `~/Library/Application Support/Claude/claude_deskto
 
 ## OpenClaw 插件
 
-同时提供 OpenClaw 记忆插件，支持自动记忆和自动召回钩子。详见 `openclaw-plugin/` 目录。
+给你的 OpenClaw Agent 加上永久记忆，支持自动记忆和自动召回。
+
+**安装：**
+
+```bash
+# 1. 安装 Cortex 二进制
+curl -fsSL https://raw.githubusercontent.com/gambletan/cortex/main/install.sh | bash
+
+# 2. 安装 OpenClaw 插件
+openclaw plugin add @cortex-ai-memory/cortex-memory
+```
+
+**配置**（可选，默认即可使用）：
+
+```json
+{
+  "plugins": {
+    "@cortex-ai-memory/cortex-memory": {
+      "autoCapture": true,
+      "autoRecall": true,
+      "topK": 10
+    }
+  }
+}
+```
+
+**功能说明：**
+- `autoCapture`：每轮对话后自动存储上下文
+- `autoRecall`：每轮对话前自动注入相关记忆（你的 Agent "记住"了一切）
+- 7 个工具：memory_search, memory_store, fact_add, belief_observe, person_resolve 等
+
+详见 `openclaw-plugin/README.md`。
 
 ## 项目结构
 
