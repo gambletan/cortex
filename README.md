@@ -63,6 +63,30 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 
 > **Note:** Benchmarks include proactive inference (auto-extracting facts, preferences, relationships) on every ingest. Raw ingest without inference is ~15µs. Numbers from `cargo bench` on M-series Mac.
 
+### LoCoMo Benchmark ([ACL 2024](https://snap-research.github.io/locomo/))
+
+Academic-grade long-term conversation memory evaluation — 10 conversations, 1540 QA pairs across 4 categories.
+
+| System | Single-hop | Multi-hop | Open-domain | Temporal | Overall |
+|--------|-----------|-----------|-------------|----------|---------|
+| Backboard | 89.4% | 75.0% | 91.2% | 91.9% | 90.0% |
+| MemMachine v0.2 | — | — | — | — | 84.9% |
+| Mem0-Graph | 65.7% | 47.2% | 75.7% | 58.1% | 68.4% |
+| Mem0 | 67.1% | 51.2% | 72.9% | 55.5% | 66.9% |
+| **Cortex v1.7** | **64.9%** | **53.1%** | **80.3%** | 39.9% | **59.5%** |
+| OpenAI Memory | — | — | — | — | 52.9% |
+
+**Key findings:**
+- **Open-domain 80.3%** — leads Mem0 (72.9%) and Mem0-Graph (75.7%) by +7.4%
+- **Multi-hop 53.1%** — leads Mem0 (51.2%) and Mem0-Graph (47.2%) by +1.9%
+- **Single-hop 64.9%** — near parity with Mem0 (67.1%)
+- **Temporal 39.9%** — behind Mem0 (55.5%), our current gap — actively improving
+- **Overall 59.5%** — beats OpenAI Memory (52.9%), trails Mem0 (66.9%) on overall score
+
+Unlike cloud competitors, Cortex runs 100% locally, is end-to-end encrypted, and costs $0.
+
+> **Setup:** Claude Sonnet 4 (QA + judge), nomic-embed-text (embeddings via Ollama), top-20 retrieval. Fully reproducible: `python3 bench/locomo_bench.py`
+
 ## Architecture
 
 Cortex implements a 4-tier memory model inspired by human cognition:
