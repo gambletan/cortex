@@ -7,11 +7,11 @@
 
 [中文文档](README_CN.md)
 
-### Memory for fully decentralized AI agents.
+### Private. Free. Local. — Memory engine for personal AI agents.
 
-**Persistent memory engine that runs entirely on your hardware.** Pure Rust. Local-first. 3.8MB. Zero cloud.
+**Your AI's memory lives on your device — never leaves, never costs, never spies.** Pure Rust. 3.8MB. No third-party servers. Zero telemetry. Zero cost. Syncs through your own cloud storage.
 
-> **Philosophy:** We build for a future where AI agents are fully decentralized — running on your device, owning your data, answering only to you. No cloud middleman. No vendor lock-in. No one else sees your memories. Cortex is the memory layer for sovereign AI agents that need to remember, learn, and evolve — without ever phoning home.
+> **Philosophy:** Your memories are yours — not a cloud provider's training data, not a startup's monetization asset, not a government's surveillance target. Cortex runs 100% on your hardware, stores everything in your own database, and syncs only through your own cloud storage (iCloud, Google Drive, OneDrive, Dropbox). No middleman ever sees your data. No API key required. No account to create. Just plug it into your AI agent and it remembers — privately, permanently, and at sub-millisecond speed.
 
 LLMs start blank every session. Your assistant forgets your name, your preferences, the conversation you had yesterday, the decision you made last week. Current "memory" solutions are flat text files, keyword grep, or cloud APIs that add 200-500ms latency, charge you for the privilege, and send your personal data to someone else's server.
 
