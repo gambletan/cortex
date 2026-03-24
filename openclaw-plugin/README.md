@@ -9,12 +9,12 @@ Persistent memory plugin for [OpenClaw](https://github.com/openclaw/openclaw) â€
 Install the Cortex MCP server binary:
 
 ```bash
-# From source
+# One-line install
+curl -fsSL https://raw.githubusercontent.com/gambletan/cortex/main/install.sh | bash
+
+# Or from source
 git clone https://github.com/gambletan/cortex.git
 cd cortex && cargo install --path cortex-mcp-server
-
-# Or copy the binary to PATH
-cp target/release/cortex-mcp-server ~/.local/bin/
 ```
 
 ## Install
