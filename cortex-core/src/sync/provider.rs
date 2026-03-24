@@ -60,13 +60,13 @@ pub fn detect_all_providers() -> Vec<DetectedProvider> {
 }
 
 fn provider_candidates(home: &std::path::Path) -> Vec<(CloudProvider, PathBuf)> {
-    vec![
+    let mut candidates = vec![
         // iCloud Drive (macOS)
         (
             CloudProvider::ICloud,
             home.join("Library/Mobile Documents/com~apple~CloudDocs"),
         ),
-        // Google Drive
+        // Google Drive (legacy path)
         (
             CloudProvider::GoogleDrive,
             home.join("Google Drive/My Drive"),
@@ -75,11 +75,35 @@ fn provider_candidates(home: &std::path::Path) -> Vec<(CloudProvider, PathBuf)> 
             CloudProvider::GoogleDrive,
             home.join("Google Drive"),
         ),
-        // OneDrive
+        // OneDrive (legacy path)
         (CloudProvider::OneDrive, home.join("OneDrive")),
         // Dropbox
         (CloudProvider::Dropbox, home.join("Dropbox")),
-    ]
+    ];
+
+    // macOS CloudStorage paths (Google Drive, OneDrive use ~/Library/CloudStorage/)
+    let cloud_storage = home.join("Library/CloudStorage");
+    if let Ok(entries) = std::fs::read_dir(&cloud_storage) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            if name.starts_with("GoogleDrive-") {
+                // Google Drive on macOS: ~/Library/CloudStorage/GoogleDrive-{email}/My Drive
+                let my_drive = path.join("My Drive");
+                if my_drive.exists() {
+                    candidates.insert(0, (CloudProvider::GoogleDrive, my_drive));
+                } else {
+                    candidates.insert(0, (CloudProvider::GoogleDrive, path));
+                }
+            } else if name.starts_with("OneDrive-") {
+                candidates.insert(0, (CloudProvider::OneDrive, path));
+            } else if name.starts_with("Dropbox") {
+                candidates.insert(0, (CloudProvider::Dropbox, path));
+            }
+        }
+    }
+
+    candidates
 }
 
 #[cfg(test)]
