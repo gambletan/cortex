@@ -72,7 +72,9 @@ impl JsonRpcResponse {
 
 // ── MCP Protocol constants ──────────────────────────────────────────────────
 
-const SERVER_NAME: &str = "cortex-memory";
+fn server_name() -> String {
+    std::env::var("CORTEX_SERVER_NAME").unwrap_or_else(|_| "cortex-memory".into())
+}
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -168,7 +170,7 @@ impl McpServer {
                         "tools": {}
                     },
                     "serverInfo": {
-                        "name": SERVER_NAME,
+                        "name": server_name(),
                         "version": SERVER_VERSION
                     }
                 }),
