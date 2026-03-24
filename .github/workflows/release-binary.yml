@@ -61,9 +61,9 @@ jobs:
       - name: Build lite version (no embeddings)
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features --features encrypted-db
+            cross build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features
           else
-            cargo build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features --features encrypted-db
+            cargo build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features
           fi
 
       - name: Package lite version
