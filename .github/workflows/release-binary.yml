@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -26,6 +27,7 @@ jobs:
             os: ubuntu-latest
             suffix: linux-arm64
             cross: true
+            lite_only: true
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -44,6 +46,7 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build full version
+        if: ${{ !matrix.lite_only }}
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }} -p cortex-mcp-server
@@ -52,6 +55,7 @@ jobs:
           fi
 
       - name: Package full version
+        if: ${{ !matrix.lite_only }}
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/cortex-mcp-server dist/
