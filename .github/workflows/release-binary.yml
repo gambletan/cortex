@@ -37,6 +37,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install cross
         if: ${{ matrix.cross }}
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -49,29 +51,27 @@ jobs:
             cargo build --release --target ${{ matrix.target }} -p cortex-mcp-server
           fi
 
-      - name: Build lite version
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features
-          else
-            cargo build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features
-          fi
-
-      - name: Package
+      - name: Package full version
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/cortex-mcp-server dist/cortex-mcp-server
+          cp target/${{ matrix.target }}/release/cortex-mcp-server dist/
           cd dist && tar czf ../cortex-mcp-server-${{ matrix.suffix }}.tar.gz cortex-mcp-server
-          rm cortex-mcp-server
+          cd .. && rm -rf dist
 
-          # Rebuild with lite binary name
+      - name: Build lite version (no embeddings)
+        run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features
+            cross build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features --features encrypted-db
           else
-            cargo build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features
+            cargo build --release --target ${{ matrix.target }} -p cortex-mcp-server --no-default-features --features encrypted-db
           fi
-          cp target/${{ matrix.target }}/release/cortex-mcp-server dist/cortex-mcp-server
+
+      - name: Package lite version
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/cortex-mcp-server dist/
           cd dist && tar czf ../cortex-mcp-server-lite-${{ matrix.suffix }}.tar.gz cortex-mcp-server
+          cd .. && rm -rf dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
