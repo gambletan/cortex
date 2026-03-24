@@ -23,6 +23,11 @@ lru = "0.12"
 half = "2"
 rayon = "1"
 dirs = "5"
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+base64 = "0.22"
 fastembed = { version = "4", optional = true }
 
 [dev-dependencies]

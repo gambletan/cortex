@@ -1,0 +1,220 @@
+//! Encryption for sync oplog files — AES-256-GCM with Argon2id key derivation.
+//!
+//! Each JSONL line is independently encrypted with a unique nonce.
+//! Format: `ENC1:<base64(nonce[12] || ciphertext || tag[16])>`
+
+use aes_gcm::aead::{Aead, OsRng};
+use aes_gcm::{Aes256Gcm, AeadCore, Key, KeyInit};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::CortexError;
+
+const ENC_PREFIX: &str = "ENC1:";
+const NONCE_LEN: usize = 12;
+const SALT_LEN: usize = 16;
+
+/// Holds the derived encryption key. Zeroized on drop.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct CryptoContext {
+    key_bytes: [u8; 32],
+}
+
+impl CryptoContext {
+    fn cipher(&self) -> Aes256Gcm {
+        let key = Key::<Aes256Gcm>::from_slice(&self.key_bytes);
+        Aes256Gcm::new(key)
+    }
+}
+
+/// Encryption metadata stored in manifest.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionManifest {
+    pub algorithm: String,
+    pub kdf: String,
+    pub salt: String, // base64-encoded
+    pub kdf_params: KdfParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KdfParams {
+    pub time_cost: u32,
+    pub mem_cost: u32,
+    pub parallelism: u32,
+}
+
+/// Generate a new encryption manifest with random salt.
+pub fn new_encryption_manifest() -> EncryptionManifest {
+    use rand::RngCore;
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+
+    EncryptionManifest {
+        algorithm: "aes-256-gcm".to_string(),
+        kdf: "argon2id".to_string(),
+        salt: base64::engine::general_purpose::STANDARD.encode(salt),
+        kdf_params: KdfParams {
+            time_cost: 3,
+            mem_cost: 65536, // 64 MB
+            parallelism: 1,
+        },
+    }
+}
+
+/// Derive an encryption key from a passphrase and manifest.
+pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<CryptoContext, CortexError> {
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(&manifest.salt)
+        .map_err(|e| CortexError::Storage(format!("Invalid salt: {}", e)))?;
+
+    let params = argon2::Params::new(
+        manifest.kdf_params.mem_cost,
+        manifest.kdf_params.time_cost,
+        manifest.kdf_params.parallelism,
+        Some(32),
+    )
+    .map_err(|e| CortexError::Storage(format!("Invalid Argon2 params: {}", e)))?;
+
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+
+    let mut key_bytes = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut key_bytes)
+        .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
+
+    Ok(CryptoContext { key_bytes })
+}
+
+/// Encrypt a plaintext line → `ENC1:<base64(nonce || ciphertext || tag)>`
+pub fn encrypt_line(ctx: &CryptoContext, plaintext: &[u8]) -> Result<String, CortexError> {
+    let cipher = ctx.cipher();
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| CortexError::Storage(format!("Encryption failed: {}", e)))?;
+
+    // nonce || ciphertext (includes GCM tag)
+    let mut combined = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    combined.extend_from_slice(&nonce);
+    combined.extend_from_slice(&ciphertext);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&combined);
+    Ok(format!("{}{}", ENC_PREFIX, encoded))
+}
+
+/// Decrypt an `ENC1:...` line → plaintext bytes.
+pub fn decrypt_line(ctx: &CryptoContext, encrypted_line: &str) -> Result<Vec<u8>, CortexError> {
+    let payload = encrypted_line
+        .strip_prefix(ENC_PREFIX)
+        .ok_or_else(|| CortexError::Storage("Missing ENC1: prefix".into()))?;
+
+    let combined = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| CortexError::Storage(format!("Base64 decode failed: {}", e)))?;
+
+    if combined.len() < NONCE_LEN + 16 {
+        return Err(CortexError::Storage("Encrypted data too short".into()));
+    }
+
+    let (nonce_bytes, ciphertext) = combined.split_at(NONCE_LEN);
+    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+
+    let cipher = ctx.cipher();
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| CortexError::Storage(format!("Decryption failed (wrong key or tampered data): {}", e)))
+}
+
+/// Check if a line is encrypted.
+pub fn is_encrypted_line(line: &str) -> bool {
+    line.starts_with(ENC_PREFIX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_manifest() -> EncryptionManifest {
+        // Use fast params for tests
+        let mut m = new_encryption_manifest();
+        m.kdf_params.time_cost = 1;
+        m.kdf_params.mem_cost = 1024; // 1 MB
+        m
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let manifest = test_manifest();
+        let ctx = derive_key("test-passphrase", &manifest).unwrap();
+        let plaintext = b"hello world, this is a secret memory";
+
+        let encrypted = encrypt_line(&ctx, plaintext).unwrap();
+        assert!(encrypted.starts_with("ENC1:"));
+
+        let decrypted = decrypt_line(&ctx, &encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_wrong_key_fails() {
+        let manifest = test_manifest();
+        let ctx1 = derive_key("correct-passphrase", &manifest).unwrap();
+        let ctx2 = derive_key("wrong-passphrase", &manifest).unwrap();
+
+        let encrypted = encrypt_line(&ctx1, b"secret data").unwrap();
+        let result = decrypt_line(&ctx2, &encrypted);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unique_nonces() {
+        let manifest = test_manifest();
+        let ctx = derive_key("passphrase", &manifest).unwrap();
+        let plaintext = b"same text";
+
+        let enc1 = encrypt_line(&ctx, plaintext).unwrap();
+        let enc2 = encrypt_line(&ctx, plaintext).unwrap();
+        // Same plaintext should produce different ciphertext (random nonce)
+        assert_ne!(enc1, enc2);
+    }
+
+    #[test]
+    fn test_deterministic_key_derivation() {
+        let manifest = test_manifest();
+        let ctx1 = derive_key("same-passphrase", &manifest).unwrap();
+        let ctx2 = derive_key("same-passphrase", &manifest).unwrap();
+        assert_eq!(ctx1.key_bytes, ctx2.key_bytes);
+    }
+
+    #[test]
+    fn test_different_salt_different_key() {
+        let m1 = test_manifest();
+        let m2 = test_manifest(); // new random salt
+        let ctx1 = derive_key("same-passphrase", &m1).unwrap();
+        let ctx2 = derive_key("same-passphrase", &m2).unwrap();
+        assert_ne!(ctx1.key_bytes, ctx2.key_bytes);
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_fails() {
+        let manifest = test_manifest();
+        let ctx = derive_key("passphrase", &manifest).unwrap();
+
+        let encrypted = encrypt_line(&ctx, b"secret").unwrap();
+        // Tamper with the base64 payload
+        let mut tampered = encrypted.clone();
+        let last_char = tampered.pop().unwrap();
+        tampered.push(if last_char == 'A' { 'B' } else { 'A' });
+
+        let result = decrypt_line(&ctx, &tampered);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_encrypted_line() {
+        assert!(is_encrypted_line("ENC1:abc123"));
+        assert!(!is_encrypted_line("{\"op_id\":\"...\"}"));
+    }
+}

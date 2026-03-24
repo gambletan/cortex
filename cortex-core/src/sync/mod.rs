@@ -4,6 +4,7 @@
 //! Other devices read and replay those logs to stay in sync.
 //! Conflict resolution: Last-Writer-Wins (LWW) per entity using Hybrid Logical Clocks.
 
+pub mod crypto;
 pub mod hlc;
 pub mod merge;
 pub mod oplog;
@@ -38,6 +39,10 @@ pub struct SyncConfig {
     /// Tombstone retention in days (default: 30).
     #[serde(default = "default_tombstone_ttl_days")]
     pub tombstone_ttl_days: i64,
+    /// Optional passphrase for encrypting oplog files (AES-256-GCM).
+    /// Never serialized to disk.
+    #[serde(default, skip_serializing)]
+    pub encryption_passphrase: Option<String>,
 }
 
 fn default_poll_interval_secs() -> u64 { 30 }
@@ -51,7 +56,14 @@ impl SyncConfig {
             device_name,
             poll_interval_secs: default_poll_interval_secs(),
             tombstone_ttl_days: default_tombstone_ttl_days(),
+            encryption_passphrase: None,
         }
+    }
+
+    /// Set encryption passphrase for oplog files.
+    pub fn with_encryption(mut self, passphrase: impl Into<String>) -> Self {
+        self.encryption_passphrase = Some(passphrase.into());
+        self
     }
 
     pub fn poll_interval(&self) -> Duration {
@@ -90,6 +102,7 @@ pub struct SyncEngine {
     config: SyncConfig,
     hlc: HlcClock,
     writer: OpLogWriter,
+    crypto: Option<std::sync::Arc<crypto::CryptoContext>>,
 }
 
 impl SyncEngine {
@@ -132,10 +145,43 @@ impl SyncEngine {
             state::get_or_create_device(conn, &config.device_id, &config.device_name)
         })?;
 
-        let hlc = HlcClock::new(&config.device_id);
-        let writer = OpLogWriter::new(my_dir)?;
+        // Set up encryption if passphrase is provided
+        let crypto_ctx = if let Some(ref passphrase) = config.encryption_passphrase {
+            // Read or create encryption manifest
+            let manifest_path = config.sync_dir.join("manifest.json");
+            let manifest_json: serde_json::Value = if manifest_path.exists() {
+                let content = fs::read_to_string(&manifest_path)
+                    .map_err(|e| CortexError::Storage(format!("Failed to read manifest: {}", e)))?;
+                serde_json::from_str(&content)
+                    .map_err(|e| CortexError::Serialization(e.to_string()))?
+            } else {
+                serde_json::json!({})
+            };
 
-        Ok(Self { config, hlc, writer })
+            let enc_manifest = if let Some(enc) = manifest_json.get("encryption") {
+                serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
+                    .map_err(|e| CortexError::Serialization(e.to_string()))?
+            } else {
+                // First time: generate salt and write to manifest
+                let new_manifest = crypto::new_encryption_manifest();
+                let mut updated = manifest_json.clone();
+                updated["encryption"] = serde_json::to_value(&new_manifest)
+                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
+                fs::write(&manifest_path, serde_json::to_string_pretty(&updated).unwrap())
+                    .map_err(|e| CortexError::Storage(format!("Failed to write manifest: {}", e)))?;
+                new_manifest
+            };
+
+            let ctx = crypto::derive_key(passphrase, &enc_manifest)?;
+            Some(std::sync::Arc::new(ctx))
+        } else {
+            None
+        };
+
+        let hlc = HlcClock::new(&config.device_id);
+        let writer = OpLogWriter::new(my_dir, crypto_ctx.clone())?;
+
+        Ok(Self { config, hlc, writer, crypto: crypto_ctx })
     }
 
     /// Record a local mutation as a SyncOp in the oplog.
@@ -150,23 +196,34 @@ impl SyncEngine {
     }
 
     /// Record a memory event from the EventBus.
+    /// Only Shared/Public memories are synced — Private (the default) never leaves the device.
     pub fn record_memory_event(
         &mut self,
         event: &CortexEvent,
-        storage: &dyn StorageBackend,
+        storage: &SqliteStorage,
     ) -> Result<(), CortexError> {
         match event {
             CortexEvent::MemoryCreated { id, .. } | CortexEvent::MemoryUpdated { id } => {
                 if let Some(mem) = storage.get_memory(*id)? {
-                    self.record_op(SyncPayload::MemoryUpsert { memory: mem })?;
+                    if mem.privacy.is_syncable() {
+                        self.record_op(SyncPayload::MemoryUpsert { memory: mem })?;
+                    }
                 }
             }
             CortexEvent::MemoryDeleted { id } => {
-                self.record_op(SyncPayload::MemoryDelete { id: *id })?;
+                // Only sync delete if the memory was previously synced
+                let was_synced = storage.with_write_conn(|conn| {
+                    state::get_entity_hlc(conn, state::EntityType::Memory, *id)
+                })?.is_some();
+                if was_synced {
+                    self.record_op(SyncPayload::MemoryDelete { id: *id })?;
+                }
             }
             CortexEvent::MemoryArchived { id } => {
                 if let Some(mem) = storage.get_memory(*id)? {
-                    self.record_op(SyncPayload::MemoryUpsert { memory: mem })?;
+                    if mem.privacy.is_syncable() {
+                        self.record_op(SyncPayload::MemoryUpsert { memory: mem })?;
+                    }
                 }
             }
             // Consolidation and decay are local-only operations
@@ -222,7 +279,11 @@ impl SyncEngine {
                 })?;
 
                 // Read new operations from cursor
-                let (ops, new_offset) = oplog::read_oplog(file_path, cursor)?;
+                let (ops, new_offset) = oplog::read_oplog(
+                    file_path,
+                    cursor,
+                    self.crypto.as_deref(),
+                )?;
 
                 if ops.is_empty() {
                     continue;

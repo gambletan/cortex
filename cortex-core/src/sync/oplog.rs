@@ -53,10 +53,14 @@ pub struct OpLogWriter {
     current_path: PathBuf,
     current_date: String,
     current_seq: u32,
+    crypto: Option<std::sync::Arc<crate::sync::crypto::CryptoContext>>,
 }
 
 impl OpLogWriter {
-    pub fn new(device_dir: PathBuf) -> Result<Self, CortexError> {
+    pub fn new(
+        device_dir: PathBuf,
+        crypto: Option<std::sync::Arc<crate::sync::crypto::CryptoContext>>,
+    ) -> Result<Self, CortexError> {
         fs::create_dir_all(&device_dir)
             .map_err(|e| CortexError::Storage(format!("Failed to create device dir: {}", e)))?;
 
@@ -66,6 +70,7 @@ impl OpLogWriter {
             current_path: PathBuf::new(),
             current_date: String::new(),
             current_seq: 0,
+            crypto,
         };
         writer.rotate_if_needed()?;
         Ok(writer)
@@ -81,8 +86,14 @@ impl OpLogWriter {
     pub fn append_buffered(&mut self, op: &SyncOp) -> Result<(), CortexError> {
         self.rotate_if_needed()?;
 
-        let line = serde_json::to_string(op)
+        let json = serde_json::to_string(op)
             .map_err(|e| CortexError::Serialization(e.to_string()))?;
+
+        let line = if let Some(ref ctx) = self.crypto {
+            crate::sync::crypto::encrypt_line(ctx, json.as_bytes())?
+        } else {
+            json
+        };
 
         let file = self.current_file.as_mut()
             .ok_or_else(|| CortexError::Storage("No open oplog file".into()))?;
@@ -148,6 +159,7 @@ impl OpLogWriter {
 pub fn read_oplog(
     path: &Path,
     start_offset: u64,
+    crypto: Option<&crate::sync::crypto::CryptoContext>,
 ) -> Result<(Vec<SyncOp>, u64), CortexError> {
     let file = File::open(path)
         .map_err(|e| CortexError::Storage(format!("Failed to open oplog {}: {}", path.display(), e)))?;
@@ -177,13 +189,42 @@ pub fn read_oplog(
             continue;
         }
 
-        match serde_json::from_str::<SyncOp>(trimmed) {
+        // Decrypt if needed, then deserialize
+        let json_str = if crate::sync::crypto::is_encrypted_line(trimmed) {
+            match crypto {
+                Some(ctx) => {
+                    match crate::sync::crypto::decrypt_line(ctx, trimmed) {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                tracing::warn!("Invalid UTF-8 after decryption at offset {}", offset);
+                                offset += bytes_read as u64;
+                                continue;
+                            }
+                        },
+                        Err(_) => {
+                            tracing::warn!("Decryption failed at offset {}", offset);
+                            offset += bytes_read as u64;
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("Encrypted line but no decryption key at offset {}", offset);
+                    offset += bytes_read as u64;
+                    continue;
+                }
+            }
+        } else {
+            trimmed.to_string()
+        };
+
+        match serde_json::from_str::<SyncOp>(&json_str) {
             Ok(op) => {
                 ops.push(op);
                 offset += bytes_read as u64;
             }
             Err(_) => {
-                // Partial/corrupted line (e.g., crash mid-write) — skip it
                 tracing::warn!("Skipping invalid oplog line at offset {}", offset);
                 offset += bytes_read as u64;
             }
@@ -234,7 +275,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let device_dir = tmp.path().join("device-a");
 
-        let mut writer = OpLogWriter::new(device_dir.clone()).unwrap();
+        let mut writer = OpLogWriter::new(device_dir.clone(), None).unwrap();
         let op1 = make_op("device-a", 1000);
         let op2 = make_op("device-a", 2000);
         writer.append(&op1).unwrap();
@@ -243,14 +284,14 @@ mod tests {
         let files = list_oplog_files(&device_dir).unwrap();
         assert_eq!(files.len(), 1);
 
-        let (ops, offset) = read_oplog(&files[0], 0).unwrap();
+        let (ops, offset) = read_oplog(&files[0], 0, None).unwrap();
         assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].op_id, op1.op_id);
         assert_eq!(ops[1].op_id, op2.op_id);
         assert!(offset > 0);
 
         // Reading from the end offset should return nothing
-        let (ops2, _) = read_oplog(&files[0], offset).unwrap();
+        let (ops2, _) = read_oplog(&files[0], offset, None).unwrap();
         assert!(ops2.is_empty());
     }
 
@@ -259,12 +300,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let device_dir = tmp.path().join("device-a");
 
-        let mut writer = OpLogWriter::new(device_dir.clone()).unwrap();
+        let mut writer = OpLogWriter::new(device_dir.clone(), None).unwrap();
         let op1 = make_op("device-a", 1000);
         writer.append(&op1).unwrap();
 
         let files = list_oplog_files(&device_dir).unwrap();
-        let (ops, offset1) = read_oplog(&files[0], 0).unwrap();
+        let (ops, offset1) = read_oplog(&files[0], 0, None).unwrap();
         assert_eq!(ops.len(), 1);
 
         // Write more ops
@@ -272,7 +313,7 @@ mod tests {
         writer.append(&op2).unwrap();
 
         // Read from previous offset — should only get op2
-        let (ops2, _) = read_oplog(&files[0], offset1).unwrap();
+        let (ops2, _) = read_oplog(&files[0], offset1, None).unwrap();
         assert_eq!(ops2.len(), 1);
         assert_eq!(ops2[0].op_id, op2.op_id);
     }

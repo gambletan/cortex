@@ -38,6 +38,10 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 | **Binary size** | 3.8 MB | npm package | N/A |
 | **Dependencies** | 0 runtime deps | Node.js + cloud | N/A |
 | **Open source** | MIT | Partial | No |
+| **Encryption** | AES-256-GCM encrypted sync (opt-in) | No | No |
+| **Privacy levels** | Private (default, never syncs) / Shared / Public | No | No |
+| **Zero telemetry** | No analytics, no phone-home, verifiable | Unknown | No |
+| **Cost** | Free forever, unlimited | $99+/mo (Pro) | $20/mo (Plus) |
 | **Chinese NLP** | Native (inference, retrieval, relationships) | No | Limited |
 | **Namespace isolation** | Per-user/context memory separation | No | No |
 | **Plugin system** | Compile-time hooks for ingest/retrieve/consolidation | No | No |

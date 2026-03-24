@@ -180,6 +180,38 @@ pub enum MemContent {
     },
 }
 
+impl MemContent {
+    /// Securely clear all sensitive text fields in this content.
+    /// Call when dropping memories from caches or working memory.
+    pub fn zeroize_content(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            MemContent::Text(s) => s.zeroize(),
+            MemContent::Fact { subject, predicate, object } => {
+                subject.zeroize();
+                predicate.zeroize();
+                object.zeroize();
+            }
+            MemContent::Preference { key, value, .. } => {
+                key.zeroize();
+                value.zeroize();
+            }
+            MemContent::Relationship { relation, .. } => {
+                relation.zeroize();
+            }
+            MemContent::Pattern { trigger, actions, .. } => {
+                trigger.zeroize();
+                for a in actions {
+                    a.zeroize();
+                }
+            }
+            MemContent::Event { title, .. } => {
+                title.zeroize();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemSource {
     pub channel: String,
@@ -207,6 +239,14 @@ pub enum PrivacyLevel {
     Private,
     Shared { scope: String },
     Public,
+}
+
+impl PrivacyLevel {
+    /// Returns true if this privacy level allows syncing via oplog.
+    /// Private memories (the default) never leave the local database.
+    pub fn is_syncable(&self) -> bool {
+        !matches!(self, PrivacyLevel::Private)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
