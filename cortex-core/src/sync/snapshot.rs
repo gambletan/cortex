@@ -5,7 +5,6 @@
 
 use crate::export::{self, ExportData, ImportData, ImportReport};
 use crate::storage::memory_index::MemoryIndex;
-use crate::storage::sqlite::SqliteStorage;
 use crate::storage::traits::StorageBackend;
 use crate::CortexError;
 use std::fs;

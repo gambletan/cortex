@@ -95,8 +95,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Store a new memory
+    Ingest {
+        /// Text to remember
+        text: String,
+        /// Source channel (default: cli)
+        #[arg(short, long, default_value = "cli")]
+        channel: String,
+    },
+    /// Search memories
+    Search {
+        /// Search query
+        query: String,
+        /// Max results (default: 5)
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
     /// Show memory statistics
     Stats,
+    /// Show cloud sync status and detected providers
+    Sync,
     /// Export all data as JSON
     Export {
         /// Output file (default: stdout)
@@ -234,6 +252,100 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Ingest { text, channel }) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+            let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
+                eprintln!("Error opening database: {e}");
+                std::process::exit(1);
+            });
+            let mem = cortex.ingest(&text, &channel, None, None, None).unwrap_or_else(|e| {
+                eprintln!("Error ingesting memory: {e}");
+                std::process::exit(1);
+            });
+            println!("✅ Memory stored");
+            println!("   ID:      {}", mem.id);
+            println!("   Tier:    {}", mem.tier.as_str());
+            println!("   Channel: {}", channel);
+            if let cortex_core::types::MemContent::Text(ref t) = mem.content {
+                let preview = if t.len() > 80 { format!("{}...", &t[..80]) } else { t.clone() };
+                println!("   Text:    {}", preview);
+            }
+        }
+        Some(Command::Search { query, limit }) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+            let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
+                eprintln!("Error opening database: {e}");
+                std::process::exit(1);
+            });
+            let results = cortex.retrieve(&query, limit, None, None, None).unwrap_or_else(|e| {
+                eprintln!("Error searching: {e}");
+                std::process::exit(1);
+            });
+            if results.is_empty() {
+                println!("No results found for: {}", query);
+            } else {
+                println!("Found {} results for: \"{}\"", results.len(), query);
+                println!();
+                for (i, r) in results.iter().enumerate() {
+                    let content = match &r.memory.content {
+                        cortex_core::types::MemContent::Text(t) => {
+                            if t.len() > 120 { format!("{}...", &t[..120]) } else { t.clone() }
+                        }
+                        cortex_core::types::MemContent::Fact { subject, predicate, object } => {
+                            format!("{} {} {}", subject, predicate, object)
+                        }
+                        cortex_core::types::MemContent::Preference { key, value, .. } => {
+                            format!("{} = {}", key, value)
+                        }
+                        other => format!("{:?}", other),
+                    };
+                    println!("  {}. [score: {:.3}] {}", i + 1, r.score, content);
+                    println!("     tier: {} | channel: {} | {}",
+                        r.memory.tier.as_str(),
+                        r.memory.source.channel,
+                        r.memory.temporal.ingestion_time.format("%Y-%m-%d %H:%M"),
+                    );
+                }
+            }
+        }
+        Some(Command::Sync) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+
+            // Detect providers
+            let providers = cortex_core::sync::provider::detect_all_providers();
+            println!("Cloud Sync Status");
+            println!("=================");
+            if providers.is_empty() {
+                println!("No cloud providers detected.");
+                println!("Install iCloud Drive, Google Drive, OneDrive, or Dropbox.");
+            } else {
+                println!("Detected providers:");
+                for p in &providers {
+                    let exists = if p.sync_dir.exists() { "✅" } else { "📁" };
+                    println!("  {} {} → {}", exists, p.provider.as_str(), p.sync_dir.display());
+                }
+            }
+
+            // Check if sync is configured for this DB
+            let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
+                eprintln!("Error opening database: {e}");
+                std::process::exit(1);
+            });
+            match cortex.sync_status() {
+                Some(status) => {
+                    println!("\nActive sync:");
+                    println!("  Device:  {} ({})", status.device_name, status.device_id);
+                    println!("  Dir:     {}", status.sync_dir);
+                    println!("  Remotes: {}", status.remote_devices.len());
+                }
+                None => {
+                    println!("\nSync not enabled for this database.");
+                }
+            }
+        }
         Some(Command::Stats) => {
             let db_path = resolve_db_path(cli.db_path.as_deref());
             ensure_db_dir(&db_path);

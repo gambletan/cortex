@@ -1,196 +1,117 @@
-I built a memory engine that makes AI assistants 2,000x faster at remembering you.
+# Why Your AI's Memory Shouldn't Live on Someone Else's Server
 
-Here's why every existing solution is fundamentally broken — and the engineering behind what I did about it.
+Your AI assistant knows your name, your job, your preferences, your relationships, what you discussed yesterday, and what decisions you made last week. That's a lot of intimate data.
 
----
+Now ask yourself: where does it go?
 
-THE DIRTY SECRET OF AI MEMORY
+## The Problem
 
-Every AI assistant in 2026 has the same problem: amnesia.
+Every major AI memory solution today sends your data to someone else's server:
 
-Claude, GPT, Gemini — they forget you the instant the session ends. The "memory" features they ship are band-aids. Claude Code writes to a flat MEMORY.md with a 200-line hard truncation. ChatGPT stores a bullet list. Gemini... doesn't even try.
+- **Mem0** stores your memories on their cloud. You pay $99/month for the privilege. Their server can read everything.
+- **OpenAI Memory** lives on OpenAI's infrastructure. You have zero control, zero export, zero visibility into what's stored or how it's used.
+- **Custom RAG pipelines** typically use Pinecone, Weaviate, or similar cloud vector databases. Your personal context sits alongside thousands of other users' data.
 
-I've spent the past year building multi-channel AI assistants — Telegram, Slack, Discord, LinkedIn, YouTube — with automated engagement, content pipelines, and cross-platform orchestration. Dozens of accounts. Thousands of interactions per day.
+This isn't just a privacy concern — it's a fundamental architectural mistake.
 
-The bottleneck was never the LLM. It was always memory.
+## Why Cloud Memory Is a Bad Idea
 
-Not "can the model remember things" — but "can it UNDERSTAND what it knows about you, update that understanding when you change, and do it fast enough that you don't notice."
+**1. Your memories are the most valuable data an AI can have about you.**
 
-None of the existing solutions do this. Here's why.
+They contain your preferences, habits, relationships, work context, health information, financial details, and decision patterns. This is orders of magnitude more sensitive than your search history.
 
----
+**2. Cloud providers are targets.**
 
-WHY CURRENT MEMORY SYSTEMS FAIL
+A breach of a memory service exposes not individual queries but complete, structured profiles of every user. It's the difference between someone seeing one search vs. reading your entire diary.
 
-I benchmarked and analyzed the three dominant approaches:
+**3. Latency kills the experience.**
 
-1. FILE-BASED (Claude Code, ChatGPT)
+Cloud memory adds 200-500ms to every query. You feel it. Your AI hesitates before it can recall anything. Cortex does the same operation in 253µs — that's 1000x faster. The difference between "instant recall" and "thinking..."
 
-Claude Code's MEMORY.md is literally `cat >> file.md`. No structure. No ranking. No decay. When it hits 200 lines, it truncates — silently dropping your oldest memories. It cannot distinguish "user mentioned sushi once" from "user has been a systems programmer for 10 years."
+**4. You lose control.**
 
-This is a notepad, not a memory system.
+Can you delete a specific memory from Mem0's servers? Can you verify it's actually gone? Can you export your data and move to a competitor? In most cases: no, no, and sort of.
 
-2. KEYWORD SEARCH (OpenClaw memory-core)
+## The Alternative: Local-First Memory
 
-SQLite + full-text search. Better than flat files, but fundamentally limited: it returns matches, not understanding. Search "what does the user prefer?" and you get every line containing "prefer" — with zero ranking by importance, recency, or confidence.
+We built [Cortex](https://github.com/gambletan/cortex) on a simple principle: **your memories should live on your device, encrypted, under your control.**
 
-3. CLOUD VECTOR DB (Mem0)
+### How It Works
 
-Mem0 is the current "best" option. It embeds your text, stores vectors in Qdrant, and does similarity search. The problems:
+```
+Your Device                    Your Cloud Storage
+┌──────────────┐         ┌──────────────────────┐
+│  SQLCipher DB │         │  iCloud / GDrive /   │
+│  (encrypted)  │ ──────> │  OneDrive / Dropbox  │
+│               │ <────── │                      │
+│  62µs ingest  │         │  AES-256-GCM oplog   │
+│  253µs search │         │  (your key, your     │
+│  3.8MB binary │         │   account, encrypted) │
+└──────────────┘         └──────────────────────┘
+```
 
-- 200-500ms latency per operation (network + embedding API + vector search)
-- Your data leaves your machine (privacy)
-- $0.01-0.05 per operation at scale (cost)
-- Still stores memories as flat text (no structure)
-- No belief system, no contradiction detection
-- Graph memory is cloud-only, paid tier
+- **All computation is local.** SQLite database on your disk, in-memory vector index, sub-millisecond operations. Nothing leaves your machine unless you explicitly enable sync.
 
-I tested: with 20 memories, Mem0 cloud takes ~300ms to search. At 1,000 memories, it's ~500ms. That's half a second of dead air every time your AI tries to remember something about you.
+- **Sync goes through YOUR cloud storage.** Not our servers — your iCloud Drive, your Google Drive, your Dropbox. We never see your data. The sync protocol writes encrypted changelog files to a folder that your cloud provider syncs.
 
----
+- **Encryption is end-to-end.** AES-256-GCM with Argon2id key derivation. Even if someone compromises your cloud account, they get meaningless ciphertext.
 
-THE INSIGHT
+- **Private by default.** Every memory is `Private` unless you explicitly mark it `Shared`. Private memories never leave the local database. They can't be synced, exported, or leaked.
 
-The problem isn't storage. It's architecture.
+### The Architecture
 
-Human memory doesn't work like a database. You don't `SELECT * FROM memories WHERE text LIKE '%rust%'`. You have layers:
+Cortex implements a 4-tier memory model inspired by human cognition:
 
-- Something that just happened (working memory)
-- Something you experienced (episodic memory)
-- Something you know as fact (semantic memory)
-- Something you know how to do (procedural memory)
+```
+Working Memory  →  current session context
+      ↓
+Episodic Memory →  raw experiences with timestamps
+      ↓ (consolidation: decay + promotion)
+Semantic Memory →  distilled facts, preferences, relationships
+      ↓
+Procedural      →  learned behavioral patterns
+```
 
-These layers interact. Episodes consolidate into facts. Facts inform beliefs. Beliefs decay when contradicted. Memories that aren't accessed fade. Memories that are accessed strengthen.
+Each tier has different retention characteristics. Episodic memories decay over time (importance-aware exponential decay). Recurring patterns get promoted to Semantic facts. Bayesian beliefs self-correct as new evidence arrives.
 
-No AI memory system models this. They all treat memory as a flat append-only log.
+The retrieval engine combines 5 signals — vector similarity, temporal recency, salience, social context, and channel relevance — to find the right memory for each query.
 
-So I built one that doesn't.
+### Cross-Device Sync Without a Server
 
----
+The sync protocol is changelog-based:
 
-CORTEX: THE ENGINEERING
+1. Each device writes append-only operation logs to its own subfolder in the sync directory
+2. Each device reads other devices' logs and replays them locally
+3. Conflicts are resolved using Hybrid Logical Clocks (LWW per entity)
+4. Beliefs merge as CRDTs (observation lists are add-only sets)
 
-Cortex is a persistent memory engine written in Rust. 3.8MB binary. Zero dependencies. Zero cloud. Pure local.
+No two devices ever write to the same file, so cloud providers never see write conflicts.
 
-Here's the architecture and the engineering decisions behind each component:
+### Numbers
 
-4-TIER MEMORY MODEL
+| Operation | Cortex | Mem0 (cloud) |
+|-----------|--------|-------------|
+| Ingest | **62µs** | ~200ms |
+| Search (top-10) | **253µs** | ~300ms |
+| Context generation | **111µs** | ~500ms |
+| Belief update | **28µs** | N/A |
 
-Working Memory → current session scratch pad (in-memory, no persistence)
-Episodic Memory → raw experiences with timestamps and source metadata
-Semantic Memory → structured facts (subject-predicate-object triples), preferences, relationships
-Procedural Memory → learned patterns, workflows, user-specific routines
+Binary size: **3.8 MB**. Dependencies: **0 runtime**. Cost: **$0, forever**.
 
-The Consolidation Engine runs periodically and:
-- Promotes recurring episodes to semantic facts (no LLM needed — pattern extraction via frequency analysis)
-- Decays stale episodes (salience score drops over time)
-- Sweeps dead memories below a threshold
+## Try It
 
-This means the memory store is self-cleaning. It doesn't grow unboundedly like every other system.
+```bash
+# Store a memory
+cortex-mcp-server ~/.cortex/memory.db ingest "I prefer dark mode and use Rust"
 
-BAYESIAN BELIEF ENGINE
+# Search
+cortex-mcp-server ~/.cortex/memory.db search "preferences"
 
-This is the core differentiator.
+# Check sync status
+cortex-mcp-server ~/.cortex/memory.db sync
+```
 
-Instead of storing "user prefers Rust" as a boolean, Cortex tracks it as a probability:
-
-  First mention: P(prefers_rust) = 0.75
-  Second confirmation: P = 0.92
-  User says "switching to Go": P drops to 0.68
-  Back to Rust next week: P = 0.89
-
-Mathematically:
-
-  posterior = prior * likelihood / evidence
-
-With sigmoid bounds to prevent P from hitting 0 or 1 (which would make beliefs irrecoverable).
-
-I ran 100 observations with 67% supporting evidence. The belief converged to 0.9944 — correct Bayesian inference, computed in 27 microseconds total. That's 0.27µs per update.
-
-No other memory system does probabilistic reasoning. They all store facts as immutable strings. Cortex stores beliefs as evolving distributions.
-
-PEOPLE GRAPH
-
-Your AI talks to people across channels. Alice on Telegram (alice_123) and Alice on Slack (alice_work) should be the same person.
-
-Cortex resolves identities automatically:
-- `resolve_identity("telegram", "alice_123", "Alice")` → creates Person
-- `resolve_identity("slack", "alice_work", "Alice")` → finds existing, merges
-
-Each Person tracks: identities across channels, interaction count, first/last seen, communication style, tags, notes. Relationships between people are stored as semantic memory triples.
-
-Resolved 3 cross-channel identities in 41µs. Mem0's graph memory requires the paid cloud tier. File-based systems can't do it at all.
-
-MULTI-SIGNAL RETRIEVAL
-
-Most memory systems rank by one signal — usually vector similarity. Cortex combines five:
-
-1. Similarity — cosine distance between query and memory embeddings
-2. Temporal — exponential decay weighting (newer = more relevant)
-3. Salience — importance score from access patterns + explicit hints
-4. Social — boost for memories involving a specific person
-5. Channel — filter or boost by source channel
-
-Each signal is weighted and combined into a final relevance score. The retrieval engine pre-filters by embedding similarity using an in-memory vector index, then re-ranks the top candidates with all five signals.
-
-VECTOR INDEX: THE PERFORMANCE STORY
-
-The in-memory vector index is where I spent the most optimization time.
-
-Key decisions:
-
-1. Precomputed L2 norms — every vector's norm is computed once at insert time, stored alongside the vector. Search only computes dot products, not full cosine similarity from scratch. Saves one sqrt per candidate per query.
-
-2. Split dot_product() and l2_norm() as #[inline] functions — LLVM auto-vectorizes these into SIMD instructions (NEON on Apple Silicon, AVX2 on x86). The iterator-based `zip().map().sum()` pattern is the exact shape LLVM optimizes best.
-
-3. Partial sort via select_nth_unstable — for top-k retrieval, we don't need a full O(n log n) sort. `select_nth_unstable` gives us the top-k in O(n), then we only sort those k elements. At 50K vectors with k=10, this saves ~4x compared to full sort.
-
-4. SQLite pragmas — WAL mode, synchronous=NORMAL, 64MB cache, 256MB mmap, temp_store=MEMORY. These alone gave ~3x improvement on mixed read/write workloads.
-
-5. prepare_cached() — every SQL query reuses compiled statements from rusqlite's internal LRU cache instead of re-parsing SQL on each call.
-
----
-
-THE NUMBERS
-
-Full benchmark. Release build. Apple Silicon M-series. In-memory database (pure compute, no disk I/O variance):
-
-OPERATION            | CORTEX    | MEM0 CLOUD | FILE-BASED
-─────────────────────────────────────────────────────────
-Ingest (single)      |      7µs  | ~200ms     | ~1ms
-Search (top-10)      |    132µs  | ~300ms     | ~10ms
-Context generation   |     51µs  | ~500ms     | manual
-Belief update        |     27µs  | N/A        | N/A
-People graph resolve |     13µs  | paid tier  | N/A
-Structured fact      |      7µs  | N/A        | N/A
-1K memories search   |   1.2ms   | ~500ms     | ~50ms
-
-SCALE TEST — 1,000 memories across 5 channels:
-
-  Ingest all:          7ms
-  Search (top-10):     1.2ms
-  Context generation:  378µs (651 chars, LLM-ready)
-
-VECTOR INDEX — 384-dimensional embeddings (typical for gte-small/bge-small):
-
-  100 vectors:     31.7µs per search
-  1,000 vectors:   152.7µs per search
-  10,000 vectors:  1.5ms per search
-  50,000 vectors:  12.4ms per search
-
-Linear scaling with brute-force cosine similarity. At 50K+ vectors, we'd swap to HNSW (instant-distance crate). For personal AI assistants, 10K-50K vectors covers years of conversations.
-
-The headline: 2,266x faster search than Mem0 cloud, with features neither Mem0 nor file-based systems offer.
-
----
-
-HOW IT INTEGRATES
-
-MCP SERVER
-
-Cortex ships as an MCP (Model Context Protocol) server — the standard that Claude Code, Claude Desktop, Cursor, and other AI tools use for tool integration.
-
-One binary. Stdio transport. JSON-RPC 2.0.
+Or use it as an MCP server with Claude Code, Cursor, or any MCP-compatible AI:
 
 ```json
 {
@@ -203,72 +124,16 @@ One binary. Stdio transport. JSON-RPC 2.0.
 }
 ```
 
-8 tools available:
+27 tools for memory management, fact storage, belief tracking, people resolution, and more — all running locally on your machine.
 
-  memory_ingest    — store memories with channel/person context
-  memory_search    — multi-signal retrieval across all tiers
-  memory_context   — generate LLM-ready context summary
-  belief_observe   — update beliefs with supporting/contradicting evidence
-  belief_list      — query beliefs above confidence threshold
-  person_resolve   — cross-channel identity resolution
-  fact_add         — structured subject-predicate-object triples
-  preference_set   — user preferences with confidence scores
+## The Future
 
-CONTEXT INJECTION
+We believe AI agents will be fully decentralized — running on your device, owning your data, answering only to you. Memory is the foundation of that future. If your AI can't remember privately, it can't think independently.
 
-When your AI asks "what do I know about this user?", Cortex returns:
+**Cortex is open source (MIT), free forever, and designed to never phone home.**
 
-```
-[Cortex Memory Context]
-## User Profile
-- language = Chinese and English bilingual (confidence: 90%)
-- editor = neovim (confidence: 85%)
-- package_manager = pnpm (confidence: 85%)
-
-## Recent Context
-- [2026-03-10 21:25] User prefers dark mode and uses Rust
-- [2026-03-10 20:15] Discussed multi-channel bot architecture
-
-## Beliefs
-- user_is_developer (likely, 95%)
-- user_prefers_rust (confident, 89%)
-
-## People
-- Alice (telegram, slack) — 12 interactions
-```
-
-Structured. Ranked. Confidence-scored. Generated in 51 microseconds.
-
-Compare this to a flat MEMORY.md that gets truncated at line 200.
+[GitHub](https://github.com/gambletan/cortex) · [SECURITY.md](https://github.com/gambletan/cortex/blob/main/SECURITY.md) · 420+ tests · 0 network calls
 
 ---
 
-WHAT COMES NEXT
-
-Phase 1 (v0.2): Local embedding integration. Currently search is text-based; adding gte-small via ONNX Runtime gives true semantic search — "what programming tools does the user like?" would match "I use neovim and pnpm" without any keyword overlap. Zero external API calls.
-
-Phase 2 (v0.3): Proactive inference. Instead of waiting to be told, Cortex will automatically extract structured knowledge from conversations. "Oh I've been living in Shanghai for 3 years" → auto-generates fact_add("User", "lives_in", "Shanghai", confidence=0.85). Small local model for entity extraction.
-
-Phase 3 (v0.3): Temporal awareness. "I'm in Tokyo this week" should NOT overwrite "I live in Shanghai." Current memory systems can't distinguish temporary state from permanent facts. Cortex will tag temporal scope on every memory and reason about it during retrieval.
-
-Phase 4 (v0.4): Cross-device sync via CRDTs. Your AI remembers you on your laptop, phone, and server — with conflict-free replication.
-
----
-
-THE DEEPER POINT
-
-The AI industry is spending billions on making models smarter. Better reasoning. Longer context. Faster inference.
-
-But the elephant in the room is that even the smartest model is useless if it doesn't know who it's talking to.
-
-A 200B parameter model with amnesia is less useful than a 7B model that remembers everything about you.
-
-Memory isn't a feature. It's the foundation. And right now, the foundation is a markdown file.
-
-Cortex is my attempt to fix that. MIT licensed. Zero cloud. Zero cost. 3.8MB.
-
-AI that knows you — not AI with a notepad.
-
-github.com/gambletan/cortex
-
-#OpenSource #Rust #AI #MCP #BuildInPublic #AIMemory #RustLang #LocalFirst #ClaudeAI #DevTools
+*Built with Rust. Encrypted with AES-256-GCM. Synced through your own cloud. Private by default.*
