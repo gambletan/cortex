@@ -108,7 +108,7 @@ impl<'a> CompressionEngine<'a> {
             if accum.memories.len() < min_messages {
                 continue;
             }
-            let channel = key.splitn(2, '|').next().unwrap_or("").to_string();
+            let channel = key.split('|').next().unwrap_or("").to_string();
 
             result.push(ConversationSession {
                 channel,
