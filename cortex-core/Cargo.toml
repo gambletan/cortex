@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["encrypted-db"]
 embeddings = ["fastembed"]
+encrypted-db = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -28,6 +29,7 @@ argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 base64 = "0.22"
+zstd = "0.13"
 fastembed = { version = "4", optional = true }
 
 [dev-dependencies]

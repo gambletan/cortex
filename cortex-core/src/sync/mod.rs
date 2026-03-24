@@ -9,6 +9,7 @@ pub mod hlc;
 pub mod merge;
 pub mod oplog;
 pub mod provider;
+pub mod snapshot;
 pub mod state;
 
 use crate::storage::memory_index::MemoryIndex;
@@ -374,6 +375,28 @@ impl SyncEngine {
             remote_devices,
             pending_ops: 0,
         })
+    }
+
+    /// Create a compressed snapshot for new-device bootstrap.
+    pub fn create_snapshot(&self, storage: &dyn StorageBackend) -> Result<std::path::PathBuf, CortexError> {
+        let snapshots_dir = self.config.sync_dir.join("snapshots");
+        snapshot::create_snapshot(storage, &snapshots_dir)
+    }
+
+    /// Restore from the latest snapshot. Returns None if no snapshot exists.
+    pub fn restore_from_snapshot(
+        &self,
+        storage: &dyn StorageBackend,
+        index: &MemoryIndex,
+    ) -> Result<Option<crate::export::ImportReport>, CortexError> {
+        let snapshots_dir = self.config.sync_dir.join("snapshots");
+        match snapshot::find_latest_snapshot(&snapshots_dir)? {
+            Some(path) => {
+                let (report, _) = snapshot::restore_from_snapshot(&path, storage, index)?;
+                Ok(Some(report))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn config(&self) -> &SyncConfig {

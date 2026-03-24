@@ -45,7 +45,26 @@ impl SqliteStorage {
     }
 
     pub fn open(path: &str) -> Result<Self, CortexError> {
+        Self::open_with_key(path, None)
+    }
+
+    /// Open a Cortex database with optional encryption passphrase.
+    /// Requires the `encrypted-db` feature (SQLCipher). Without the feature,
+    /// the passphrase is ignored and the DB is opened without encryption.
+    pub fn open_with_key(path: &str, passphrase: Option<&str>) -> Result<Self, CortexError> {
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // Apply encryption key if provided (requires bundled-sqlcipher feature)
+        #[cfg(feature = "encrypted-db")]
+        if let Some(key) = passphrase {
+            conn.pragma_update(None, "key", key)
+                .map_err(|e| CortexError::Storage(format!("Failed to set encryption key: {}", e)))?;
+        }
+        #[cfg(not(feature = "encrypted-db"))]
+        if passphrase.is_some() {
+            tracing::warn!("Database encryption requested but 'encrypted-db' feature not enabled. Opening without encryption.");
+        }
+
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -68,6 +87,11 @@ impl SqliteStorage {
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+            #[cfg(feature = "encrypted-db")]
+            if let Some(key) = passphrase {
+                reader.pragma_update(None, "key", key)
+                    .map_err(|e| CortexError::Storage(format!("Failed to set reader encryption key: {}", e)))?;
+            }
             Self::apply_read_pragmas(&reader)?;
             read_pool.push(Mutex::new(reader));
         }

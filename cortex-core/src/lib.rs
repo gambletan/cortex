@@ -175,14 +175,24 @@ impl Cortex {
         Self::open_with_config(db_path, IndexConfig::default())
     }
 
+    /// Open or create an encrypted Cortex database.
+    /// Requires the `encrypted-db` feature (SQLCipher).
+    pub fn open_encrypted(db_path: &str, passphrase: &str) -> Result<Self, CortexError> {
+        let storage = SqliteStorage::open_with_key(db_path, Some(passphrase))?;
+        let index = MemoryIndex::with_config(IndexConfig::default());
+        Ok(Self::build(storage, index))
+    }
+
     /// Open or create a Cortex database with custom index configuration.
     /// Vector index is lazily loaded on first retrieve/get_context call for fast startup.
     pub fn open_with_config(db_path: &str, index_config: IndexConfig) -> Result<Self, CortexError> {
         let storage = SqliteStorage::open(db_path)?;
         let index = MemoryIndex::with_config(index_config);
+        Ok(Self::build(storage, index))
+    }
 
-        // Index is loaded lazily on first retrieve/get_context call
-        Ok(Self {
+    fn build(storage: SqliteStorage, index: MemoryIndex) -> Self {
+        Self {
             storage,
             index,
             working: WorkingMemory::default(),
@@ -203,34 +213,15 @@ impl Cortex {
             sync_engine: parking_lot::Mutex::new(None),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
-        })
+        }
     }
 
     /// Create an in-memory Cortex (useful for testing).
     pub fn in_memory() -> Result<Self, CortexError> {
         let storage = SqliteStorage::open_in_memory()?;
-        Ok(Self {
-            storage,
-            index: MemoryIndex::new(),
-            working: WorkingMemory::default(),
-            ingest_counter: AtomicU64::new(0),
-            decay_config: None,
-            inference_fn: None,
-            plugins: PluginManager::new(),
-            consolidation_config: ConsolidationConfig::default(),
-            auto_consolidation_interval: DEFAULT_AUTO_CONSOLIDATION_INTERVAL,
-            metrics: CortexMetrics::default(),
-            event_bus: EventBus::new(),
-            dedup_config: DeduplicationConfig::default(),
-            retrieval_cache: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(64).unwrap(),
-            )),
-            write_generation: AtomicU64::new(0),
-            index_loaded: AtomicBool::new(true), // in-memory starts empty, no need to load
-            sync_engine: parking_lot::Mutex::new(None),
-            #[cfg(feature = "embeddings")]
-            embedder: parking_lot::Mutex::new(None),
-        })
+        let mut cortex = Self::build(storage, MemoryIndex::new());
+        cortex.index_loaded = AtomicBool::new(true); // in-memory starts empty
+        Ok(cortex)
     }
 
     /// Enable cloud sync. Creates sync folder structure and subscribes to events.
