@@ -1,5 +1,7 @@
 # Cortex
 
+[English](README.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
+
 ### 隐私优先。完全免费。本地运行。— 个人 AI Agent 的记忆引擎。
 
 > **觉得 Cortex 有用？[点个 ⭐](https://github.com/gambletan/cortex/stargazers) 支持一下** — 只需 1 秒，帮助更多人发现这个项目。

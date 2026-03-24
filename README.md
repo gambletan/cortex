@@ -5,7 +5,7 @@
 
 > **If Cortex helps your AI remember, [give it a ⭐](https://github.com/gambletan/cortex/stargazers)** — it takes 1 second and helps others discover the project.
 
-[中文文档](README_CN.md)
+[中文](README_CN.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
 
 ### Private. Free. Local. — Memory engine for personal AI agents.
 
