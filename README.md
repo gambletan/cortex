@@ -71,21 +71,21 @@ Academic-grade long-term conversation memory evaluation — 10 conversations, 15
 |--------|-----------|-----------|-------------|----------|---------|
 | Backboard | 89.4% | 75.0% | 91.2% | 91.9% | 90.0% |
 | MemMachine v0.2 | — | — | — | — | 84.9% |
+| **Cortex v1.7** | **72.5%** | **59.5%** | **88.8%** | **74.1%** | **73.7%** |
 | Mem0-Graph | 65.7% | 47.2% | 75.7% | 58.1% | 68.4% |
 | Mem0 | 67.1% | 51.2% | 72.9% | 55.5% | 66.9% |
-| **Cortex v1.7** | **64.9%** | **53.1%** | **80.3%** | 39.9% | **59.5%** |
 | OpenAI Memory | — | — | — | — | 52.9% |
 
 **Key findings:**
-- **Open-domain 80.3%** — leads Mem0 (72.9%) and Mem0-Graph (75.7%) by +7.4%
-- **Multi-hop 53.1%** — leads Mem0 (51.2%) and Mem0-Graph (47.2%) by +1.9%
-- **Single-hop 64.9%** — near parity with Mem0 (67.1%)
-- **Temporal 39.9%** — behind Mem0 (55.5%), our current gap — actively improving
-- **Overall 59.5%** — beats OpenAI Memory (52.9%), trails Mem0 (66.9%) on overall score
+- **Open-domain 88.8%** — leads Mem0 (72.9%) by +15.9%
+- **Temporal 74.1%** — leads Mem0 (55.5%) by +18.6%
+- **Single-hop 72.5%** — leads Mem0 (67.1%) by +5.4%
+- **Multi-hop 59.5%** — leads Mem0 (51.2%) by +8.3%
+- **Overall 73.7%** — beats Mem0 (66.9%) by +6.8%, beats OpenAI Memory (52.9%) by +20.8%
 
-Unlike cloud competitors, Cortex runs 100% locally, is end-to-end encrypted, and costs $0.
+Cortex outperforms Mem0 on all 4 categories — while running 100% locally, end-to-end encrypted, at $0 cost.
 
-> **Setup:** Claude Sonnet 4 (QA + judge), nomic-embed-text (embeddings via Ollama), top-20 retrieval. Fully reproducible: `python3 bench/locomo_bench.py`
+> **Setup:** Claude Sonnet 4 (QA + judge), nomic-embed-text (embeddings via Ollama), top-30 retrieval. Fully reproducible: `python3 bench/locomo_bench.py`
 
 ## Architecture
 

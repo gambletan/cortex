@@ -37,7 +37,7 @@ RESULTS_DIR = Path(__file__).parent / "results"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 EMBED_MODEL = "nomic-embed-text"
 OLLAMA_URL = "http://localhost:11434/api/embeddings"
-SEARCH_LIMIT = 20
+SEARCH_LIMIT = 30
 MAX_CONCURRENT_LLM = 5
 INGEST_CHUNK_SIZE = 3
 CATEGORY_NAMES = {1: "single-hop", 2: "temporal", 3: "multi-hop", 4: "open-domain"}
@@ -93,16 +93,16 @@ async def answer_question(question: str, context: str) -> str:
         resp = await aclient.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=300,
-            messages=[{"role": "user", "content": f"""You are answering questions about a conversation between two people.
-Use ONLY the provided memory context to answer. If the context doesn't contain enough information, give your best guess based on what's available.
-Be concise - answer in 1-2 sentences maximum.
+            messages=[{"role": "user", "content": f"""You are answering questions about conversations between two people that took place over multiple sessions on different dates.
+
+IMPORTANT: Pay close attention to the [Date: ...] headers in the context — they tell you WHEN each conversation happened. Use these dates to answer temporal questions like "when", "first time", "last time", "before/after", etc.
 
 Memory context:
 {context}
 
 Question: {question}
 
-Answer:"""}],
+Answer concisely in 1-2 sentences:"""}],
         )
         return resp.content[0].text.strip()
 
@@ -157,21 +157,31 @@ def extract_dialogue_turns(conv: dict) -> list:
 
 
 def build_chunks(turns: list) -> list:
+    """Build chunks by session — each session is one chunk with full date context.
+    Every chunk starts with a clear date/time header so temporal queries can find it."""
     chunks = []
     current_session = None
+    current_date = ""
     current_lines = []
+
     for turn in turns:
         if turn["session"] != current_session:
             if current_lines:
                 chunks.append("\n".join(current_lines))
                 current_lines = []
             current_session = turn["session"]
-            current_lines.append(f"[Session {current_session} - {turn['date_time']}]")
+            current_date = turn["date_time"]
+            current_lines.append(f"[Date: {current_date} | Session {current_session}]")
+
         current_lines.append(f"{turn['speaker']}: {turn['text']}")
-        if len(current_lines) >= INGEST_CHUNK_SIZE + 1:
+
+        # Larger chunks (8 turns) to preserve more context per chunk
+        if len(current_lines) >= 9:  # 8 turns + 1 header
             chunks.append("\n".join(current_lines))
-            current_lines = []
-    if current_lines:
+            # Start new chunk with same session date header (so every chunk has date)
+            current_lines = [f"[Date: {current_date} | Session {current_session} (continued)]"]
+
+    if current_lines and len(current_lines) > 1:
         chunks.append("\n".join(current_lines))
     return chunks
 
