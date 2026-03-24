@@ -126,6 +126,51 @@ cortex.observe_belief("user_prefers_morning_meetings", false, 0.6)?;
 ### 存储
 SQLite 持久化，内存向量索引实现快速相似性搜索。单文件数据库，无需外部服务。为边缘部署设计——笔记本、树莓派、服务器都能运行。
 
+### 云同步
+
+通过你自己的云盘跨设备同步记忆——不经过任何第三方服务器。
+
+```
+设备 A (Mac)              你的云盘                      设备 B (iPhone)
+┌──────────┐         ┌──────────────────────┐         ┌──────────┐
+│ SQLite DB │ ──写──> │ iCloud / GDrive /    │ <──读── │ SQLite DB│
+│ (本地)    │         │ OneDrive / Dropbox   │         │ (本地)   │
+│           │ <──读── │                      │ ──写──> │          │
+└──────────┘         └──────────────────────┘         └──────────┘
+```
+
+- **基于变更日志**：每个设备写入自己的操作日志，互不冲突
+- **无冲突**：设备永远不会写同一个文件，使用混合逻辑时钟 (HLC) 的 Last-Writer-Wins 合并
+- **端到端加密**：AES-256-GCM 加密（可选），即使云账号被入侵，记忆仍然安全
+- **隐私感知**：Private 记忆（默认）永远不离开本地设备，只有 Shared/Public 记忆才同步
+
+支持的云盘：**iCloud Drive**、**Google Drive**、**OneDrive**、**Dropbox**（自动检测）。
+
+```rust
+use cortex_core::sync::SyncConfig;
+
+// 启用加密同步
+let config = SyncConfig::new(sync_dir, device_id, device_name)
+    .with_encryption("my-strong-passphrase");
+cortex.enable_sync(config)?;
+
+// 拉取其他设备的变更
+let applied = cortex.sync_pull()?;
+println!("应用了 {} 条远程变更", applied);
+```
+
+### 安全与隐私
+
+| 特性 | 详情 |
+|------|------|
+| **加密** | AES-256-GCM + Argon2id 密钥派生（每行随机 nonce） |
+| **隐私分级** | Private（默认，不同步）、Shared、Public |
+| **内存清零** | 敏感数据在释放时从内存中清除（`zeroize` crate） |
+| **零遥测** | 无分析、无回传。验证：`grep -r "reqwest\|hyper\|TcpStream" cortex-core/src/` |
+| **无账号** | 无需 API Key、无需注册、无云端依赖 |
+
+详见 [SECURITY.md](SECURITY.md)。
+
 ## 前置依赖
 
 安装 [Rust 工具链](https://rustup.rs/)（提供 `cargo` 命令）：
@@ -494,7 +539,8 @@ cortex/
 - **v1.3** ✅ — 上下文质量优化，查询扩展，双向关系推理，126 个测试
 - **v1.4** ✅ — 增量 HNSW，SQL 索引实体查询，LLM 摘要钩子，18 个 MCP 工具，可配置衰减，LLM 辅助推理，131 个测试
 - **v1.5** ✅ — Docker 镜像（GHCR 自动发布），功能冻结
-- **v2.0** — 跨设备同步（CRDT，无需云端），插件系统，移动端（iOS/Android）
+- **v1.7** ✅ — **云同步**（基于变更日志，HLC 排序，LWW 合并），**AES-256-GCM 加密**（Argon2id 密钥派生），**隐私执行**（Private/Shared/Public），**内存清零**（zeroize），SECURITY.md，27 个 MCP 工具，400+ 测试
+- **v2.0** — 新设备快照引导，文件系统监听（即时同步），后台同步线程，移动端（iOS/Android）
 
 ## 许可证
 

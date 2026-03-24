@@ -118,6 +118,51 @@ Generates LLM-ready context strings from memory state. Pass a token budget, opti
 ### Storage
 SQLite for persistence, in-memory vector index for fast similarity search. Single-file database, no external services required. Designed for edge deployment -- runs on a laptop, a Raspberry Pi, or a server.
 
+### Cloud Sync
+
+Sync memories across devices through your own cloud storage — no third-party server involved.
+
+```
+Device A (Mac)              Your Cloud Storage              Device B (iPhone)
+┌──────────┐         ┌──────────────────────┐         ┌──────────┐
+│ SQLite DB │ ──W──>  │ iCloud / GDrive /    │  <──R── │ SQLite DB│
+│ (local)   │         │ OneDrive / Dropbox   │         │ (local)  │
+│           │ <──R──  │                      │  ──W──> │          │
+└──────────┘         └──────────────────────┘         └──────────┘
+```
+
+- **Changelog-based**: Each device writes append-only operation logs to its own subfolder
+- **No conflicts**: Devices never write to the same file. Merge uses Last-Writer-Wins with Hybrid Logical Clocks
+- **Encrypted**: AES-256-GCM encryption (opt-in). Even if your cloud account is compromised, memories stay private
+- **Privacy-aware**: Private memories (the default) never leave your device. Only Shared/Public memories sync
+
+Supported providers: **iCloud Drive**, **Google Drive**, **OneDrive**, **Dropbox** (auto-detected).
+
+```rust
+use cortex_core::sync::SyncConfig;
+
+// Enable sync with encryption
+let config = SyncConfig::new(sync_dir, device_id, device_name)
+    .with_encryption("my-strong-passphrase");
+cortex.enable_sync(config)?;
+
+// Pull changes from other devices
+let applied = cortex.sync_pull()?;
+println!("Applied {} remote changes", applied);
+```
+
+### Security & Privacy
+
+| Feature | Detail |
+|---------|--------|
+| **Encryption** | AES-256-GCM with Argon2id key derivation (per-line random nonce) |
+| **Privacy levels** | Private (default, never syncs), Shared, Public |
+| **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
+| **Zero telemetry** | No analytics, no phone-home. Verify: `grep -r "reqwest\|hyper\|TcpStream" cortex-core/src/` |
+| **No accounts** | No API key, no registration, no cloud dependency |
+
+See [SECURITY.md](SECURITY.md) for the full threat model.
+
 ## Prerequisites
 
 Install the [Rust toolchain](https://rustup.rs/) (provides `cargo`):
@@ -425,7 +470,7 @@ Two Cortex MCP servers: `cortex-project` (project DB) and `cortex-global` (globa
 
 This gives you two independent Cortex instances per project — complete isolation with shared user knowledge.
 
-### 25 Tools
+### 27 Tools
 
 | Tool | Purpose |
 |------|---------|
@@ -447,6 +492,8 @@ This gives you two independent Cortex instances per project — complete isolati
 | `person_list` | List all known people |
 | `contradiction_check` | Check for fact contradictions |
 | `relationship_extract` | Extract relationships from text |
+| `sync_status` | Cloud sync status (provider, devices, pending ops) |
+| `sync_providers` | Detect available cloud storage providers |
 
 ## OpenClaw Plugin
 
@@ -470,6 +517,7 @@ cortex/
 │   │   ├── consolidation.rs    # Episodic→semantic promotion + decay
 │   │   ├── retrieval.rs        # Multi-signal retrieval engine
 │   │   ├── context.rs          # LLM context generation
+│   │   ├── sync/               # Cloud sync (oplog, HLC, merge, encryption)
 │   │   └── storage/            # SQLite + in-memory vector index
 │   └── benches/                # Performance benchmarks
 ├── cortex-http/          # HTTP REST API (axum, local-only)
@@ -553,7 +601,8 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.4** ✅ — Incremental HNSW, SQL-indexed entity queries, LLM summarizer hook, 18 MCP tools, configurable decay, LLM-assisted inference, 131 tests
 - **v1.5** ✅ — Docker image (GHCR auto-publish), batch ingest, dedup, namespace isolation, plugin system, event bus, archival, 351 tests
 - **v1.6** ✅ — Int8 quantization (75% storage reduction), materialized column indexes, FTS5 triggers, LRU caches (MemObject + entity-facts), rayon parallel decay, Arc embedding, generation-based cache invalidation, 25 MCP tools, batch inference, enhanced Chinese NLP
-- **v2.0** — Cross-device sync (CRDTs, no cloud), mobile (iOS/Android)
+- **v1.7** ✅ — **Cloud sync** (changelog-based, HLC ordering, LWW merge), **AES-256-GCM encryption** (Argon2id KDF), **privacy enforcement** (Private/Shared/Public), **zeroize** (memory wiping), SECURITY.md, 27 MCP tools, 400+ tests
+- **v2.0** — Snapshot bootstrap for new devices, filesystem watcher (instant sync), background sync thread, mobile targets (iOS/Android)
 
 ---
 
