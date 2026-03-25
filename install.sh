@@ -14,13 +14,14 @@ Install cortex-mcp-server from GitHub Releases.
 
 Options:
   --lite              Download lite version (no embedding model, <5MB)
-  --ide <target>      Auto-configure MCP for IDE: claude|cursor|windsurf|all
+  --ide <target>      Auto-configure MCP for IDE: claude|claude-desktop|cursor|windsurf|all
   --dir <path>        Install directory (default: ~/.local/bin)
   -h, --help          Show this help
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --lite --ide claude
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --ide claude
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --lite --ide all
 EOF
   exit 0
 }
@@ -95,13 +96,29 @@ configure_ide() {
 
   case "${ide}" in
     claude)
-      local config_dir="${HOME}/.claude"
+      # Use claude CLI to register MCP server (global scope)
+      if command -v claude >/dev/null 2>&1; then
+        claude mcp add cortex-memory --scope user -- "${binary}" "${db_path}" 2>/dev/null && \
+          echo "Registered cortex-memory MCP server (claude mcp add --scope user)" || \
+          echo "Warning: 'claude mcp add' failed — register manually: claude mcp add cortex-memory --scope user -- ${binary} ${db_path}"
+      else
+        echo "Claude Code CLI not found. Register manually:"
+        echo "  claude mcp add cortex-memory --scope user -- ${binary} ${db_path}"
+      fi
+      # Ensure ~/.cortex directory exists
+      mkdir -p "${HOME}/.cortex"
+      ;;
+    claude-desktop)
+      local config_dir
+      case "$(uname -s)" in
+        Darwin) config_dir="${HOME}/Library/Application Support/Claude" ;;
+        *)      config_dir="${HOME}/.config/claude" ;;
+      esac
       local config_file="${config_dir}/claude_desktop_config.json"
       mkdir -p "${config_dir}"
       if [ -f "${config_file}" ]; then
-        # Merge using python3 (available on macOS and most Linux)
         python3 -c "
-import json, sys
+import json
 try:
     with open('${config_file}') as f:
         config = json.load(f)
@@ -114,7 +131,7 @@ config['mcpServers']['cortex-memory'] = {
 }
 with open('${config_file}', 'w') as f:
     json.dump(config, f, indent=2)
-print('Configured Claude Code MCP: ${config_file}')
+print('Configured Claude Desktop MCP: ${config_file}')
 "
       else
         cat > "${config_file}" <<CONF
@@ -127,7 +144,7 @@ print('Configured Claude Code MCP: ${config_file}')
   }
 }
 CONF
-        echo "Created Claude Code MCP config: ${config_file}"
+        echo "Created Claude Desktop MCP config: ${config_file}"
       fi
       ;;
     cursor)
@@ -207,7 +224,7 @@ CONF
 
 if [ -n "${IDE}" ]; then
   if [ "${IDE}" = "all" ]; then
-    for target in claude cursor windsurf; do
+    for target in claude claude-desktop cursor windsurf; do
       configure_ide "${target}" || true
     done
   else
@@ -224,5 +241,16 @@ if ! echo "${PATH}" | grep -q "${INSTALL_DIR}"; then
 fi
 
 echo ""
-echo "Done! If you find Cortex useful, please star the repo:"
-echo "  https://github.com/${REPO} ⭐"
+echo "============================================"
+echo "  Cortex installed successfully!"
+echo "============================================"
+echo ""
+if [ -n "${IDE}" ]; then
+  echo "Next steps:"
+  echo "  1. Start a new Claude Code session"
+  echo "  2. Say: \"Enable cross-device memory sync\""
+  echo "  3. Save the passphrase for your other devices"
+  echo ""
+fi
+echo "If you find Cortex useful, please star the repo:"
+echo "  https://github.com/${REPO}"
