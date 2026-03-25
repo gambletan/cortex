@@ -261,8 +261,11 @@ impl Cortex {
 
     /// Start background sync: periodic polling + filesystem watcher.
     /// Sync must be enabled first via `enable_sync()`.
-    /// Calling this again while already running will stop the previous background sync.
-    pub fn start_background_sync(&self) -> Result<(), CortexError> {
+    ///
+    /// Uses a channel-based design: the watcher and timer send "pull requested"
+    /// signals, the background thread calls `sync_pull()` through a callback
+    /// that captures only Arc-wrapped data (no raw pointers, no UB on move).
+    pub fn start_background_sync(self: &std::sync::Arc<Self>) -> Result<(), CortexError> {
         let guard = self.sync_engine.lock();
         let engine_ref = guard.as_ref()
             .ok_or_else(|| CortexError::InvalidInput("Sync not enabled. Call enable_sync() first.".into()))?;
@@ -275,26 +278,6 @@ impl Cortex {
             handle.stop();
         }
 
-        // We need Arc wrappers for the background threads.
-        // Since Cortex owns storage/index directly, we create Arcs that reference
-        // them through a thin clone-friendly wrapper. For SyncEngine we already
-        // have it behind a Mutex.
-        //
-        // SAFETY: The background sync handle is stopped before Cortex is dropped
-        // (via Drop or explicit stop), so these pointers remain valid.
-        let storage_ptr = &self.storage as *const SqliteStorage;
-        let index_ptr = &self.index as *const MemoryIndex;
-        let engine_ptr = &self.sync_engine as *const parking_lot::Mutex<Option<crate::sync::SyncEngine>>;
-
-        // We use a shared-ownership wrapper via Arc so the threads can hold references.
-        // Create Arc<SqliteStorage> and Arc<MemoryIndex> by wrapping raw pointers
-        // behind a safe abstraction.
-        //
-        // Instead of unsafe, we'll use a channel-based approach: the background
-        // threads send "pull requested" signals, and we process them here.
-        // Actually, the cleanest approach is to accept that start_background_sync
-        // needs Arc-wrapped fields. Let's use a simpler approach: spawn a single
-        // thread that holds the pulling logic via a closure.
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
 
@@ -303,10 +286,9 @@ impl Cortex {
         let notify_tx_clone = notify_tx.clone();
 
         // Start filesystem watcher
-        let devices_dir = config.devices_dir();
         let watcher_handle = crate::sync::watcher::start_watcher(
             crate::sync::watcher::WatcherConfig {
-                watch_dir: devices_dir,
+                watch_dir: config.devices_dir(),
                 device_id: config.device_id.clone(),
                 debounce: std::time::Duration::from_secs(2),
             },
@@ -315,66 +297,51 @@ impl Cortex {
             }),
         )?;
 
-        // Start polling + notification thread
-        // We use raw pointers safely: the thread is guaranteed to be joined
-        // before Cortex is dropped (via BackgroundSyncHandle Drop).
+        // Use Weak<Cortex> — does NOT prevent Drop. Thread auto-exits when Cortex is dropped.
+        let cortex_weak = std::sync::Arc::downgrade(self);
         let poll_interval = config.poll_interval();
-        let poll_thread = {
-            let storage_raw = storage_ptr as usize;
-            let index_raw = index_ptr as usize;
-            let engine_raw = engine_ptr as usize;
 
-            std::thread::Builder::new()
-                .name("cortex-bg-sync".into())
-                .spawn(move || {
-                    // SAFETY: These pointers are valid for the lifetime of this thread,
-                    // which is joined in BackgroundSyncHandle::drop before Cortex is dropped.
-                    let storage = unsafe { &*(storage_raw as *const SqliteStorage) };
-                    let index = unsafe { &*(index_raw as *const MemoryIndex) };
-                    let engine_mutex = unsafe {
-                        &*(engine_raw as *const parking_lot::Mutex<Option<crate::sync::SyncEngine>>)
+        let poll_thread = std::thread::Builder::new()
+            .name("cortex-bg-sync".into())
+            .spawn(move || {
+                let mut last_poll = std::time::Instant::now();
+                loop {
+                    if stop_clone.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+
+                    let remaining = poll_interval.saturating_sub(last_poll.elapsed());
+                    let timeout = remaining.min(std::time::Duration::from_millis(200));
+
+                    let should_pull = match notify_rx.recv_timeout(timeout) {
+                        Ok(()) => true,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            last_poll.elapsed() >= poll_interval
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     };
 
-                    let mut last_poll = std::time::Instant::now();
+                    while notify_rx.try_recv().is_ok() {}
 
-                    loop {
-                        if stop_clone.load(std::sync::atomic::Ordering::Acquire) {
-                            break;
-                        }
-
-                        // Wait for either a watcher notification or poll interval timeout
-                        let remaining = poll_interval.saturating_sub(last_poll.elapsed());
-                        let timeout = remaining.min(std::time::Duration::from_millis(200));
-
-                        let should_pull = match notify_rx.recv_timeout(timeout) {
-                            Ok(()) => true, // watcher triggered
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                last_poll.elapsed() >= poll_interval
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        };
-
-                        // Drain any queued notifications
-                        while notify_rx.try_recv().is_ok() {}
-
-                        if should_pull {
-                            last_poll = std::time::Instant::now();
-                            let mut guard = engine_mutex.lock();
-                            if let Some(ref mut engine) = *guard {
-                                match engine.pull_remote(storage, index) {
+                    if should_pull {
+                        last_poll = std::time::Instant::now();
+                        // Upgrade Weak → Arc. If Cortex was dropped, exit thread.
+                        match cortex_weak.upgrade() {
+                            Some(cortex) => {
+                                match cortex.sync_pull() {
                                     Ok(0) => {}
                                     Ok(n) => tracing::info!(applied = n, "Background sync: pulled changes"),
                                     Err(e) => tracing::warn!(error = %e, "Background sync: pull failed"),
                                 }
                             }
+                            None => break, // Cortex dropped, exit
                         }
                     }
-                    tracing::debug!("Background sync thread exiting");
-                })
-                .map_err(|e| CortexError::Storage(format!("Failed to spawn bg sync thread: {}", e)))?
-        };
+                }
+                tracing::debug!("Background sync thread exiting");
+            })
+            .map_err(|e| CortexError::Storage(format!("Failed to spawn bg sync thread: {}", e)))?;
 
-        // Store handle using a simple wrapper
         *bg_guard = Some(crate::sync::BackgroundSyncHandle::new(
             stop_flag,
             poll_thread,
@@ -1314,5 +1281,13 @@ impl Cortex {
                 _ => {}
             }
         }
+    }
+}
+
+impl Drop for Cortex {
+    fn drop(&mut self) {
+        // CRITICAL: Stop background sync thread BEFORE fields it references are dropped.
+        // The background thread holds raw pointers to storage/index/sync_engine.
+        self.stop_background_sync();
     }
 }

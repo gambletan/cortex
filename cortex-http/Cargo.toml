@@ -18,5 +18,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 clap = { version = "4", features = ["derive", "env"] }

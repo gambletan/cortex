@@ -63,6 +63,33 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> AppResult {
     })))
 }
 
+// ── Recent Memories ──────────────────────────────────────────────────────────
+
+pub async fn recent_memories(State(state): State<Arc<AppState>>) -> AppResult {
+    let mems = state.cortex.storage()
+        .list_by_tier_ordered_by_ingestion(cortex_core::types::MemoryTier::Episodic, 20)
+        .map_err(cortex_err)?;
+
+    let results: Vec<serde_json::Value> = mems.iter().map(|m| {
+        let text = match &m.content {
+            cortex_core::types::MemContent::Text(t) => t.clone(),
+            cortex_core::types::MemContent::Fact { subject, predicate, object } => format!("{} {} {}", subject, predicate, object),
+            cortex_core::types::MemContent::Preference { key, value, .. } => format!("{} = {}", key, value),
+            other => format!("{:?}", other),
+        };
+        json!({
+            "id": m.id.to_string(),
+            "text": text,
+            "tier": m.tier.as_str(),
+            "channel": m.source.channel,
+            "created_at": m.temporal.ingestion_time.to_rfc3339(),
+            "score": m.salience.effective_score,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "results": results })))
+}
+
 // ── Ingest ───────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

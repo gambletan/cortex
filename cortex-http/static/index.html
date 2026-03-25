@@ -641,13 +641,7 @@ async function loadPeople() {
 }
 
 async function loadRecentMemories() {
-  // Use search with a broad query to get recent memories
-  const data = await apiFetch("/v1/memories/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: "*", limit: 20 }),
-  });
-
+  const data = await apiFetch("/v1/memories/recent");
   if (data && data.results) {
     renderMemoryList(data.results, false);
   } else {

@@ -8,7 +8,7 @@ use axum::{
     Router,
     routing::{get, post},
 };
-use tower_http::services::ServeDir;
+// Dashboard HTML is embedded via include_str! — no ServeDir needed
 use clap::Parser;
 use tracing::info;
 
@@ -67,24 +67,8 @@ async fn main() {
     let cortex = Cortex::open(&db_path).expect("failed to open cortex database");
     let state = Arc::new(AppState { cortex });
 
-    // Resolve the static directory relative to the executable, falling back to compile-time path.
-    let static_dir = {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let candidates = [
-            exe_dir.as_ref().map(|d| d.join("static")),
-            exe_dir.as_ref().map(|d| d.join("../static")),
-            Some(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static"))),
-        ];
-        candidates
-            .into_iter()
-            .flatten()
-            .find(|p| p.is_dir())
-            .unwrap_or_else(|| std::path::PathBuf::from("static"))
-    };
-
-    info!(path = %static_dir.display(), "serving static files");
+    // Dashboard HTML is embedded at compile time — works in installed binaries.
+    const DASHBOARD_HTML: &str = include_str!("../static/index.html");
 
     let app = Router::new()
         // Health
@@ -104,6 +88,8 @@ async fn main() {
         // Beliefs
         .route("/v1/beliefs", get(handlers::list_beliefs))
         .route("/v1/beliefs/observe", post(handlers::observe_belief))
+        // Recent memories (for dashboard)
+        .route("/v1/memories/recent", get(handlers::recent_memories))
         // People
         .route("/v1/people", get(handlers::list_people).post(handlers::resolve_person))
         // Import/Export
@@ -113,8 +99,10 @@ async fn main() {
         .route("/v1/memories/compress", post(handlers::compress))
         .route("/v1/relationships/extract", post(handlers::extract_relationships))
         .with_state(state)
-        // Serve static files (dashboard) — fallback so API routes take priority
-        .fallback_service(ServeDir::new(&static_dir))
+        // Dashboard — embedded HTML, no external files needed
+        .route("/", get(|| async {
+            axum::response::Html(DASHBOARD_HTML)
+        }))
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
