@@ -329,6 +329,32 @@ Email    ─┤  (ingest)                 │  (retrieve + inject)
 Calendar ─┘                          └─ Response
 ```
 
+## Integration with LangGraph
+
+Add persistent memory to any [LangGraph](https://github.com/langchain-ai/langgraph) agent via [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters) — no custom code needed.
+
+```python
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(model="gpt-4o")
+
+async with MultiServerMCPClient({
+    "cortex": {
+        "command": "cortex-mcp-server",
+        "args": ["~/.cortex/memory.db"]
+    }
+}) as client:
+    agent = create_react_agent(model, client.get_tools())
+    # Agent now has all 29 Cortex memory tools
+    result = await agent.ainvoke({
+        "messages": [{"role": "user", "content": "What do you remember about Alice?"}]
+    })
+```
+
+Your LangGraph agent gets instant access to memory_search, memory_ingest, fact_add, belief_observe, person_resolve, and 24 more tools — all running locally.
+
 ## Integration with DeerFlow (ByteDance)
 
 Cortex works as a persistent memory layer for [DeerFlow](https://github.com/bytedance/deer-flow) — ByteDance's open-source multi-agent orchestration platform. Zero code changes needed.
