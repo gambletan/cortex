@@ -11,6 +11,7 @@ pub mod oplog;
 pub mod provider;
 pub mod snapshot;
 pub mod state;
+pub mod watcher;
 
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::sqlite::SqliteStorage;
@@ -22,6 +23,8 @@ use crate::CortexError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -71,7 +74,7 @@ impl SyncConfig {
         Duration::from_secs(self.poll_interval_secs)
     }
 
-    fn devices_dir(&self) -> PathBuf {
+    pub fn devices_dir(&self) -> PathBuf {
         self.sync_dir.join("devices")
     }
 
@@ -401,5 +404,134 @@ impl SyncEngine {
 
     pub fn config(&self) -> &SyncConfig {
         &self.config
+    }
+
+    /// Start background sync: a polling thread that calls `pull_remote()` on the
+    /// configured interval, plus a filesystem watcher that triggers immediate pulls
+    /// when remote .jsonl files change (with 2-second debounce).
+    ///
+    /// The returned `BackgroundSyncHandle` stops both when `stop()` is called or on drop.
+    pub fn start_background_sync(
+        config: SyncConfig,
+        storage: Arc<SqliteStorage>,
+        index: Arc<MemoryIndex>,
+        engine: Arc<parking_lot::Mutex<SyncEngine>>,
+    ) -> Result<BackgroundSyncHandle, CortexError> {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // --- Polling thread ---
+        let poll_stop = stop_flag.clone();
+        let poll_storage = storage.clone();
+        let poll_index = index.clone();
+        let poll_engine = engine.clone();
+        let poll_interval = config.poll_interval();
+
+        let poll_thread = std::thread::Builder::new()
+            .name("cortex-sync-poll".into())
+            .spawn(move || {
+                tracing::info!(interval = ?poll_interval, "Background sync polling started");
+                while !poll_stop.load(Ordering::Acquire) {
+                    // Sleep in small increments so we can check the stop flag
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < poll_interval {
+                        if poll_stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+
+                    if poll_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let mut guard = poll_engine.lock();
+                    match guard.pull_remote(&poll_storage, &poll_index) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(applied = n, "Background sync: pulled remote changes"),
+                        Err(e) => tracing::warn!(error = %e, "Background sync: pull failed"),
+                    }
+                }
+                tracing::debug!("Background sync polling thread exiting");
+            })
+            .map_err(|e| CortexError::Storage(format!("Failed to spawn poll thread: {}", e)))?;
+
+        // --- Filesystem watcher ---
+        let watch_stop = stop_flag.clone();
+        let watch_storage = storage;
+        let watch_index = index;
+        let watch_engine = engine;
+
+        let watcher_handle = watcher::start_watcher(
+            watcher::WatcherConfig {
+                watch_dir: config.devices_dir(),
+                device_id: config.device_id.clone(),
+                debounce: Duration::from_secs(2),
+            },
+            Box::new(move || {
+                if watch_stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let mut guard = watch_engine.lock();
+                match guard.pull_remote(&watch_storage, &watch_index) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(applied = n, "Watcher sync: pulled remote changes"),
+                    Err(e) => tracing::warn!(error = %e, "Watcher sync: pull failed"),
+                }
+            }),
+        )?;
+
+        Ok(BackgroundSyncHandle {
+            stop_flag,
+            poll_thread: Some(poll_thread),
+            watcher_handle: Some(watcher_handle),
+        })
+    }
+}
+
+/// Handle for stopping background sync (polling + filesystem watcher).
+pub struct BackgroundSyncHandle {
+    stop_flag: Arc<AtomicBool>,
+    poll_thread: Option<std::thread::JoinHandle<()>>,
+    watcher_handle: Option<watcher::WatcherHandle>,
+}
+
+impl BackgroundSyncHandle {
+    /// Create a new handle from pre-built components.
+    pub fn new(
+        stop_flag: Arc<AtomicBool>,
+        poll_thread: std::thread::JoinHandle<()>,
+        watcher_handle: watcher::WatcherHandle,
+    ) -> Self {
+        Self {
+            stop_flag,
+            poll_thread: Some(poll_thread),
+            watcher_handle: Some(watcher_handle),
+        }
+    }
+
+    /// Stop both the polling thread and the filesystem watcher.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    /// Check if background sync is still running.
+    pub fn is_running(&self) -> bool {
+        !self.stop_flag.load(Ordering::Acquire)
+    }
+
+    fn shutdown(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(wh) = self.watcher_handle.take() {
+            wh.stop();
+        }
+        if let Some(th) = self.poll_thread.take() {
+            let _ = th.join();
+        }
+    }
+}
+
+impl Drop for BackgroundSyncHandle {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

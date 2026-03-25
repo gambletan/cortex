@@ -165,6 +165,8 @@ pub struct Cortex {
     index_loaded: AtomicBool,
     /// Cloud sync engine (opt-in, default disabled).
     sync_engine: parking_lot::Mutex<Option<crate::sync::SyncEngine>>,
+    /// Handle for background sync (polling + filesystem watcher).
+    background_sync_handle: parking_lot::Mutex<Option<crate::sync::BackgroundSyncHandle>>,
     #[cfg(feature = "embeddings")]
     embedder: parking_lot::Mutex<Option<Option<crate::embedder::Embedder>>>,
 }
@@ -211,6 +213,7 @@ impl Cortex {
             write_generation: AtomicU64::new(0),
             index_loaded: AtomicBool::new(false),
             sync_engine: parking_lot::Mutex::new(None),
+            background_sync_handle: parking_lot::Mutex::new(None),
             #[cfg(feature = "embeddings")]
             embedder: parking_lot::Mutex::new(None), // lazy init on first use
         }
@@ -253,6 +256,139 @@ impl Cortex {
             if let Err(e) = engine.record_memory_event(event, &self.storage) {
                 tracing::warn!(error = %e, "Failed to record sync event");
             }
+        }
+    }
+
+    /// Start background sync: periodic polling + filesystem watcher.
+    /// Sync must be enabled first via `enable_sync()`.
+    /// Calling this again while already running will stop the previous background sync.
+    pub fn start_background_sync(&self) -> Result<(), CortexError> {
+        let guard = self.sync_engine.lock();
+        let engine_ref = guard.as_ref()
+            .ok_or_else(|| CortexError::InvalidInput("Sync not enabled. Call enable_sync() first.".into()))?;
+        let config = engine_ref.config().clone();
+        drop(guard);
+
+        // Stop any existing background sync
+        let mut bg_guard = self.background_sync_handle.lock();
+        if let Some(handle) = bg_guard.take() {
+            handle.stop();
+        }
+
+        // We need Arc wrappers for the background threads.
+        // Since Cortex owns storage/index directly, we create Arcs that reference
+        // them through a thin clone-friendly wrapper. For SyncEngine we already
+        // have it behind a Mutex.
+        //
+        // SAFETY: The background sync handle is stopped before Cortex is dropped
+        // (via Drop or explicit stop), so these pointers remain valid.
+        let storage_ptr = &self.storage as *const SqliteStorage;
+        let index_ptr = &self.index as *const MemoryIndex;
+        let engine_ptr = &self.sync_engine as *const parking_lot::Mutex<Option<crate::sync::SyncEngine>>;
+
+        // We use a shared-ownership wrapper via Arc so the threads can hold references.
+        // Create Arc<SqliteStorage> and Arc<MemoryIndex> by wrapping raw pointers
+        // behind a safe abstraction.
+        //
+        // Instead of unsafe, we'll use a channel-based approach: the background
+        // threads send "pull requested" signals, and we process them here.
+        // Actually, the cleanest approach is to accept that start_background_sync
+        // needs Arc-wrapped fields. Let's use a simpler approach: spawn a single
+        // thread that holds the pulling logic via a closure.
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+
+        // Channel for watcher notifications
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel::<()>();
+        let notify_tx_clone = notify_tx.clone();
+
+        // Start filesystem watcher
+        let devices_dir = config.devices_dir();
+        let watcher_handle = crate::sync::watcher::start_watcher(
+            crate::sync::watcher::WatcherConfig {
+                watch_dir: devices_dir,
+                device_id: config.device_id.clone(),
+                debounce: std::time::Duration::from_secs(2),
+            },
+            Box::new(move || {
+                let _ = notify_tx_clone.send(());
+            }),
+        )?;
+
+        // Start polling + notification thread
+        // We use raw pointers safely: the thread is guaranteed to be joined
+        // before Cortex is dropped (via BackgroundSyncHandle Drop).
+        let poll_interval = config.poll_interval();
+        let poll_thread = {
+            let storage_raw = storage_ptr as usize;
+            let index_raw = index_ptr as usize;
+            let engine_raw = engine_ptr as usize;
+
+            std::thread::Builder::new()
+                .name("cortex-bg-sync".into())
+                .spawn(move || {
+                    // SAFETY: These pointers are valid for the lifetime of this thread,
+                    // which is joined in BackgroundSyncHandle::drop before Cortex is dropped.
+                    let storage = unsafe { &*(storage_raw as *const SqliteStorage) };
+                    let index = unsafe { &*(index_raw as *const MemoryIndex) };
+                    let engine_mutex = unsafe {
+                        &*(engine_raw as *const parking_lot::Mutex<Option<crate::sync::SyncEngine>>)
+                    };
+
+                    let mut last_poll = std::time::Instant::now();
+
+                    loop {
+                        if stop_clone.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+
+                        // Wait for either a watcher notification or poll interval timeout
+                        let remaining = poll_interval.saturating_sub(last_poll.elapsed());
+                        let timeout = remaining.min(std::time::Duration::from_millis(200));
+
+                        let should_pull = match notify_rx.recv_timeout(timeout) {
+                            Ok(()) => true, // watcher triggered
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                last_poll.elapsed() >= poll_interval
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
+
+                        // Drain any queued notifications
+                        while notify_rx.try_recv().is_ok() {}
+
+                        if should_pull {
+                            last_poll = std::time::Instant::now();
+                            let mut guard = engine_mutex.lock();
+                            if let Some(ref mut engine) = *guard {
+                                match engine.pull_remote(storage, index) {
+                                    Ok(0) => {}
+                                    Ok(n) => tracing::info!(applied = n, "Background sync: pulled changes"),
+                                    Err(e) => tracing::warn!(error = %e, "Background sync: pull failed"),
+                                }
+                            }
+                        }
+                    }
+                    tracing::debug!("Background sync thread exiting");
+                })
+                .map_err(|e| CortexError::Storage(format!("Failed to spawn bg sync thread: {}", e)))?
+        };
+
+        // Store handle using a simple wrapper
+        *bg_guard = Some(crate::sync::BackgroundSyncHandle::new(
+            stop_flag,
+            poll_thread,
+            watcher_handle,
+        ));
+
+        Ok(())
+    }
+
+    /// Stop background sync if running.
+    pub fn stop_background_sync(&self) {
+        let mut guard = self.background_sync_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.stop();
         }
     }
 

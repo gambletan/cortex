@@ -257,6 +257,22 @@ You: "Turns out Sarah moved to Anthropic last month."
 
 All of this happens **locally in <1ms per operation**. No cloud. No API calls. No one else sees your data.
 
+## Install
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap gambletan/tap
+brew install cortex-mcp-server
+```
+
+### From source
+
+```bash
+cargo build --release -p cortex-mcp-server
+cp target/release/cortex-mcp-server ~/.local/bin/
+```
+
 ## Quick Start
 
 ```rust

@@ -46,6 +46,23 @@ pub async fn health() -> Json<Value> {
     }))
 }
 
+// ── Stats ────────────────────────────────────────────────────────────────────
+
+pub async fn stats(State(state): State<Arc<AppState>>) -> AppResult {
+    let s = state.cortex.stats().map_err(cortex_err)?;
+
+    Ok(Json(json!({
+        "total": s.total,
+        "episodic": s.episodic,
+        "semantic": s.semantic,
+        "procedural": s.procedural,
+        "archived": s.archived,
+        "people": s.people,
+        "beliefs": s.beliefs,
+        "index_size": s.index_size,
+    })))
+}
+
 // ── Ingest ───────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -370,6 +387,25 @@ pub async fn observe_belief(
 }
 
 // ── People ───────────────────────────────────────────────────────────────────
+
+pub async fn list_people(State(state): State<Arc<AppState>>) -> AppResult {
+    let people = state.cortex.list_people().map_err(cortex_err)?;
+
+    let items: Vec<Value> = people
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id.to_string(),
+                "name": p.display_name,
+                "identities": p.identities.iter().map(|i| {
+                    json!({ "channel": i.channel, "user_id": i.channel_user_id })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "people": items, "total": items.len() })))
+}
 
 #[derive(Deserialize)]
 pub struct ResolvePersonRequest {

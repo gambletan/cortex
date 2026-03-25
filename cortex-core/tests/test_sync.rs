@@ -5,6 +5,7 @@ use cortex_core::sync::merge;
 use cortex_core::sync::oplog::{self, SyncOp, SyncPayload};
 use cortex_core::sync::provider;
 use cortex_core::sync::state::{self, EntityType};
+use cortex_core::sync::watcher;
 use cortex_core::sync::{SyncConfig, SyncEngine};
 use cortex_core::types::*;
 use cortex_core::Cortex;
@@ -1012,4 +1013,64 @@ fn test_privacy_level_is_syncable() {
     assert!(!PrivacyLevel::Private.is_syncable());
     assert!(PrivacyLevel::Public.is_syncable());
     assert!((PrivacyLevel::Shared { scope: "all".into() }).is_syncable());
+}
+
+// ── Background sync / watcher tests ──────────────────────────────────────────
+
+#[test]
+fn test_background_sync_detects_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let devices_dir = tmp.path().join("devices");
+    std::fs::create_dir_all(&devices_dir).unwrap();
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = call_count.clone();
+
+    // Start the watcher with a short debounce for testing
+    let handle = watcher::start_watcher(
+        watcher::WatcherConfig {
+            watch_dir: devices_dir.clone(),
+            device_id: "device-a".to_string(),
+            debounce: Duration::from_millis(500),
+        },
+        Box::new(move || {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        }),
+    )
+    .unwrap();
+
+    // Give the watcher time to start
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Simulate a remote device writing an oplog file
+    let remote_dir = devices_dir.join("device-b");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Write a .jsonl file (simulating a remote oplog entry)
+    std::fs::write(
+        remote_dir.join("oplog-001.jsonl"),
+        "{\"test\": true}\n",
+    )
+    .unwrap();
+
+    // Wait for debounce + processing time
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let count = call_count.load(Ordering::SeqCst);
+    assert!(
+        count >= 1,
+        "Expected watcher callback to fire at least once, got {}",
+        count
+    );
+
+    // Verify watcher is still running
+    assert!(handle.is_running());
+
+    // Stop the watcher
+    handle.stop();
 }

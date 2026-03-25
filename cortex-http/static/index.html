@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cortex Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --purple: #bc8cff;
+    --red: #f85149;
+    --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ── Header ─────────────────────────────────────────────────── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text);
+    font-family: var(--mono);
+  }
+
+  header h1 span { color: var(--accent); }
+
+  .header-stats {
+    display: flex;
+    gap: 20px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+
+  .header-stat {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .header-stat .label { color: var(--text-dim); }
+  .header-stat .value { color: var(--accent); font-weight: 600; }
+
+  .health-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    display: inline-block;
+  }
+  .health-dot.ok { background: var(--green); }
+  .health-dot.err { background: var(--red); }
+
+  /* ── Layout ─────────────────────────────────────────────────── */
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px 24px;
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    gap: 20px;
+  }
+
+  @media (max-width: 800px) {
+    .container { grid-template-columns: 1fr; }
+  }
+
+  /* ── Panels ─────────────────────────────────────────────────── */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+  }
+
+  .panel-body { padding: 16px; }
+
+  /* ── Search ─────────────────────────────────────────────────── */
+  .search-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+
+  .search-bar input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--mono);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .search-bar input:focus { border-color: var(--accent); }
+
+  .search-bar input::placeholder { color: var(--text-dim); }
+
+  .search-bar button {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 6px;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+  }
+
+  .search-bar button:hover { opacity: 0.85; }
+
+  /* ── Memory list ────────────────────────────────────────────── */
+  .memory-list { display: flex; flex-direction: column; gap: 1px; }
+
+  .memory-item {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    cursor: default;
+    transition: background 0.1s;
+  }
+
+  .memory-item:hover { background: rgba(88, 166, 255, 0.04); }
+  .memory-item:last-child { border-bottom: none; }
+
+  .memory-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-size: 12px;
+  }
+
+  .tier-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .tier-episodic { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+  .tier-semantic { background: rgba(188, 140, 255, 0.15); color: var(--purple); }
+  .tier-procedural { background: rgba(210, 153, 34, 0.15); color: var(--orange); }
+  .tier-archived { background: rgba(139, 148, 158, 0.15); color: var(--text-dim); }
+
+  .memory-time {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+
+  .memory-channel {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+
+  .memory-score {
+    margin-left: auto;
+    color: var(--green);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .memory-text {
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+  }
+
+  .memory-id {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    margin-top: 4px;
+  }
+
+  /* ── Stats panel ────────────────────────────────────────────── */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .stat-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    text-align: center;
+  }
+
+  .stat-card .stat-value {
+    font-family: var(--mono);
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  .stat-card .stat-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 2px;
+  }
+
+  .stat-card.episodic .stat-value { color: var(--accent); }
+  .stat-card.semantic .stat-value { color: var(--purple); }
+  .stat-card.procedural .stat-value { color: var(--orange); }
+  .stat-card.people .stat-value { color: var(--green); }
+  .stat-card.beliefs .stat-value { color: var(--orange); }
+  .stat-card.total .stat-value { color: var(--text); }
+
+  /* ── Beliefs list ───────────────────────────────────────────── */
+  .belief-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+
+  .belief-item:last-child { border-bottom: none; }
+
+  .belief-key {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-right: 8px;
+  }
+
+  .belief-prob {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--purple);
+    white-space: nowrap;
+  }
+
+  /* ── People list ────────────────────────────────────────────── */
+  .person-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+
+  .person-item:last-child { border-bottom: none; }
+
+  .person-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .person-name { font-weight: 500; }
+
+  .person-channels {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  /* ── Sync panel ─────────────────────────────────────────────── */
+  .sync-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    font-size: 13px;
+    font-family: var(--mono);
+  }
+
+  .sync-label { color: var(--text-dim); font-size: 12px; }
+  .sync-value { color: var(--text); font-size: 12px; }
+
+  /* ── Empty / loading states ─────────────────────────────────── */
+  .empty-state {
+    text-align: center;
+    padding: 32px 16px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+
+  .loading { opacity: 0.5; }
+
+  .error-msg {
+    color: var(--red);
+    font-size: 12px;
+    font-family: var(--mono);
+    padding: 8px 0;
+  }
+
+  /* ── Sidebar stacking ───────────────────────────────────────── */
+  .sidebar { display: flex; flex-direction: column; gap: 20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>&gt;</span> cortex dashboard</h1>
+  <div class="header-stats">
+    <div class="header-stat">
+      <span class="health-dot" id="health-dot"></span>
+      <span class="label">status</span>
+      <span class="value" id="health-status">--</span>
+    </div>
+    <div class="header-stat">
+      <span class="label">memories</span>
+      <span class="value" id="header-total">--</span>
+    </div>
+    <div class="header-stat">
+      <span class="label">people</span>
+      <span class="value" id="header-people">--</span>
+    </div>
+    <div class="header-stat">
+      <span class="label">beliefs</span>
+      <span class="value" id="header-beliefs">--</span>
+    </div>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- ── Main column ──────────────────────────────────────────── -->
+  <div class="main-col">
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="Search memories..." />
+      <button id="search-btn">Search</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header" id="memory-panel-header">Recent Memories</div>
+      <div class="memory-list" id="memory-list">
+        <div class="empty-state">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Sidebar ──────────────────────────────────────────────── -->
+  <div class="sidebar">
+
+    <!-- Stats -->
+    <div class="panel">
+      <div class="panel-header">Memory Stats</div>
+      <div class="panel-body">
+        <div class="stat-grid">
+          <div class="stat-card total">
+            <div class="stat-value" id="stat-total">--</div>
+            <div class="stat-label">Total</div>
+          </div>
+          <div class="stat-card episodic">
+            <div class="stat-value" id="stat-episodic">--</div>
+            <div class="stat-label">Episodic</div>
+          </div>
+          <div class="stat-card semantic">
+            <div class="stat-value" id="stat-semantic">--</div>
+            <div class="stat-label">Semantic</div>
+          </div>
+          <div class="stat-card procedural">
+            <div class="stat-value" id="stat-procedural">--</div>
+            <div class="stat-label">Procedural</div>
+          </div>
+          <div class="stat-card people">
+            <div class="stat-value" id="stat-people">--</div>
+            <div class="stat-label">People</div>
+          </div>
+          <div class="stat-card beliefs">
+            <div class="stat-value" id="stat-beliefs">--</div>
+            <div class="stat-label">Beliefs</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Beliefs -->
+    <div class="panel">
+      <div class="panel-header">Beliefs</div>
+      <div class="panel-body" id="beliefs-list">
+        <div class="empty-state">Loading...</div>
+      </div>
+    </div>
+
+    <!-- People -->
+    <div class="panel">
+      <div class="panel-header">People</div>
+      <div class="panel-body" id="people-list">
+        <div class="empty-state">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Sync Status -->
+    <div class="panel">
+      <div class="panel-header">Sync Status</div>
+      <div class="panel-body" id="sync-panel">
+        <div class="empty-state">Loading...</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+
+// ── Helpers ───────────────────────────────────────────────────
+
+async function apiFetch(path, options) {
+  try {
+    const res = await fetch(API + path, options);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error(`API error: ${path}`, e);
+    return null;
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function timeAgo(iso) {
+  const d = new Date(iso);
+  const now = Date.now();
+  const diff = (now - d.getTime()) / 1000;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  if (diff < 604800) return Math.floor(diff / 86400) + "d ago";
+  return d.toLocaleDateString();
+}
+
+function tierClass(tier) {
+  const t = (tier || "").toLowerCase();
+  if (t === "episodic") return "tier-episodic";
+  if (t === "semantic") return "tier-semantic";
+  if (t === "procedural") return "tier-procedural";
+  if (t === "archived") return "tier-archived";
+  return "tier-episodic";
+}
+
+// ── Render functions ──────────────────────────────────────────
+
+function renderMemoryList(items, isSearch) {
+  const el = document.getElementById("memory-list");
+  const header = document.getElementById("memory-panel-header");
+
+  if (!items || items.length === 0) {
+    el.innerHTML = '<div class="empty-state">No memories found</div>';
+    header.textContent = isSearch ? "Search Results (0)" : "Recent Memories";
+    return;
+  }
+
+  header.textContent = isSearch
+    ? `Search Results (${items.length})`
+    : `Recent Memories (${items.length})`;
+
+  el.innerHTML = items.map(m => `
+    <div class="memory-item">
+      <div class="memory-meta">
+        <span class="tier-badge ${tierClass(m.tier)}">${escapeHtml(m.tier || "episodic")}</span>
+        <span class="memory-time">${timeAgo(m.created_at)}</span>
+        ${m.channel ? `<span class="memory-channel">#${escapeHtml(m.channel)}</span>` : ""}
+        ${m.score != null ? `<span class="memory-score">${(m.score * 100).toFixed(0)}%</span>` : ""}
+      </div>
+      <div class="memory-text">${escapeHtml(m.text || "")}</div>
+      <div class="memory-id">${escapeHtml(m.id || "")}</div>
+    </div>
+  `).join("");
+}
+
+function renderStats(stats) {
+  if (!stats) return;
+  document.getElementById("stat-total").textContent = stats.total ?? "--";
+  document.getElementById("stat-episodic").textContent = stats.episodic ?? "--";
+  document.getElementById("stat-semantic").textContent = stats.semantic ?? "--";
+  document.getElementById("stat-procedural").textContent = stats.procedural ?? "--";
+  document.getElementById("stat-people").textContent = stats.people ?? "--";
+  document.getElementById("stat-beliefs").textContent = stats.beliefs ?? "--";
+
+  document.getElementById("header-total").textContent = stats.total ?? "--";
+  document.getElementById("header-people").textContent = stats.people ?? "--";
+  document.getElementById("header-beliefs").textContent = stats.beliefs ?? "--";
+}
+
+function renderBeliefs(data) {
+  const el = document.getElementById("beliefs-list");
+  if (!data || !data.beliefs || data.beliefs.length === 0) {
+    el.innerHTML = '<div class="empty-state">No beliefs recorded</div>';
+    return;
+  }
+  el.innerHTML = data.beliefs.map(b => `
+    <div class="belief-item">
+      <span class="belief-key">${escapeHtml(b.key)}</span>
+      <span class="belief-prob">${(b.probability * 100).toFixed(0)}%</span>
+    </div>
+  `).join("");
+}
+
+function renderPeople(data) {
+  const el = document.getElementById("people-list");
+  if (!data || !data.people || data.people.length === 0) {
+    el.innerHTML = '<div class="empty-state">No people tracked</div>';
+    return;
+  }
+  el.innerHTML = data.people.map(p => {
+    const initials = (p.name || "?").split(/\s+/).map(w => w[0]).join("").toUpperCase().slice(0, 2);
+    const channels = (p.identities || []).map(i => i.channel).join(", ");
+    return `
+      <div class="person-item">
+        <div class="person-avatar">${escapeHtml(initials)}</div>
+        <span class="person-name">${escapeHtml(p.name)}</span>
+        <span class="person-channels">${escapeHtml(channels)}</span>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderSync(health) {
+  const el = document.getElementById("sync-panel");
+  if (!health) {
+    el.innerHTML = '<div class="empty-state">Cannot reach server</div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="sync-row">
+      <span class="sync-label">Engine</span>
+      <span class="sync-value">${escapeHtml(health.engine || "cortex")}</span>
+    </div>
+    <div class="sync-row">
+      <span class="sync-label">Version</span>
+      <span class="sync-value">${escapeHtml(health.version || "unknown")}</span>
+    </div>
+    <div class="sync-row">
+      <span class="sync-label">Status</span>
+      <span class="sync-value">${escapeHtml(health.status || "unknown")}</span>
+    </div>
+    <div class="sync-row">
+      <span class="sync-label">Host</span>
+      <span class="sync-value">${escapeHtml(window.location.host)}</span>
+    </div>
+  `;
+}
+
+// ── Data loading ──────────────────────────────────────────────
+
+async function loadHealth() {
+  const data = await apiFetch("/health");
+  const dot = document.getElementById("health-dot");
+  const status = document.getElementById("health-status");
+  if (data && data.status === "ok") {
+    dot.className = "health-dot ok";
+    status.textContent = "online";
+  } else {
+    dot.className = "health-dot err";
+    status.textContent = "offline";
+  }
+  renderSync(data);
+}
+
+async function loadStats() {
+  const data = await apiFetch("/v1/stats");
+  renderStats(data);
+}
+
+async function loadBeliefs() {
+  const data = await apiFetch("/v1/beliefs?threshold=0.0");
+  renderBeliefs(data);
+}
+
+async function loadPeople() {
+  const data = await apiFetch("/v1/people");
+  renderPeople(data);
+}
+
+async function loadRecentMemories() {
+  // Use search with a broad query to get recent memories
+  const data = await apiFetch("/v1/memories/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "*", limit: 20 }),
+  });
+
+  if (data && data.results) {
+    renderMemoryList(data.results, false);
+  } else {
+    renderMemoryList([], false);
+  }
+}
+
+async function doSearch(query) {
+  if (!query.trim()) {
+    loadRecentMemories();
+    return;
+  }
+
+  document.getElementById("memory-list").innerHTML =
+    '<div class="empty-state loading">Searching...</div>';
+
+  const data = await apiFetch("/v1/memories/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: query, limit: 25 }),
+  });
+
+  if (data && data.results) {
+    renderMemoryList(data.results, true);
+  } else {
+    renderMemoryList([], true);
+  }
+}
+
+// ── Event listeners ───────────────────────────────────────────
+
+document.getElementById("search-btn").addEventListener("click", () => {
+  doSearch(document.getElementById("search-input").value);
+});
+
+document.getElementById("search-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doSearch(e.target.value);
+});
+
+// ── Init ──────────────────────────────────────────────────────
+
+async function init() {
+  await Promise.all([
+    loadHealth(),
+    loadStats(),
+    loadBeliefs(),
+    loadPeople(),
+    loadRecentMemories(),
+  ]);
+}
+
+init();
+
+// Refresh stats every 30 seconds
+setInterval(() => {
+  loadHealth();
+  loadStats();
+}, 30000);
+</script>
+
+</body>
+</html>
