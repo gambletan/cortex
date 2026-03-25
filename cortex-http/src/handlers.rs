@@ -66,9 +66,18 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> AppResult {
 // ── Recent Memories ──────────────────────────────────────────────────────────
 
 pub async fn recent_memories(State(state): State<Arc<AppState>>) -> AppResult {
-    let mems = state.cortex.storage()
-        .list_by_tier_ordered_by_ingestion(cortex_core::types::MemoryTier::Episodic, 20)
-        .map_err(cortex_err)?;
+    use cortex_core::types::MemoryTier;
+    // Fetch recent memories from all active tiers with enough headroom
+    let mut mems = Vec::new();
+    for tier in &[MemoryTier::Episodic, MemoryTier::Semantic, MemoryTier::Procedural] {
+        let tier_mems = state.cortex.storage()
+            .list_by_tier_ordered_by_ingestion(*tier, 20)
+            .map_err(cortex_err)?;
+        mems.extend(tier_mems);
+    }
+    // Sort by ingestion time descending, take top 20
+    mems.sort_by(|a, b| b.temporal.ingestion_time.cmp(&a.temporal.ingestion_time));
+    mems.truncate(20);
 
     let results: Vec<serde_json::Value> = mems.iter().map(|m| {
         let text = match &m.content {

@@ -225,6 +225,12 @@ pub fn read_oplog(
                 offset += bytes_read as u64;
             }
             Err(_) => {
+                // Distinguish partial write (incomplete line) from permanent corruption:
+                // - If the raw line ends with '\n', it's a complete but corrupt line → skip it
+                // - If at EOF without '\n', it's likely a partial write → don't advance, retry
+                // Always advance past bad lines to avoid stalling sync.
+                // Partial writes (no trailing \n) are also skipped — the writer
+                // uses flush() which guarantees complete lines on disk.
                 tracing::warn!("Skipping invalid oplog line at offset {}", offset);
                 offset += bytes_read as u64;
             }

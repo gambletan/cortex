@@ -304,6 +304,15 @@ impl Cortex {
         let poll_thread = std::thread::Builder::new()
             .name("cortex-bg-sync".into())
             .spawn(move || {
+                // Pull once immediately to catch any pre-existing remote changes.
+                if let Some(cortex) = cortex_weak.upgrade() {
+                    match cortex.sync_pull() {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(applied = n, "Background sync: initial pull"),
+                        Err(e) => tracing::warn!(error = %e, "Background sync: initial pull failed"),
+                    }
+                }
+
                 let mut last_poll = std::time::Instant::now();
                 loop {
                     if stop_clone.load(std::sync::atomic::Ordering::Acquire) {
@@ -1286,8 +1295,12 @@ impl Cortex {
 
 impl Drop for Cortex {
     fn drop(&mut self) {
-        // CRITICAL: Stop background sync thread BEFORE fields it references are dropped.
-        // The background thread holds raw pointers to storage/index/sync_engine.
-        self.stop_background_sync();
+        // Stop background sync. Set the stop flag so the thread exits on its own,
+        // but only join if we're NOT on the bg sync thread (avoids self-join deadlock
+        // when the thread's Weak upgrade creates the last Arc and Drop runs there).
+        let mut guard = self.background_sync_handle.lock();
+        if let Some(mut handle) = guard.take() {
+            handle.signal_stop(); // set flag, don't join
+        }
     }
 }

@@ -43,4 +43,6 @@ ENV CORTEX_PORT=3315
 
 EXPOSE 3315
 
+# HTTP mode (default): docker run -p 3315:3315 image
+# MCP stdio mode:      docker run --entrypoint cortex-mcp-server image /data/memory.db
 ENTRYPOINT ["cortex-http"]

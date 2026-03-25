@@ -7,15 +7,19 @@
     "url": "https://github.com/gambletan/cortex",
     "source": "github"
   },
-  "version": "1.5.1",
+  "version": "1.8.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/gambletan/cortex:v1.5.1",
+      "identifier": "ghcr.io/gambletan/cortex/cortex-http:1.8.0",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": {
+        "CORTEX_DB_PATH": "/data/memory.db"
+      },
+      "entrypoint": ["cortex-mcp-server", "/data/memory.db"]
     }
   ]
 }

@@ -519,6 +519,17 @@ impl BackgroundSyncHandle {
         !self.stop_flag.load(Ordering::Acquire)
     }
 
+    /// Signal stop without joining the thread. Safe to call from any thread
+    /// including the background sync thread itself (avoids self-join deadlock).
+    pub fn signal_stop(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(wh) = self.watcher_handle.take() {
+            wh.stop();
+        }
+        // Don't join — thread will exit on its own when it checks stop_flag
+        // or when Weak::upgrade fails.
+    }
+
     fn shutdown(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
         if let Some(wh) = self.watcher_handle.take() {
@@ -532,6 +543,12 @@ impl BackgroundSyncHandle {
 
 impl Drop for BackgroundSyncHandle {
     fn drop(&mut self) {
-        self.shutdown();
+        // Check if we're on the bg sync thread — if so, only signal (no join).
+        let is_bg_thread = std::thread::current().name() == Some("cortex-bg-sync");
+        if is_bg_thread {
+            self.signal_stop();
+        } else {
+            self.shutdown();
+        }
     }
 }

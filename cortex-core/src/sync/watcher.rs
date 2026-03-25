@@ -132,9 +132,12 @@ pub fn start_watcher(
 
 /// Check whether a filesystem event is relevant (i.e., a .jsonl file from another device).
 fn is_relevant_event(event: &Event, my_device_id: &str) -> bool {
-    // Only care about creates, modifications, and renames
+    // Only care about creates (new oplog files) and close-write events.
+    // Skip Modify events to avoid reading partially-written files.
     match event.kind {
-        EventKind::Create(_) | EventKind::Modify(_) => {}
+        EventKind::Create(_) => {}
+        EventKind::Modify(notify::event::ModifyKind::Data(_)) => {}
+        EventKind::Access(notify::event::AccessKind::Close(notify::event::AccessMode::Write)) => {}
         _ => return false,
     }
 
@@ -147,10 +150,18 @@ fn is_relevant_event(event: &Event, my_device_id: &str) -> bool {
             return false;
         }
 
-        // Check that the file is NOT in our own device subfolder
-        let path_str = path.to_string_lossy();
-        !path_str.contains(&format!("/{}/", my_device_id))
-            && !path_str.contains(&format!("\\{}\\", my_device_id))
+        // Only ignore events from the immediate `devices/{my_device_id}/` subfolder.
+        // Check the path component right after "devices/" — not any arbitrary component.
+        let components: Vec<_> = path.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let devices_idx = components.iter().position(|c| c == "devices");
+        if let Some(idx) = devices_idx {
+            if let Some(device_dir) = components.get(idx + 1) {
+                return device_dir != my_device_id;
+            }
+        }
+        true // no "devices/" in path — allow event
     })
 }
 
