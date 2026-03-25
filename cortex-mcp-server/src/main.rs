@@ -116,7 +116,10 @@ enum Command {
     /// Show memory statistics
     Stats,
     /// Show cloud sync status and detected providers
-    Sync,
+    Sync {
+        #[command(subcommand)]
+        action: Option<SyncAction>,
+    },
     /// Export all data as JSON
     Export {
         /// Output file (default: stdout)
@@ -130,6 +133,24 @@ enum Command {
     },
     /// Show version, DB path, and capabilities
     Info,
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    /// Enable cloud sync (auto-detects provider, generates passphrase)
+    Enable {
+        /// Cloud provider: icloud, gdrive, onedrive, dropbox (auto-detect if omitted)
+        #[arg(short, long)]
+        provider: Option<String>,
+        /// Encryption passphrase (generated if omitted)
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Device name (defaults to hostname)
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Pull remote changes from other devices
+    Pull,
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
@@ -248,10 +269,32 @@ fn ensure_db_dir(db_path: &str) {
     }
 }
 
+/// Show a one-time star prompt on first interactive CLI use.
+fn maybe_show_star_prompt() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let marker = format!("{home}/.cortex/.star-prompted");
+    if std::path::Path::new(&marker).exists() {
+        return;
+    }
+    // Ensure directory exists
+    let _ = std::fs::create_dir_all(format!("{home}/.cortex"));
+    eprintln!();
+    eprintln!("  ⭐ Enjoying Cortex? Star us on GitHub — it helps others find the project:");
+    eprintln!("     https://github.com/gambletan/cortex");
+    eprintln!();
+    // Write marker so we only show this once
+    let _ = std::fs::write(&marker, "prompted");
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
     let cli = Cli::parse();
+
+    // Show star prompt for interactive CLI commands (not MCP server)
+    if cli.command.is_some() {
+        maybe_show_star_prompt();
+    }
 
     match cli.command {
         Some(Command::Ingest { text, channel }) => {
@@ -312,39 +355,119 @@ fn main() {
                 }
             }
         }
-        Some(Command::Sync) => {
+        Some(Command::Sync { action }) => {
             let db_path = resolve_db_path(cli.db_path.as_deref());
             ensure_db_dir(&db_path);
-
-            // Detect providers
-            let providers = cortex_core::sync::provider::detect_all_providers();
-            println!("Cloud Sync Status");
-            println!("=================");
-            if providers.is_empty() {
-                println!("No cloud providers detected.");
-                println!("Install iCloud Drive, Google Drive, OneDrive, or Dropbox.");
-            } else {
-                println!("Detected providers:");
-                for p in &providers {
-                    let exists = if p.sync_dir.exists() { "✅" } else { "📁" };
-                    println!("  {} {} → {}", exists, p.provider.as_str(), p.sync_dir.display());
-                }
-            }
-
-            // Check if sync is configured for this DB
             let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
                 eprintln!("Error opening database: {e}");
                 std::process::exit(1);
             });
-            match cortex.sync_status() {
-                Some(status) => {
-                    println!("\nActive sync:");
-                    println!("  Device:  {} ({})", status.device_name, status.device_id);
-                    println!("  Dir:     {}", status.sync_dir);
-                    println!("  Remotes: {}", status.remote_devices.len());
+
+            match action {
+                Some(SyncAction::Enable { provider, passphrase, name }) => {
+                    use cortex_core::sync::{SyncConfig, provider::{detect_all_providers, CloudProvider}};
+
+                    let providers = detect_all_providers();
+                    let detected = if let Some(ref pname) = provider {
+                        let target = match pname.to_lowercase().as_str() {
+                            "icloud" => CloudProvider::ICloud,
+                            "gdrive" | "googledrive" | "google_drive" => CloudProvider::GoogleDrive,
+                            "onedrive" => CloudProvider::OneDrive,
+                            "dropbox" => CloudProvider::Dropbox,
+                            _ => {
+                                eprintln!("Unknown provider: {pname}. Use: icloud, gdrive, onedrive, dropbox");
+                                std::process::exit(1);
+                            }
+                        };
+                        providers.into_iter()
+                            .find(|p| std::mem::discriminant(&p.provider) == std::mem::discriminant(&target))
+                            .unwrap_or_else(|| {
+                                eprintln!("{} not found on this machine", target.as_str());
+                                std::process::exit(1);
+                            })
+                    } else {
+                        providers.into_iter().next().unwrap_or_else(|| {
+                            eprintln!("No cloud providers detected. Install iCloud Drive, Google Drive, OneDrive, or Dropbox.");
+                            std::process::exit(1);
+                        })
+                    };
+
+                    let device_name = name.unwrap_or_else(|| {
+                        hostname::get()
+                            .ok()
+                            .and_then(|h| h.into_string().ok())
+                            .unwrap_or_else(|| "unknown-device".into())
+                    });
+                    let device_id = uuid::Uuid::new_v4().to_string();
+
+                    let pass = passphrase.unwrap_or_else(|| {
+                        use std::fmt::Write;
+                        let bytes: [u8; 24] = std::array::from_fn(|_| rand::random());
+                        let mut s = String::with_capacity(48);
+                        for b in &bytes {
+                            let _ = write!(s, "{:02x}", b);
+                        }
+                        s
+                    });
+
+                    let config = SyncConfig::new(detected.sync_dir.clone(), device_id.clone(), device_name.clone())
+                        .with_encryption(&pass);
+
+                    cortex.enable_sync(config).unwrap_or_else(|e| {
+                        eprintln!("Error enabling sync: {e}");
+                        std::process::exit(1);
+                    });
+
+                    let pulled = cortex.sync_pull().unwrap_or(0);
+
+                    println!("Sync enabled!");
+                    println!("  Provider:   {}", detected.provider.as_str());
+                    println!("  Sync dir:   {}", detected.sync_dir.display());
+                    println!("  Device:     {} ({})", device_name, device_id);
+                    println!("  Encryption: AES-256-GCM");
+                    println!("  Passphrase: {}", pass);
+                    println!("  Pulled:     {} remote changes", pulled);
+                    println!();
+                    println!("IMPORTANT: Save the passphrase above!");
+                    println!("You'll need it when setting up sync on another device.");
+                }
+                Some(SyncAction::Pull) => {
+                    let applied = cortex.sync_pull().unwrap_or_else(|e| {
+                        eprintln!("Error pulling: {e}");
+                        std::process::exit(1);
+                    });
+                    if applied > 0 {
+                        println!("Applied {} remote changes.", applied);
+                    } else {
+                        println!("Already up to date.");
+                    }
                 }
                 None => {
-                    println!("\nSync not enabled for this database.");
+                    // Default: show status
+                    let providers = cortex_core::sync::provider::detect_all_providers();
+                    println!("Cloud Sync Status");
+                    println!("=================");
+                    if providers.is_empty() {
+                        println!("No cloud providers detected.");
+                        println!("Install iCloud Drive, Google Drive, OneDrive, or Dropbox.");
+                    } else {
+                        println!("Detected providers:");
+                        for p in &providers {
+                            let exists = if p.sync_dir.exists() { "✅" } else { "📁" };
+                            println!("  {} {} → {}", exists, p.provider.as_str(), p.sync_dir.display());
+                        }
+                    }
+                    match cortex.sync_status() {
+                        Some(status) => {
+                            println!("\nActive sync:");
+                            println!("  Device:  {} ({})", status.device_name, status.device_id);
+                            println!("  Dir:     {}", status.sync_dir);
+                            println!("  Remotes: {}", status.remote_devices.len());
+                        }
+                        None => {
+                            println!("\nSync not enabled. Run: cortex-mcp-server sync enable");
+                        }
+                    }
                 }
             }
         }
