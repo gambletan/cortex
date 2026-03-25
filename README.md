@@ -329,6 +329,21 @@ Email    ─┤  (ingest)                 │  (retrieve + inject)
 Calendar ─┘                          └─ Response
 ```
 
+## Integration with DeerFlow (ByteDance)
+
+Cortex works as a persistent memory layer for [DeerFlow](https://github.com/bytedance/deer-flow) — ByteDance's open-source multi-agent orchestration platform. Zero code changes needed.
+
+```yaml
+# Add to DeerFlow config.yaml
+mcp_servers:
+  cortex-memory:
+    command: cortex-mcp-server
+    args:
+      - ~/.cortex/deerflow.db
+```
+
+All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 29 memory tools — cross-session memory, fact storage, people graph, and belief tracking across all channels.
+
 ## MCP Server (Claude Code / Claude Desktop)
 
 Cortex ships as an MCP server — works with any MCP-compatible client.
