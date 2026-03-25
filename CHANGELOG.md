@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.8.0 — Cross-Device Memory Sync
+
+### One-Click Sync Setup
+- `sync_enable` MCP tool: auto-detects cloud provider, generates device ID, AES-256-GCM passphrase
+- `sync_pull` MCP tool: pull and apply remote changes from other devices
+- `sync_status` now shows real sync state (device ID, provider, remote devices)
+- CLI: `cortex-mcp-server sync enable` / `sync pull` subcommands
+
+### Improved Install
+- `--ide claude` now uses `claude mcp add` (correct Claude Code registration)
+- New `--ide claude-desktop` for Claude Desktop app
+- Post-install next steps guide
+
+### Documentation
+- Cross-device sync section in README (EN + CN)
+- Japanese (README_JA.md) and Korean (README_KO.md) translations
+- Configurable MCP server name via `CORTEX_SERVER_NAME` env var
+
+### Stats
+- 29 MCP tools, 485+ tests
+
 ## v1.7.0 — Private. Free. Local.
 
 ### Cloud Sync
