@@ -462,6 +462,35 @@ fn list_tools_builtin() -> Value {
             }
         },
         {
+            "name": "sync_enable",
+            "description": "Enable cross-device cloud sync. Auto-detects cloud provider (iCloud/Google Drive/OneDrive/Dropbox), generates device ID, and starts syncing. Optionally encrypts with AES-256-GCM. Returns the passphrase (user must save it for other devices).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "Cloud provider: 'icloud', 'gdrive', 'onedrive', 'dropbox'. If omitted, auto-detects the first available."
+                    },
+                    "passphrase": {
+                        "type": "string",
+                        "description": "Encryption passphrase for AES-256-GCM. If omitted, a random one is generated and returned."
+                    },
+                    "device_name": {
+                        "type": "string",
+                        "description": "Human-readable device name (default: hostname)"
+                    }
+                }
+            }
+        },
+        {
+            "name": "sync_pull",
+            "description": "Pull and apply remote changes from other devices. Call periodically or after enabling sync to fetch new memories from other devices.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
             "name": "sync_status",
             "description": "Show cloud sync status: enabled/disabled, provider, connected devices, pending operations.",
             "inputSchema": {
@@ -508,7 +537,9 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_restore" => tool_memory_restore(cortex, args),
         "namespace_list" => tool_namespace_list(cortex),
         "person_merge" => tool_person_merge(cortex, args),
-        "sync_status" => tool_sync_status(),
+        "sync_enable" => tool_sync_enable(cortex, args),
+        "sync_pull" => tool_sync_pull(cortex),
+        "sync_status" => tool_sync_status(cortex),
         "sync_providers" => tool_sync_providers(),
         _ => {
             // Fallback to plugin-registered tools
@@ -1085,34 +1116,125 @@ fn tool_person_merge(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Strin
 
 // ── Sync tools ───────────────────────────────────────────────────────────────
 
-fn tool_sync_status() -> Result<String, String> {
-    // For Phase 1: report detected providers and sync readiness
-    let providers = cortex_core::sync::provider::detect_all_providers();
-    if providers.is_empty() {
-        Ok(json!({
-            "enabled": false,
-            "status": "no_providers_detected",
-            "message": "No cloud storage providers found. Install iCloud Drive, Google Drive, OneDrive, or Dropbox.",
-        }).to_string())
+fn tool_sync_enable(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    use cortex_core::sync::{SyncConfig, provider::{detect_all_providers, CloudProvider}};
+
+    // Resolve provider
+    let providers = detect_all_providers();
+    let requested = get_str(args, "provider");
+
+    let detected = if let Some(name) = requested {
+        let target = match name.to_lowercase().as_str() {
+            "icloud" => CloudProvider::ICloud,
+            "gdrive" | "googledrive" | "google_drive" => CloudProvider::GoogleDrive,
+            "onedrive" => CloudProvider::OneDrive,
+            "dropbox" => CloudProvider::Dropbox,
+            _ => return Err(format!("Unknown provider: {name}. Use: icloud, gdrive, onedrive, dropbox")),
+        };
+        providers.into_iter()
+            .find(|p| std::mem::discriminant(&p.provider) == std::mem::discriminant(&target))
+            .ok_or_else(|| format!("{} not found on this machine", target.as_str()))?
     } else {
-        let detected: Vec<serde_json::Value> = providers.iter().map(|p| {
-            json!({
-                "provider": p.provider.as_str(),
-                "sync_dir": p.sync_dir.display().to_string(),
-            })
-        }).collect();
-        Ok(json!({
-            "enabled": false,
-            "status": "ready",
-            "message": "Cloud providers detected. Use sync_enable to start syncing.",
-            "available_providers": detected,
-        }).to_string())
+        providers.into_iter().next()
+            .ok_or("No cloud providers detected. Install iCloud Drive, Google Drive, OneDrive, or Dropbox.")?
+    };
+
+    // Device name: arg > hostname > "unknown"
+    let device_name = get_str(args, "device_name")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "unknown-device".into())
+        });
+
+    // Device ID: random UUID
+    let device_id = Uuid::new_v4().to_string();
+
+    // Passphrase: arg or generate random 48-char hex
+    let passphrase = get_str(args, "passphrase")
+        .map(String::from)
+        .unwrap_or_else(|| {
+            use std::fmt::Write;
+            let bytes: [u8; 24] = std::array::from_fn(|_| rand::random::<u8>());
+            let mut s = String::with_capacity(48);
+            for b in &bytes {
+                let _ = write!(s, "{:02x}", b);
+            }
+            s
+        });
+
+    let config = SyncConfig::new(detected.sync_dir.clone(), device_id.clone(), device_name.clone())
+        .with_encryption(&passphrase);
+
+    cortex.enable_sync(config).map_err(|e| e.to_string())?;
+
+    // Do an initial pull
+    let pulled = cortex.sync_pull().unwrap_or(0);
+
+    Ok(json!({
+        "status": "enabled",
+        "provider": detected.provider.as_str(),
+        "sync_dir": detected.sync_dir.display().to_string(),
+        "device_id": device_id,
+        "device_name": device_name,
+        "encryption": true,
+        "passphrase": passphrase,
+        "remote_changes_applied": pulled,
+        "message": "Sync enabled! IMPORTANT: Save the passphrase — you need it on other devices."
+    }).to_string())
+}
+
+fn tool_sync_pull(cortex: &Arc<Cortex>) -> Result<String, String> {
+    let applied = cortex.sync_pull().map_err(|e| e.to_string())?;
+    Ok(json!({
+        "applied": applied,
+        "status": if applied > 0 { "changes_applied" } else { "up_to_date" },
+    }).to_string())
+}
+
+fn tool_sync_status(cortex: &Arc<Cortex>) -> Result<String, String> {
+    match cortex.sync_status() {
+        Some(status) => {
+            Ok(json!({
+                "enabled": true,
+                "device_id": status.device_id,
+                "device_name": status.device_name,
+                "provider": status.provider,
+                "sync_dir": status.sync_dir,
+                "remote_devices": status.remote_devices,
+            }).to_string())
+        }
+        None => {
+            let providers = cortex_core::sync::provider::detect_all_providers();
+            if providers.is_empty() {
+                Ok(json!({
+                    "enabled": false,
+                    "status": "no_providers_detected",
+                    "message": "No cloud storage providers found. Install iCloud Drive, Google Drive, OneDrive, or Dropbox.",
+                }).to_string())
+            } else {
+                let detected: Vec<Value> = providers.iter().map(|p| {
+                    json!({
+                        "provider": p.provider.as_str(),
+                        "sync_dir": p.sync_dir.display().to_string(),
+                    })
+                }).collect();
+                Ok(json!({
+                    "enabled": false,
+                    "status": "ready",
+                    "message": "Cloud providers detected. Use sync_enable to start syncing.",
+                    "available_providers": detected,
+                }).to_string())
+            }
+        }
     }
 }
 
 fn tool_sync_providers() -> Result<String, String> {
     let providers = cortex_core::sync::provider::detect_all_providers();
-    let items: Vec<serde_json::Value> = providers.iter().map(|p| {
+    let items: Vec<Value> = providers.iter().map(|p| {
         json!({
             "provider": p.provider.as_str(),
             "sync_dir": p.sync_dir.display().to_string(),
