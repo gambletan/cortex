@@ -54,7 +54,7 @@
       <button onclick="quickIngest('I prefer dark mode and use neovim')">⚙️ "I prefer dark mode, use neovim"</button>
       <button onclick="quickIngest('Met Alice at the Rust meetup yesterday')">👤 "Met Alice at Rust meetup"</button>
       <button onclick="quickIngest('I\\'m a software engineer with 10 years experience')">💼 "I'm a software engineer"</button>
-      <button onclick="cortex.observe_belief('user_is_dev', true, 0.8); addLog('belief', 'Updated belief: user_is_dev → ' + (cortex.observe_belief('user_is_dev', true, 0.8)*100).toFixed(0) + '%'); refreshStats()">🧪 Observe belief</button>
+      <button onclick="var p = cortex.observe_belief('user_is_dev', true, 0.8); addLog('belief', 'Updated belief: user_is_dev → ' + (p*100).toFixed(0) + '%'); refreshStats()">🧪 Observe belief</button>
     </div>
   </div>
 
@@ -155,8 +155,10 @@ function refreshStats() {
 
 function addLog(type, msg) {
   const el = document.getElementById('log');
-  const cls = type === 'fact' ? 'log-fact' : 'log-entry';
-  el.innerHTML = `<div class="${cls}">${msg}</div>` + el.innerHTML;
+  const div = document.createElement('div');
+  div.className = type === 'fact' ? 'log-fact' : 'log-entry';
+  div.textContent = msg; // textContent — safe from XSS
+  el.prepend(div);
 }
 
 function escapeHtml(s) {

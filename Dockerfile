@@ -14,10 +14,13 @@ COPY cortex-core/ cortex-core/
 COPY cortex-http/ cortex-http/
 COPY cortex-mcp-server/ cortex-mcp-server/
 
-# Stub out cortex-python so workspace resolves without Python deps
+# Stub out cortex-python and cortex-wasm so workspace resolves without their deps
 RUN mkdir -p cortex-python/src && \
     printf '[package]\nname = "cortex-python"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\npath = "src/lib.rs"' > cortex-python/Cargo.toml && \
-    echo '' > cortex-python/src/lib.rs
+    echo '' > cortex-python/src/lib.rs && \
+    mkdir -p cortex-wasm/src && \
+    printf '[package]\nname = "cortex-wasm"\nversion = "2.0.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\npath = "src/lib.rs"' > cortex-wasm/Cargo.toml && \
+    echo '' > cortex-wasm/src/lib.rs
 
 # Build release binaries (HTTP server + MCP server)
 RUN cargo build --release -p cortex-http -p cortex-mcp-server

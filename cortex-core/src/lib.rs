@@ -177,6 +177,11 @@ impl Cortex {
         Self::open_with_config(db_path, IndexConfig::default())
     }
 
+    /// Open and wrap in Arc (needed for `start_background_sync`).
+    pub fn open_arc(db_path: &str) -> Result<std::sync::Arc<Self>, CortexError> {
+        Ok(std::sync::Arc::new(Self::open(db_path)?))
+    }
+
     /// Open or create an encrypted Cortex database.
     /// Requires the `encrypted-db` feature (SQLCipher).
     pub fn open_encrypted(db_path: &str, passphrase: &str) -> Result<Self, CortexError> {

@@ -155,7 +155,7 @@ fn is_relevant_event(event: &Event, my_device_id: &str) -> bool {
         let components: Vec<_> = path.components()
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .collect();
-        let devices_idx = components.iter().position(|c| c == "devices");
+        let devices_idx = components.iter().rposition(|c| c == "devices");
         if let Some(idx) = devices_idx {
             if let Some(device_dir) = components.get(idx + 1) {
                 return device_dir != my_device_id;
