@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.gambletan/cortex",
+  "title": "Cortex Memory Engine",
+  "description": "Local-first AI memory engine with 4-tier memory model (working/episodic/semantic/procedural), people graph, and Bayesian belief tracking. 27 MCP tools. Rust binary, sub-millisecond operations, AES-256-GCM encrypted.",
+  "repository": {
+    "url": "https://github.com/gambletan/cortex",
+    "source": "github"
+  },
+  "version": "1.5.1",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/gambletan/cortex:v1.5.1",
+      "runtimeHint": "docker",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

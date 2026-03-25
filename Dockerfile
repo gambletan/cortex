@@ -19,8 +19,8 @@ RUN mkdir -p cortex-python/src && \
     printf '[package]\nname = "cortex-python"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\npath = "src/lib.rs"' > cortex-python/Cargo.toml && \
     echo '' > cortex-python/src/lib.rs
 
-# Build release binary
-RUN cargo build --release -p cortex-http
+# Build release binaries (HTTP server + MCP server)
+RUN cargo build --release -p cortex-http -p cortex-mcp-server
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -30,6 +30,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/cortex-http /usr/local/bin/cortex-http
+COPY --from=builder /src/target/release/cortex-mcp-server /usr/local/bin/cortex-mcp-server
+
+# MCP Registry ownership verification
+LABEL io.modelcontextprotocol.server.name="io.github.gambletan/cortex"
 
 # Data volume for SQLite persistence
 VOLUME /data
