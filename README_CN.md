@@ -422,6 +422,51 @@ Claude Desktop — 添加到 `~/Library/Application Support/Claude/claude_deskto
 - 定期：调用 memory_consolidate 清理过期记忆
 ```
 
+### 跨设备记忆同步
+
+你的 Claude 记忆跟随你到所有设备——MacBook、iMac、工作电脑——通过你自己的云盘同步。
+
+**一句话开启同步：**
+```
+你："帮我开启跨设备记忆同步"
+
+Claude 调用 sync_enable → 自动检测 iCloud Drive →
+  生成设备 ID + AES-256-GCM 加密密钥 → 完成。
+
+输出：
+  云盘：     iCloud Drive
+  加密：     AES-256-GCM
+  密码短语： a1b2c3...  ← 保存好，其他设备要用
+```
+
+**在第二台设备上**，同样安装 Cortex，然后：
+```
+你："用密码 a1b2c3... 开启同步"
+
+Claude 调用 sync_enable(passphrase: "a1b2c3...") →
+  连接同一个 iCloud 同步目录 → 拉取所有记忆。
+
+两台设备共享同一份记忆。偏好、事实、信念、社交图谱——全部实时同步。
+```
+
+**什么会同步，什么不会：**
+- Private 记忆（默认）**永远不离开本地** — 只有 Shared/Public 记忆同步
+- 所有同步数据 **AES-256-GCM 加密** — 即使云账号被入侵，记忆仍然安全
+- 不需要服务器、API、账号 — 只用你自己的云盘
+
+**CLI 方式：**
+```bash
+# 设备 A
+cortex-mcp-server sync enable
+# 保存输出中的密码短语
+
+# 设备 B
+cortex-mcp-server sync enable --passphrase "设备A的密码短语"
+
+# 手动拉取
+cortex-mcp-server sync pull
+```
+
 ### 多项目隔离
 
 跨多个项目工作？使用**独立数据库**实现物理级记忆隔离 — 零跨项目泄漏，无需改代码。

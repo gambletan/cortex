@@ -428,6 +428,52 @@ Add to `~/.claude/settings.json`:
 
 Now every new Claude Code session automatically loads your memory context — **zero manual effort**. Claude learns as you work and remembers across sessions.
 
+### Cross-Device Memory Sync
+
+Your Claude's memory follows you across all your devices — MacBook, iMac, work laptop — through your own cloud storage.
+
+**Enable sync (one command):**
+```
+You: "Enable cross-device memory sync"
+
+Claude calls sync_enable → auto-detects iCloud Drive →
+  generates device ID + AES-256-GCM encryption key → done.
+
+Output:
+  Provider:   iCloud Drive
+  Encryption: AES-256-GCM
+  Passphrase: a1b2c3...  ← save this for your other devices
+```
+
+**On your second device**, install Cortex the same way, then:
+```
+You: "Enable sync with passphrase a1b2c3..."
+
+Claude calls sync_enable(passphrase: "a1b2c3...") →
+  connects to the same iCloud sync folder → pulls all memories.
+
+Now both devices share the same memory. Preferences, facts,
+beliefs, people graph — all synced in real-time.
+```
+
+**What syncs and what doesn't:**
+- Private memories (default) **never leave your device** — only Shared/Public memories sync
+- All sync data is **AES-256-GCM encrypted** — even if your cloud account is compromised, memories stay private
+- No server, no API, no account — just your own cloud folder
+
+**CLI alternative:**
+```bash
+# Device A
+cortex-mcp-server sync enable
+# Save the passphrase from the output
+
+# Device B
+cortex-mcp-server sync enable --passphrase "your-passphrase-from-device-A"
+
+# Manual pull
+cortex-mcp-server sync pull
+```
+
 ### Multi-Project Isolation
 
 Working across multiple projects? Use **separate databases** for physical memory isolation — no cross-project leakage, zero code changes needed.
