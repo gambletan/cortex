@@ -630,7 +630,8 @@ cortex/
 - **v1.4** ✅ — 增量 HNSW，SQL 索引实体查询，LLM 摘要钩子，18 个 MCP 工具，可配置衰减，LLM 辅助推理，131 个测试
 - **v1.5** ✅ — Docker 镜像（GHCR 自动发布），功能冻结
 - **v1.7** ✅ — **云同步**（基于变更日志，HLC 排序，LWW 合并），**AES-256-GCM 加密**（Argon2id 密钥派生），**隐私执行**（Private/Shared/Public），**内存清零**（zeroize），SECURITY.md，27 个 MCP 工具，400+ 测试
-- **v2.0** — 新设备快照引导，文件系统监听（即时同步），后台同步线程，移动端（iOS/Android）
+- **v2.0** ✅ — 后台同步（文件系统监听 + 轮询），Web Dashboard，Homebrew，集成文档（CrewAI/AutoGen/LangGraph/DeerFlow），489 测试
+- **v2.1** — 移动端（iOS/Android），多模态记忆，WASM 构建
 
 ## 许可证
 

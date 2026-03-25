@@ -760,7 +760,8 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.5** ✅ — Docker image (GHCR auto-publish), batch ingest, dedup, namespace isolation, plugin system, event bus, archival, 351 tests
 - **v1.6** ✅ — Int8 quantization (75% storage reduction), materialized column indexes, FTS5 triggers, LRU caches (MemObject + entity-facts), rayon parallel decay, Arc embedding, generation-based cache invalidation, 25 MCP tools, batch inference, enhanced Chinese NLP
 - **v1.7** ✅ — **Cloud sync** (changelog-based, HLC ordering, LWW merge), **AES-256-GCM encryption** (Argon2id KDF), **privacy enforcement** (Private/Shared/Public), **zeroize** (memory wiping), SECURITY.md, 27 MCP tools, 400+ tests
-- **v2.0** — Snapshot bootstrap for new devices, filesystem watcher (instant sync), background sync thread, mobile targets (iOS/Android)
+- **v2.0** ✅ — Background sync (filesystem watcher + polling), Web Dashboard, Homebrew tap, integration docs (CrewAI/AutoGen/LangGraph/DeerFlow), `/v1/memories/recent` API, 12 rounds Codex review fixes, 489 tests
+- **v2.1** — Mobile targets (iOS/Android), multi-modal memory, WASM build
 
 ---
 

@@ -1,5 +1,37 @@
 # Changelog
 
+## v2.0.0 — Background Sync, Web Dashboard, Homebrew
+
+### Background Sync
+- Filesystem watcher (`notify` crate) triggers instant pull on remote oplog changes
+- Polling thread as fallback on configurable interval (default 30s)
+- `Cortex::start_background_sync()` / `stop_background_sync()` API
+- `Weak<Cortex>` lifecycle — no Arc leak, safe Drop with thread-name self-join guard
+- Initial pull on start (no 30s wait for pre-existing data)
+
+### Web Dashboard
+- Dark-theme single-page dashboard at `http://localhost:3315/`
+- Search, memory list, stats panel, beliefs, people, sync status
+- Auto-refresh every 30s, embedded via `include_str!` (no external files)
+- New endpoints: `GET /v1/memories/recent`, `GET /v1/stats`, `GET /v1/people`
+
+### Homebrew
+- `brew tap gambletan/tap && brew install cortex-mcp-server`
+
+### Integration Docs
+- CrewAI, AutoGen, LangGraph, DeerFlow, OpenClaw examples in `docs/integrations.md`
+
+### Codex Review Fixes (12 rounds)
+- Oplog: always skip invalid JSON lines (writer guarantees flush)
+- Watcher: `Create` + `Modify(Data)` + `Access(Close(Write))` events
+- Watcher: device ID filter checks `devices/{id}/` component specifically
+- Dashboard: multi-tier recent memories (Episodic + Semantic + Procedural)
+- server.json: v1.8.0, pinned OCI tag, MCP entrypoint
+- Dockerfile: ENTRYPOINT preserved for backward compat
+
+### Stats
+- 489 tests, 0 failures
+
 ## v1.8.0 — Cross-Device Memory Sync
 
 ### One-Click Sync Setup
