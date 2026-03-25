@@ -1,5 +1,5 @@
 [workspace]
-members = ["cortex-core", "cortex-mcp-server", "cortex-http", "cortex-python"]
+members = ["cortex-core", "cortex-mcp-server", "cortex-http", "cortex-python", "cortex-wasm"]
 resolver = "2"
 
 [profile.release]
