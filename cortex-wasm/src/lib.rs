@@ -187,16 +187,32 @@ impl CortexWasm {
         self.memories.len()
     }
 
-    /// Simple fact extraction from text. Splits on " and " to handle multi-clause inputs.
+    /// Fact extraction from text. Handles multi-clause ("I live in X and work at Y")
+    /// without breaking values that contain "and" ("Research and Development").
     fn extract_facts(&mut self, text: &str) {
-        // Split on " and " to handle "I live in X and work at Y"
-        let clauses: Vec<&str> = text.split(" and ").collect();
-        for clause in &clauses {
-            self.extract_facts_clause(clause.trim());
+        let lower = text.to_lowercase();
+
+        // Known second-clause verb prefixes (after " and ")
+        let verb_prefixes = ["work at ", "work for ", "i'm a ", "i am a ", "live in "];
+
+        // Try splitting on " and " only if the second part starts with a known verb
+        if let Some(pos) = lower.find(" and ") {
+            let after = lower[pos + 5..].trim_start();
+            let is_verb_clause = verb_prefixes.iter().any(|p| after.starts_with(p));
+            if is_verb_clause {
+                let first = &text[..pos];
+                let second = text[pos + 5..].trim();
+                self.extract_single(first);
+                self.extract_single(second);
+                return;
+            }
         }
+
+        // No split — extract from full text
+        self.extract_single(text);
     }
 
-    fn extract_facts_clause(&mut self, text: &str) {
+    fn extract_single(&mut self, text: &str) {
         let lower = text.to_lowercase();
 
         // "X lives in Y"
@@ -210,7 +226,7 @@ impl CortexWasm {
         }
 
         // "X works at Y"
-        for pattern in &["i work at ", "i work for ", "work at "] {
+        for pattern in &["i work at ", "i work for ", "work at ", "work for "] {
             if let Some(rest) = lower.strip_prefix(pattern) {
                 let obj = rest.split(&[',', '.', '!', '?'][..]).next().unwrap_or("").trim();
                 if !obj.is_empty() {
