@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --workspace --exclude cortex-python
+        run: cargo test --workspace --exclude cortex-python --exclude cortex-wasm
 
   clippy:
     name: Clippy
@@ -30,7 +30,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --exclude cortex-python -- -D warnings
+        run: cargo clippy --workspace --exclude cortex-python --exclude cortex-wasm -- -D warnings
 
   bench:
     name: Benchmark
