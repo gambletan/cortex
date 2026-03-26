@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cortex — Try It in Your Browser</title>
+<style>
+  :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --mono: "JetBrains Mono", "Fira Code", monospace; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .header { padding: 24px 32px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 20px; font-weight: 600; }
+  .header .tag { background: var(--green); color: #000; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .header .stats { margin-left: auto; font-size: 13px; color: var(--dim); font-family: var(--mono); }
+  .container { max-width: 900px; margin: 0 auto; padding: 24px 32px; }
+  .section { margin-bottom: 24px; }
+  .section h2 { font-size: 14px; text-transform: uppercase; color: var(--dim); margin-bottom: 8px; letter-spacing: 1px; }
+  .input-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  .input-row input, .input-row select { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 6px; font-size: 14px; font-family: var(--mono); }
+  .input-row input { flex: 1; }
+  .input-row select { width: 120px; }
+  .btn { background: var(--accent); color: #fff; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .btn:hover { opacity: 0.9; }
+  .btn-sm { padding: 6px 12px; font-size: 12px; }
+  .results { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; max-height: 400px; overflow-y: auto; }
+  .result-item { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .result-item:last-child { border-bottom: none; }
+  .result-text { font-family: var(--mono); font-size: 13px; margin-bottom: 4px; }
+  .result-meta { font-size: 11px; color: var(--dim); }
+  .result-score { color: var(--accent); font-weight: 600; }
+  .empty { padding: 24px; text-align: center; color: var(--dim); font-size: 13px; }
+  .log { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-family: var(--mono); font-size: 12px; max-height: 200px; overflow-y: auto; line-height: 1.6; }
+  .log-entry { color: var(--green); }
+  .log-fact { color: var(--accent); }
+  .quick-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .quick-actions button { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .quick-actions button:hover { border-color: var(--accent); }
+  a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🧠 Cortex</h1>
+  <span class="tag">WASM Demo — 124KB, runs in your browser</span>
+  <div class="stats" id="stats">Loading...</div>
+</div>
+
+<div class="container">
+  <div class="section">
+    <h2>Quick Demo — Try These</h2>
+    <div class="quick-actions">
+      <button onclick="quickIngest('I live in Shanghai and work at Google')">📍 "I live in Shanghai, work at Google"</button>
+      <button onclick="quickIngest('I prefer dark mode and use neovim')">⚙️ "I prefer dark mode, use neovim"</button>
+      <button onclick="quickIngest('Met Alice at the Rust meetup yesterday')">👤 "Met Alice at Rust meetup"</button>
+      <button onclick="quickIngest('I\\'m a software engineer with 10 years experience')">💼 "I'm a software engineer"</button>
+      <button onclick="var p = cortex.observe_belief('user_is_dev', true, 0.8); addLog('belief', 'Updated belief: user_is_dev → ' + (p*100).toFixed(0) + '%'); refreshStats()">🧪 Observe belief</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Ingest Memory</h2>
+    <div class="input-row">
+      <input type="text" id="ingest-text" placeholder="Type something to remember..." onkeydown="if(event.key==='Enter')doIngest()">
+      <select id="ingest-channel"><option>cli</option><option>telegram</option><option>slack</option><option>email</option></select>
+      <button class="btn" onclick="doIngest()">Store</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Search</h2>
+    <div class="input-row">
+      <input type="text" id="search-query" placeholder="Search memories..." onkeydown="if(event.key==='Enter')doSearch()">
+      <button class="btn" onclick="doSearch()">Search</button>
+    </div>
+    <div class="results" id="search-results"><div class="empty">Try ingesting some memories first, then search</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Activity Log</h2>
+    <div class="log" id="log"><span class="log-entry">Cortex WASM initialized (124KB, in-browser, zero server)</span></div>
+  </div>
+
+  <div style="text-align:center; padding: 24px; color: var(--dim); font-size: 13px;">
+    <strong>Private. Free. Local.</strong> — This demo runs 100% in your browser. No data leaves your device.<br>
+    <a href="https://github.com/gambletan/cortex">GitHub</a> · 
+    <a href="https://github.com/gambletan/cortex/blob/main/SECURITY.md">Security</a> · 
+    MIT Licensed
+  </div>
+</div>
+
+<script type="module">
+import init, { CortexWasm } from './pkg/cortex_wasm.js';
+
+let cortex;
+
+async function start() {
+  await init();
+  cortex = new CortexWasm();
+  window.cortex = cortex;
+  refreshStats();
+  addLog('init', 'Cortex WASM ready — try the quick demo buttons above');
+}
+
+window.doIngest = function() {
+  const text = document.getElementById('ingest-text').value.trim();
+  const channel = document.getElementById('ingest-channel').value;
+  if (!text) return;
+  const id = cortex.ingest(text, channel);
+  addLog('ingest', `Stored: "${text}" [${channel}] → ${id.slice(0,8)}`);
+  
+  // Show auto-extracted facts
+  const facts = JSON.parse(cortex.query_facts("User"));
+  if (facts.length > 0) {
+    const latest = facts[facts.length - 1];
+    addLog('fact', `Auto-extracted: ${latest.subject} ${latest.predicate} ${latest.object}`);
+  }
+  
+  document.getElementById('ingest-text').value = '';
+  refreshStats();
+};
+
+window.doSearch = function() {
+  const query = document.getElementById('search-query').value.trim();
+  if (!query) return;
+  const results = JSON.parse(cortex.search(query, 10));
+  const el = document.getElementById('search-results');
+  
+  if (results.length === 0) {
+    el.innerHTML = '<div class="empty">No results found</div>';
+    return;
+  }
+  
+  el.innerHTML = results.map(r => `
+    <div class="result-item">
+      <div class="result-text">${escapeHtml(r.text)}</div>
+      <div class="result-meta">
+        <span class="result-score">score: ${r.score.toFixed(3)}</span> · 
+        ${r.tier} · ${r.channel} · ${r.created_at.slice(0,16)}
+      </div>
+    </div>
+  `).join('');
+};
+
+window.quickIngest = function(text) {
+  document.getElementById('ingest-text').value = text;
+  doIngest();
+};
+
+function refreshStats() {
+  const s = JSON.parse(cortex.stats());
+  document.getElementById('stats').textContent = 
+    `memories: ${s.total} · facts: ${s.semantic} · beliefs: ${s.beliefs}`;
+}
+
+function addLog(type, msg) {
+  const el = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = type === 'fact' ? 'log-fact' : 'log-entry';
+  div.textContent = msg; // textContent — safe from XSS
+  el.prepend(div);
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+start();
+</script>
+</body>
+</html>
