@@ -191,7 +191,6 @@ impl CortexWasm {
     /// without breaking values that contain "and" ("Research and Development").
     /// Recurses for 3+ clauses. Accepts "I" prefix in second clause.
     fn extract_facts(&mut self, text: &str) {
-        // Known second-clause prefixes (with and without repeated "I")
         let verb_prefixes = [
             "work at ", "work for ", "i work at ", "i work for ",
             "i'm a ", "i am a ", "i'm an ", "i am an ",
@@ -199,20 +198,23 @@ impl CortexWasm {
             "based in ",
         ];
 
-        // Find " and " case-insensitively in the original text
-        // " and " is ASCII so byte offsets are safe for any Unicode string
+        // Scan ALL " and " positions (not just the first) to handle
+        // "I work at Research and Development and live in Berlin"
         let lower = text.to_lowercase();
-        if let Some(pos) = lower.find(" and ") {
-            let after = &lower[pos + 5..];
-            let after_trimmed = after.trim_start();
-            if verb_prefixes.iter().any(|p| after_trimmed.starts_with(p)) {
-                // pos is valid for original text since " and " is ASCII
+        let mut search_from = 0;
+        while let Some(rel_pos) = lower[search_from..].find(" and ") {
+            let pos = search_from + rel_pos;
+            let after = lower[pos + 5..].trim_start();
+            if verb_prefixes.iter().any(|p| after.starts_with(p)) {
+                // Find the same " and " in original text by searching from same byte offset
+                // Safe: " and " is pure ASCII, so byte positions match between original and lowercase
                 let first = &text[..pos];
                 let second = text[pos + 5..].trim();
                 self.extract_single(first);
-                self.extract_facts(second); // recurse for 3+ clauses
+                self.extract_facts(second);
                 return;
             }
+            search_from = pos + 5; // skip past this " and " and keep looking
         }
 
         self.extract_single(text);
