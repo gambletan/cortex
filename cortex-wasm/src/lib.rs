@@ -221,8 +221,8 @@ impl CortexWasm {
     fn extract_single(&mut self, text: &str) {
         let lower = text.to_lowercase();
 
-        // "X lives in Y"
-        for pattern in &["i live in ", "i'm based in ", "i am based in "] {
+        // "X lives in Y" (also bare "live in" / "based in" from clause splits)
+        for pattern in &["i live in ", "i'm based in ", "i am based in ", "live in ", "based in "] {
             if let Some(rest) = lower.strip_prefix(pattern) {
                 let obj = rest.split(&[',', '.', '!', '?'][..]).next().unwrap_or("").trim();
                 if !obj.is_empty() {
