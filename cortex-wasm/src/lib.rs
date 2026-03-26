@@ -214,9 +214,11 @@ impl CortexWasm {
                 self.extract_single(first);
                 // Prepend "I " to bare verb clauses so extract_single can match them
                 let second_lower = second.to_lowercase();
-                let bare_verbs = ["work at ", "work for ", "live in ", "based in "];
+                let bare_verbs = ["work at ", "work for ", "live in "];
                 let normalized = if bare_verbs.iter().any(|v| second_lower.starts_with(v)) {
                     format!("I {}", second)
+                } else if second_lower.starts_with("based in ") {
+                    format!("I'm {}", second)
                 } else {
                     second.to_string()
                 };

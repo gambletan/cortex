@@ -1,0 +1,16 @@
+{
+  "name": "cortex-wasm",
+  "type": "module",
+  "description": "Cortex memory engine — browser WASM build for interactive demos",
+  "version": "2.0.0",
+  "files": [
+    "cortex_wasm_bg.wasm",
+    "cortex_wasm.js",
+    "cortex_wasm.d.ts"
+  ],
+  "main": "cortex_wasm.js",
+  "types": "cortex_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
