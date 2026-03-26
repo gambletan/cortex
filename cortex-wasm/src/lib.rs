@@ -189,11 +189,16 @@ impl CortexWasm {
 
     /// Fact extraction from text. Handles multi-clause ("I live in X and work at Y")
     /// without breaking values that contain "and" ("Research and Development").
+    /// Recurses for 3+ clauses. Accepts "I" prefix in second clause.
     fn extract_facts(&mut self, text: &str) {
         let lower = text.to_lowercase();
 
-        // Known second-clause verb prefixes (after " and ")
-        let verb_prefixes = ["work at ", "work for ", "i'm a ", "i am a ", "live in "];
+        // Known second-clause verb prefixes (with and without repeated "I")
+        let verb_prefixes = [
+            "work at ", "work for ", "i work at ", "i work for ",
+            "i'm a ", "i am a ", "i'm an ", "i am an ",
+            "live in ", "i live in ",
+        ];
 
         // Try splitting on " and " only if the second part starts with a known verb
         if let Some(pos) = lower.find(" and ") {
@@ -203,7 +208,8 @@ impl CortexWasm {
                 let first = &text[..pos];
                 let second = text[pos + 5..].trim();
                 self.extract_single(first);
-                self.extract_single(second);
+                // Recurse on the rest to handle 3+ clauses
+                self.extract_facts(second);
                 return;
             }
         }
