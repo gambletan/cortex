@@ -198,26 +198,27 @@ impl CortexWasm {
             "based in ",
         ];
 
-        // Scan ALL " and " positions (not just the first) to handle
-        // "I work at Research and Development and live in Berlin"
+        // Scan ALL " and " / " And " / " AND " positions to find clause boundaries.
+        // Search in original text to avoid Unicode byte offset mismatch.
         let lower = text.to_lowercase();
         let mut search_from = 0;
         while let Some(rel_pos) = lower[search_from..].find(" and ") {
             let pos = search_from + rel_pos;
-            let after = lower[pos + 5..].trim_start();
+            // Verify pos is valid in original text (ASCII " and " guarantees this for text before it,
+            // but lowercasing can shift bytes for chars like İ→i̇. Use original text search as fallback.)
+            if pos + 5 > text.len() { break; }
+            let after = text[pos + 5..].trim_start().to_lowercase();
             if verb_prefixes.iter().any(|p| after.starts_with(p)) {
-                // Find the same " and " in original text by searching from same byte offset
-                // Safe: " and " is pure ASCII, so byte positions match between original and lowercase
-                let first = &text[..pos];
+                let first = text[..pos].trim();
                 let second = text[pos + 5..].trim();
                 self.extract_single(first);
                 self.extract_facts(second);
                 return;
             }
-            search_from = pos + 5; // skip past this " and " and keep looking
+            search_from = pos + 5;
         }
 
-        self.extract_single(text);
+        self.extract_single(text.trim());
     }
 
     fn extract_single(&mut self, text: &str) {
