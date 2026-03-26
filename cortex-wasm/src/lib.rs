@@ -212,7 +212,15 @@ impl CortexWasm {
                 let first = text[..pos].trim();
                 let second = text[pos + 5..].trim();
                 self.extract_single(first);
-                self.extract_facts(second);
+                // Prepend "I " to bare verb clauses so extract_single can match them
+                let second_lower = second.to_lowercase();
+                let bare_verbs = ["work at ", "work for ", "live in ", "based in "];
+                let normalized = if bare_verbs.iter().any(|v| second_lower.starts_with(v)) {
+                    format!("I {}", second)
+                } else {
+                    second.to_string()
+                };
+                self.extract_facts(&normalized);
                 return;
             }
             search_from = pos + 5;
@@ -224,8 +232,8 @@ impl CortexWasm {
     fn extract_single(&mut self, text: &str) {
         let lower = text.to_lowercase();
 
-        // "X lives in Y" (also bare "live in" / "based in" from clause splits)
-        for pattern in &["i live in ", "i'm based in ", "i am based in ", "live in ", "based in "] {
+        // "X lives in Y" — require "I" prefix to avoid false positives ("Live in the moment")
+        for pattern in &["i live in ", "i'm based in ", "i am based in "] {
             if let Some(rest) = lower.strip_prefix(pattern) {
                 let obj = rest.split(&[',', '.', '!', '?'][..]).next().unwrap_or("").trim();
                 if !obj.is_empty() {
