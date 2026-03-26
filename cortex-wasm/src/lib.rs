@@ -191,30 +191,30 @@ impl CortexWasm {
     /// without breaking values that contain "and" ("Research and Development").
     /// Recurses for 3+ clauses. Accepts "I" prefix in second clause.
     fn extract_facts(&mut self, text: &str) {
-        let lower = text.to_lowercase();
-
-        // Known second-clause verb prefixes (with and without repeated "I")
+        // Known second-clause prefixes (with and without repeated "I")
         let verb_prefixes = [
             "work at ", "work for ", "i work at ", "i work for ",
             "i'm a ", "i am a ", "i'm an ", "i am an ",
-            "live in ", "i live in ",
+            "live in ", "i live in ", "i'm based in ", "i am based in ",
+            "based in ",
         ];
 
-        // Try splitting on " and " only if the second part starts with a known verb
+        // Find " and " case-insensitively in the original text
+        // " and " is ASCII so byte offsets are safe for any Unicode string
+        let lower = text.to_lowercase();
         if let Some(pos) = lower.find(" and ") {
-            let after = lower[pos + 5..].trim_start();
-            let is_verb_clause = verb_prefixes.iter().any(|p| after.starts_with(p));
-            if is_verb_clause {
+            let after = &lower[pos + 5..];
+            let after_trimmed = after.trim_start();
+            if verb_prefixes.iter().any(|p| after_trimmed.starts_with(p)) {
+                // pos is valid for original text since " and " is ASCII
                 let first = &text[..pos];
                 let second = text[pos + 5..].trim();
                 self.extract_single(first);
-                // Recurse on the rest to handle 3+ clauses
-                self.extract_facts(second);
+                self.extract_facts(second); // recurse for 3+ clauses
                 return;
             }
         }
 
-        // No split — extract from full text
         self.extract_single(text);
     }
 
