@@ -3,6 +3,8 @@
 [![GitHub stars](https://img.shields.io/github/stars/gambletan/cortex?style=social)](https://github.com/gambletan/cortex/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **[🧠 Try Cortex in your browser](https://gambletan.github.io/cortex/)** — zero install, 124KB WASM, runs entirely client-side.
+>
 > **If Cortex helps your AI remember, [give it a ⭐](https://github.com/gambletan/cortex/stargazers)** — it takes 1 second and helps others discover the project.
 
 [中文](README_CN.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
