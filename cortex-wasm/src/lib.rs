@@ -187,8 +187,16 @@ impl CortexWasm {
         self.memories.len()
     }
 
-    /// Simple fact extraction from text.
+    /// Simple fact extraction from text. Splits on " and " to handle multi-clause inputs.
     fn extract_facts(&mut self, text: &str) {
+        // Split on " and " to handle "I live in X and work at Y"
+        let clauses: Vec<&str> = text.split(" and ").collect();
+        for clause in &clauses {
+            self.extract_facts_clause(clause.trim());
+        }
+    }
+
+    fn extract_facts_clause(&mut self, text: &str) {
         let lower = text.to_lowercase();
 
         // "X lives in Y"
@@ -202,7 +210,7 @@ impl CortexWasm {
         }
 
         // "X works at Y"
-        for pattern in &["i work at ", "i work for "] {
+        for pattern in &["i work at ", "i work for ", "work at "] {
             if let Some(rest) = lower.strip_prefix(pattern) {
                 let obj = rest.split(&[',', '.', '!', '?'][..]).next().unwrap_or("").trim();
                 if !obj.is_empty() {

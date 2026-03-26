@@ -106,14 +106,15 @@ window.doIngest = function() {
   const text = document.getElementById('ingest-text').value.trim();
   const channel = document.getElementById('ingest-channel').value;
   if (!text) return;
+  const factsBefore = JSON.parse(cortex.query_facts("User")).length;
   const id = cortex.ingest(text, channel);
   addLog('ingest', `Stored: "${text}" [${channel}] → ${id.slice(0,8)}`);
-  
-  // Show auto-extracted facts
-  const facts = JSON.parse(cortex.query_facts("User"));
-  if (facts.length > 0) {
-    const latest = facts[facts.length - 1];
-    addLog('fact', `Auto-extracted: ${latest.subject} ${latest.predicate} ${latest.object}`);
+
+  // Show only NEW auto-extracted facts
+  const factsAfter = JSON.parse(cortex.query_facts("User"));
+  for (let i = factsBefore; i < factsAfter.length; i++) {
+    const f = factsAfter[i];
+    addLog('fact', `Auto-extracted: ${f.subject} ${f.predicate} ${f.object}`);
   }
   
   document.getElementById('ingest-text').value = '';

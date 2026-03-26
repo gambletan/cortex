@@ -19,6 +19,4 @@ chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }
 
-[profile.release]
-opt-level = "s"
-lto = true
+# Release profile inherited from workspace root (lto=true, codegen-units=1)
