@@ -388,6 +388,64 @@ mcp_servers:
 
 All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 29 memory tools — cross-session memory, fact storage, people graph, and belief tracking across all channels.
 
+## CLI
+
+Cortex doubles as a standalone CLI tool — no MCP client required.
+
+```
+$ cortex-mcp-server --help
+Cortex memory engine — MCP server & CLI tools
+
+Usage: cortex-mcp-server [DB_PATH] [COMMAND]
+
+Commands:
+  ingest  Store a new memory
+  search  Search memories
+  stats   Show memory statistics
+  sync    Show cloud sync status and detected providers
+  export  Export all data as JSON
+  import  Import data from JSON file
+  info    Show version, DB path, and capabilities
+  help    Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [DB_PATH]  Path to the Cortex database file (default: ~/.cortex/memory.db)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+**Examples:**
+
+```bash
+# Store a memory
+cortex-mcp-server ~/.cortex/memory.db ingest "Met with Alice about Q3 roadmap"
+cortex-mcp-server ~/.cortex/memory.db ingest -c telegram "Sarah moved to Anthropic"
+
+# Search
+cortex-mcp-server ~/.cortex/memory.db search "Alice"
+cortex-mcp-server ~/.cortex/memory.db search -l 10 "Q3 roadmap"
+
+# Stats
+cortex-mcp-server ~/.cortex/memory.db stats
+
+# Cloud sync
+cortex-mcp-server ~/.cortex/memory.db sync                        # status
+cortex-mcp-server ~/.cortex/memory.db sync enable                  # auto-detect provider
+cortex-mcp-server ~/.cortex/memory.db sync enable -p icloud        # specific provider
+cortex-mcp-server ~/.cortex/memory.db sync pull                    # pull remote changes
+
+# Export / Import (backup & restore)
+cortex-mcp-server ~/.cortex/memory.db export -o backup.json
+cortex-mcp-server ~/.cortex/new.db import backup.json
+
+# Version & capabilities
+cortex-mcp-server ~/.cortex/memory.db info
+```
+
+**No subcommand = MCP stdio mode** (for Claude Code / Claude Desktop integration).
+
 ## MCP Server (Claude Code / Claude Desktop)
 
 Cortex ships as an MCP server — works with any MCP-compatible client.
