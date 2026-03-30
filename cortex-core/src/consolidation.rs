@@ -180,9 +180,9 @@ impl<'a> ConsolidationEngine<'a> {
                 extra_candidates.extend(ids);
             }
         }
+        let ungrouped_ids: HashSet<Uuid> = ungrouped_with_embeddings.iter().map(|(id, _)| *id).collect();
         for id in &extra_candidates {
-            // Skip if already in the ungrouped list
-            if ungrouped_with_embeddings.iter().any(|(uid, _)| uid == id) {
+            if ungrouped_ids.contains(id) {
                 continue;
             }
             if let Some(mem) = self.storage.get_memory(*id)? {
@@ -295,12 +295,21 @@ impl<'a> ConsolidationEngine<'a> {
             return Ok(0);
         }
         let ids_to_sweep: Vec<uuid::Uuid> = decayed.iter().map(|m| m.id).collect();
-        // Archive instead of delete - preserve memories in cold storage
+        // Archive instead of delete — preserve memories in cold storage
         let mut archived_count = 0;
+        let mut failed_count = 0;
         for id in &ids_to_sweep {
-            if self.storage.archive_memory(*id).is_ok() {
-                archived_count += 1;
+            match self.storage.archive_memory(*id) {
+                Ok(()) => archived_count += 1,
+                Err(_) => failed_count += 1,
             }
+        }
+        if failed_count > 0 {
+            tracing::warn!(
+                "sweep_decayed: {} of {} archives failed",
+                failed_count,
+                ids_to_sweep.len()
+            );
         }
         Ok(archived_count)
     }
