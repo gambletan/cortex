@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+"use strict";
+
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { execSync } = require("child_process");
+
+const REPO = "gambletan/cortex";
+const BINARY_NAME = "cortex-mcp-server";
+const BIN_DIR = path.join(__dirname);
+const BINARY_PATH = path.join(BIN_DIR, BINARY_NAME);
+
+function getPlatformSuffix() {
+  const platform = os.platform();
+  const arch = os.arch();
+
+  const platformMap = {
+    darwin: "darwin",
+    linux: "linux",
+  };
+
+  const archMap = {
+    arm64: "arm64",
+    x64: "x86_64",
+  };
+
+  const osSuffix = platformMap[platform];
+  const archSuffix = archMap[arch];
+
+  if (!osSuffix) {
+    throw new Error(
+      `Unsupported platform: ${platform}. Only darwin and linux are supported.`
+    );
+  }
+  if (!archSuffix) {
+    throw new Error(
+      `Unsupported architecture: ${arch}. Only arm64 and x64 are supported.`
+    );
+  }
+
+  return `${osSuffix}-${archSuffix}`;
+}
+
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { headers: { "User-Agent": "cortex-memory-npm" } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        httpsGet(res.headers.location).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode} fetching ${url}`));
+        return;
+      }
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    });
+    request.on("error", reject);
+    request.setTimeout(60000, () => {
+      request.destroy();
+      reject(new Error(`Request timed out: ${url}`));
+    });
+  });
+}
+
+async function fetchLatestRelease() {
+  const url = `https://api.github.com/repos/${REPO}/releases/latest`;
+  const data = await httpsGet(url);
+  return JSON.parse(data.toString());
+}
+
+async function install() {
+  const suffix = getPlatformSuffix();
+  const assetName = `${BINARY_NAME}-${suffix}.tar.gz`;
+
+  console.log(`[cortex-memory] Detected platform: ${suffix}`);
+  console.log(`[cortex-memory] Fetching latest release from ${REPO}...`);
+
+  const release = await fetchLatestRelease();
+  const asset = release.assets.find((a) => a.name === assetName);
+
+  if (!asset) {
+    // Try lite variant as fallback (linux-arm64 only has lite)
+    const liteAssetName = `${BINARY_NAME}-lite-${suffix}.tar.gz`;
+    const liteAsset = release.assets.find((a) => a.name === liteAssetName);
+
+    if (!liteAsset) {
+      const available = release.assets.map((a) => a.name).join(", ");
+      throw new Error(
+        `No binary found for ${suffix}.\n` +
+        `Looked for: ${assetName} or ${liteAssetName}\n` +
+        `Available: ${available}\n` +
+        `Release: ${release.tag_name}`
+      );
+    }
+
+    console.log(`[cortex-memory] Full binary not available for ${suffix}, using lite variant.`);
+    console.log(`[cortex-memory] Downloading ${liteAssetName} (${release.tag_name})...`);
+    await downloadAndExtract(liteAsset.browser_download_url);
+    return;
+  }
+
+  console.log(`[cortex-memory] Downloading ${assetName} (${release.tag_name})...`);
+  await downloadAndExtract(asset.browser_download_url);
+}
+
+async function downloadAndExtract(downloadUrl) {
+  const tarball = await httpsGet(downloadUrl);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cortex-"));
+  const tarPath = path.join(tmpDir, "binary.tar.gz");
+
+  try {
+    fs.writeFileSync(tarPath, tarball);
+    execSync(`tar xzf "${tarPath}" -C "${tmpDir}"`, { stdio: "pipe" });
+
+    const extractedBinary = path.join(tmpDir, BINARY_NAME);
+    if (!fs.existsSync(extractedBinary)) {
+      throw new Error(
+        `Binary not found after extraction. Expected: ${BINARY_NAME} in archive.`
+      );
+    }
+
+    fs.copyFileSync(extractedBinary, BINARY_PATH);
+    fs.chmodSync(BINARY_PATH, 0o755);
+
+    console.log(`[cortex-memory] Installed ${BINARY_NAME} to ${BINARY_PATH}`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+install().catch((err) => {
+  console.error(`[cortex-memory] Installation failed: ${err.message}`);
+  console.error(
+    "[cortex-memory] You can manually download the binary from:"
+  );
+  console.error(`  https://github.com/${REPO}/releases/latest`);
+  process.exit(1);
+});

@@ -5,6 +5,13 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
+// ── Safety guardrails ───────────────────────────────────────────────────────
+const MAX_INGEST_TEXT_BYTES: usize = 100_000;   // 100KB per memory
+const MAX_BATCH_SIZE: usize = 100;              // memory_ingest_batch
+const MAX_SEARCH_LIMIT: usize = 100;            // memory_search
+const MAX_CONTEXT_TOKENS: usize = 8_000;        // memory_context
+const MAX_TAG_SCAN_PER_TIER: usize = 10_000;    // tag_list_taxonomy
+
 /// Return the list of available tools (MCP tool schema format).
 /// Includes built-in tools and any plugin-registered tools.
 pub fn list_tools_with_plugins(cortex: &Arc<Cortex>) -> Value {
@@ -580,6 +587,9 @@ fn get_embedding(args: &Value) -> Option<Vec<f32>> {
 
 fn tool_memory_ingest(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
     let text = get_str(args, "text").ok_or("missing 'text'")?;
+    if text.len() > MAX_INGEST_TEXT_BYTES {
+        return Err(format!("text too large: {} bytes (max {})", text.len(), MAX_INGEST_TEXT_BYTES));
+    }
     let channel = get_str(args, "channel").ok_or("missing 'channel'")?;
     let user_id = get_str(args, "user_id");
     let salience = args.get("salience").and_then(|v| v.as_f64()).map(|v| v as f32);
@@ -629,7 +639,7 @@ fn tool_memory_consolidate(cortex: &Arc<Cortex>) -> Result<String, String> {
 
 fn tool_memory_search(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
     let query = get_str(args, "query").ok_or("missing 'query'")?;
-    let limit = get_usize(args, "limit", 10);
+    let limit = get_usize(args, "limit", 10).min(MAX_SEARCH_LIMIT);
     let channel = get_str(args, "channel");
     let person_id = get_str(args, "person_id")
         .and_then(|s| Uuid::parse_str(s).ok());
@@ -662,7 +672,7 @@ fn tool_memory_search(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Stri
 }
 
 fn tool_memory_context(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
-    let max_tokens = get_usize(args, "max_tokens", 2000);
+    let max_tokens = get_usize(args, "max_tokens", 2000).min(MAX_CONTEXT_TOKENS);
     let channel = get_str(args, "channel");
     let person_id = get_str(args, "person_id")
         .and_then(|s| Uuid::parse_str(s).ok());
@@ -852,6 +862,8 @@ fn tool_memory_compress(cortex: &Arc<Cortex>, args: &Value) -> Result<String, St
         .get("max_age_days")
         .and_then(|v| v.as_i64())
         .unwrap_or(7);
+    let min_messages = min_messages.max(1); // prevent compressing everything
+    let max_age_days = max_age_days.max(1); // prevent compressing fresh memories
 
     let report = cortex
         .run_compression(min_messages, max_age_days)
@@ -1001,6 +1013,9 @@ fn tool_memory_ingest_batch(cortex: &Arc<Cortex>, args: &Value) -> Result<String
     let items_arr = args.get("items")
         .and_then(|v| v.as_array())
         .ok_or("missing 'items' array")?;
+    if items_arr.len() > MAX_BATCH_SIZE {
+        return Err(format!("batch too large: {} items (max {})", items_arr.len(), MAX_BATCH_SIZE));
+    }
 
     let items: Vec<cortex_core::types::BatchIngestItem> = items_arr.iter().map(|item| {
         cortex_core::types::BatchIngestItem {
@@ -1035,7 +1050,7 @@ fn tool_tag_list_taxonomy(cortex: &Arc<Cortex>) -> Result<String, String> {
     ];
 
     for tier in &tiers {
-        if let Ok(mems) = cortex.storage().list_by_tier(*tier, 100_000) {
+        if let Ok(mems) = cortex.storage().list_by_tier(*tier, MAX_TAG_SCAN_PER_TIER) {
             for mem in mems {
                 for tag in &mem.tags {
                     *tag_counts.entry(tag.clone()).or_insert(0) += 1;
@@ -1103,6 +1118,9 @@ fn tool_person_merge(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Strin
     let source_str = get_str(args, "source_id").ok_or("missing 'source_id'")?;
     let target_id = Uuid::parse_str(target_str).map_err(|e| format!("Invalid target UUID: {}", e))?;
     let source_id = Uuid::parse_str(source_str).map_err(|e| format!("Invalid source UUID: {}", e))?;
+    if target_id == source_id {
+        return Err("cannot merge a person with themselves".to_string());
+    }
 
     let merged = cortex.merge_people(target_id, source_id).map_err(|e| e.to_string())?;
 
