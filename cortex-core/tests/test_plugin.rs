@@ -368,7 +368,7 @@ fn test_tag_classifier_custom_tool() {
     let ctx = cortex.plugin_context();
     let result = cortex
         .plugin_manager()
-        .call_tool("tag_list_taxonomy", &json!({}), &ctx);
+        .call_tool("tag_classifier_taxonomy", &json!({}), &ctx);
 
     assert!(result.is_some());
     let json_str = result.unwrap().unwrap();

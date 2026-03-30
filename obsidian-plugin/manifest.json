@@ -1,0 +1,9 @@
+{
+  "id": "cortex-memory",
+  "name": "Cortex Memory",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Browse and manage AI memories from Cortex — local, private, sub-ms",
+  "author": "gambletan",
+  "isDesktopOnly": true
+}

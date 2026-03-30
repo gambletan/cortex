@@ -1,7 +1,7 @@
 //! Tag Classifier Plugin — automatic keyword-based tagging on ingest.
 //!
 //! Scans incoming text for known keyword patterns and adds tags accordingly.
-//! Also registers a custom MCP tool `tag_list_taxonomy` to inspect the taxonomy.
+//! Also registers a custom MCP tool `tag_classifier_taxonomy` to inspect the taxonomy.
 
 use serde_json::{json, Value};
 
@@ -104,7 +104,7 @@ impl Plugin for TagClassifierPlugin {
 
     fn tools(&self) -> Vec<PluginTool> {
         vec![PluginTool {
-            name: "tag_list_taxonomy".into(),
+            name: "tag_classifier_taxonomy".into(),
             description: "List the tag classification taxonomy used by the tag_classifier plugin"
                 .into(),
             input_schema: json!({
@@ -121,7 +121,7 @@ impl Plugin for TagClassifierPlugin {
         _ctx: &PluginContext<'_>,
     ) -> Result<String, String> {
         match name {
-            "tag_list_taxonomy" => {
+            "tag_classifier_taxonomy" => {
                 let taxonomy: Vec<Value> = self
                     .rules
                     .iter()

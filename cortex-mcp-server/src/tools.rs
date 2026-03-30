@@ -898,6 +898,28 @@ fn tool_relationship_extract(cortex: &Arc<Cortex>, args: &Value) -> Result<Strin
 fn tool_memory_stats(cortex: &Arc<Cortex>) -> Result<String, String> {
     let stats = cortex.stats().map_err(|e| e.to_string())?;
     let metrics = cortex.metrics();
+
+    // Health score (inspired by openclaw-auto-dream)
+    // Five dimensions, each 0.0–1.0:
+    let total_memories = stats.episodic + stats.semantic + stats.procedural + stats.archived;
+    let freshness: f32 = if stats.episodic > 0 { 0.8 } else { 0.0 };
+    let coverage: f32 =
+        ((stats.semantic as f32) / (total_memories.max(1) as f32)).min(1.0);
+    let coherence: f32 = if stats.beliefs > 0 { 0.7 } else { 0.3 };
+    let efficiency: f32 = if total_memories > 0 {
+        1.0 - ((stats.archived as f32) / (total_memories.max(1) as f32))
+    } else {
+        1.0
+    };
+    let reachability: f32 = if stats.people > 0 { 0.8 } else { 0.4 };
+
+    let health_score: f32 = (freshness * 0.25
+        + coverage * 0.25
+        + coherence * 0.20
+        + efficiency * 0.15
+        + reachability * 0.15)
+        * 100.0;
+
     Ok(json!({
         "episodic": stats.episodic,
         "semantic": stats.semantic,
@@ -915,6 +937,14 @@ fn tool_memory_stats(cortex: &Arc<Cortex>) -> Result<String, String> {
             "consolidations": metrics.consolidations,
             "decay_runs": metrics.decay_runs,
             "archives": metrics.archives,
+        },
+        "health": {
+            "score": (health_score * 100.0).round() / 100.0,
+            "freshness": freshness,
+            "coverage": (coverage * 1000.0).round() / 1000.0,
+            "coherence": coherence,
+            "efficiency": (efficiency * 1000.0).round() / 1000.0,
+            "reachability": reachability,
         }
     }).to_string())
 }

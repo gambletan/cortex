@@ -1,13 +1,16 @@
 use chrono::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::episode::{DecayConfig, EpisodeStore};
 use crate::procedural::{Pattern, ProceduralStore};
-use crate::storage::memory_index::MemoryIndex;
+use crate::storage::memory_index::{cosine_similarity, MemoryIndex};
 use crate::storage::traits::StorageBackend;
 use crate::types::*;
 use crate::CortexError;
+
+/// Minimum cosine similarity for embedding-based promotion grouping.
+const SEMANTIC_SIMILARITY_THRESHOLD: f32 = 0.85;
 
 /// Report from a consolidation cycle.
 #[derive(Debug, Default)]
@@ -15,6 +18,7 @@ pub struct ConsolidationReport {
     pub episodes_scanned: usize,
     pub promoted_to_semantic: usize,
     pub decayed_updated: usize,
+    /// Count of memories archived (moved to cold storage, not deleted).
     pub decayed_swept: usize,
     pub patterns_detected: usize,
     pub contradictions_found: usize,
@@ -107,14 +111,20 @@ impl<'a> ConsolidationEngine<'a> {
         Ok(report)
     }
 
-    /// Find episodic memories that repeat (same content observed 3+ times).
-    /// Groups by content text similarity (exact match for now).
+    /// Find episodic memories that repeat, using two strategies:
+    /// 1. Exact content hash matching (fast, strict)
+    /// 2. Embedding-based semantic similarity for ungrouped memories (cosine >= 0.85)
+    ///
     /// Processes in pages to avoid loading all episodic memories at once.
     fn find_promotion_candidates(
         &self,
         min_occurrences: usize,
     ) -> Result<Vec<Vec<Uuid>>, CortexError> {
         let mut fact_groups: HashMap<String, Vec<Uuid>> = HashMap::new();
+        // Collect ungrouped memories with embeddings for the semantic pass.
+        // Store (id, embedding) — clone the Arc's inner vec only for memories
+        // that didn't match by hash, keeping the hot path allocation-free.
+        let mut ungrouped_with_embeddings: Vec<(Uuid, Vec<f32>)> = Vec::new();
         let page_size = 1000;
         let mut offset = 0;
 
@@ -140,6 +150,9 @@ impl<'a> ConsolidationEngine<'a> {
                 };
                 if let Some(k) = key {
                     fact_groups.entry(k).or_default().push(mem.id);
+                } else if let Some(ref emb) = mem.embedding {
+                    // No hash key (e.g. Relationship, Pattern, Event) but has embedding
+                    ungrouped_with_embeddings.push((mem.id, emb.as_ref().clone()));
                 }
             }
 
@@ -149,10 +162,82 @@ impl<'a> ConsolidationEngine<'a> {
             offset += page_size;
         }
 
-        Ok(fact_groups
+        // Collect IDs that were already grouped by hash so we can skip them
+        // in the semantic pass.
+        let hash_grouped_ids: HashSet<Uuid> = fact_groups
+            .values()
+            .flat_map(|ids| ids.iter().copied())
+            .collect();
+
+        // Also add memories that had a hash key but whose group is too small
+        // (they won't be promoted by hash, so give them a chance via embedding).
+        // We need to re-scan fact_groups to find singleton/small groups with embeddings.
+        // To avoid a second storage round-trip, collect their IDs now and fetch
+        // embeddings only for those that need it.
+        let mut extra_candidates: Vec<Uuid> = Vec::new();
+        for ids in fact_groups.values() {
+            if ids.len() < min_occurrences {
+                extra_candidates.extend(ids);
+            }
+        }
+        for id in &extra_candidates {
+            // Skip if already in the ungrouped list
+            if ungrouped_with_embeddings.iter().any(|(uid, _)| uid == id) {
+                continue;
+            }
+            if let Some(mem) = self.storage.get_memory(*id)? {
+                if let Some(ref emb) = mem.embedding {
+                    ungrouped_with_embeddings.push((mem.id, emb.as_ref().clone()));
+                }
+            }
+        }
+
+        // --- Pass 1: collect hash-based groups that meet the threshold ---
+        let mut results: Vec<Vec<Uuid>> = fact_groups
             .into_values()
             .filter(|ids| ids.len() >= min_occurrences)
-            .collect())
+            .collect();
+
+        // --- Pass 2: greedy single-pass embedding clustering for ungrouped memories ---
+        // Remove any memory that already belongs to a promoted hash group.
+        ungrouped_with_embeddings.retain(|(id, _)| !hash_grouped_ids.contains(id));
+
+        if ungrouped_with_embeddings.len() >= min_occurrences {
+            let semantic_groups = self.cluster_by_embedding(&ungrouped_with_embeddings);
+            for group in semantic_groups {
+                if group.len() >= min_occurrences {
+                    results.push(group);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Greedy single-pass clustering of memories by embedding similarity.
+    /// Each unassigned memory is compared to existing cluster centroids (the
+    /// first member's embedding). If similar enough, it joins; otherwise it
+    /// starts a new cluster.
+    fn cluster_by_embedding(&self, items: &[(Uuid, Vec<f32>)]) -> Vec<Vec<Uuid>> {
+        // Each cluster is represented by the embedding of its first member
+        // (used as the centroid) and the list of member IDs.
+        let mut clusters: Vec<(Vec<Uuid>, &[f32])> = Vec::new();
+
+        for (id, embedding) in items {
+            let mut assigned = false;
+            for (members, centroid) in &mut clusters {
+                if cosine_similarity(embedding, centroid) >= SEMANTIC_SIMILARITY_THRESHOLD {
+                    members.push(*id);
+                    assigned = true;
+                    break;
+                }
+            }
+            if !assigned {
+                clusters.push((vec![*id], embedding.as_slice()));
+            }
+        }
+
+        clusters.into_iter().map(|(ids, _)| ids).collect()
     }
 
     /// Promote a group of episodic memories to a single semantic memory.
@@ -200,8 +285,8 @@ impl<'a> ConsolidationEngine<'a> {
         procedural_store.detect_patterns(3)
     }
 
-    /// Soft-delete episodic memories below salience threshold.
-    /// Returns count of deleted memories.
+    /// Archive episodic memories below salience threshold.
+    /// Returns count of archived memories.
     pub fn sweep_decayed(&self, threshold: f32) -> Result<usize, CortexError> {
         let decayed = self
             .storage
@@ -209,7 +294,14 @@ impl<'a> ConsolidationEngine<'a> {
         if decayed.is_empty() {
             return Ok(0);
         }
-        let ids: Vec<uuid::Uuid> = decayed.iter().map(|m| m.id).collect();
-        self.storage.delete_memories_batch(&ids)
+        let ids_to_sweep: Vec<uuid::Uuid> = decayed.iter().map(|m| m.id).collect();
+        // Archive instead of delete - preserve memories in cold storage
+        let mut archived_count = 0;
+        for id in &ids_to_sweep {
+            if self.storage.archive_memory(*id).is_ok() {
+                archived_count += 1;
+            }
+        }
+        Ok(archived_count)
     }
 }

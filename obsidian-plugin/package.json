@@ -1,0 +1,20 @@
+{
+  "name": "obsidian-cortex-memory",
+  "version": "0.1.0",
+  "description": "Obsidian plugin for Cortex Memory — browse and manage AI memories locally",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --external:obsidian --platform=node --format=cjs --target=es2020",
+    "dev": "esbuild src/main.ts --bundle --outfile=dist/main.js --external:obsidian --platform=node --format=cjs --target=es2020 --watch"
+  },
+  "keywords": ["obsidian", "cortex", "memory", "ai"],
+  "author": "gambletan",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  },
+  "peerDependencies": {
+    "obsidian": ">=1.0.0"
+  }
+}
