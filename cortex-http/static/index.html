@@ -357,6 +357,184 @@
 
   /* ── Sidebar stacking ───────────────────────────────────────── */
   .sidebar { display: flex; flex-direction: column; gap: 20px; }
+
+  /* ── Health Score ───────────────────────────────────────────── */
+  .health-score-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .health-gauge {
+    position: relative;
+    width: 80px;
+    height: 80px;
+    flex-shrink: 0;
+  }
+
+  .health-gauge svg {
+    transform: rotate(-90deg);
+    width: 80px;
+    height: 80px;
+  }
+
+  .health-gauge-bg {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 6;
+  }
+
+  .health-gauge-fill {
+    fill: none;
+    stroke-width: 6;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.6s ease, stroke 0.3s ease;
+  }
+
+  .health-gauge-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 700;
+  }
+
+  .health-details {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .health-details-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    font-weight: 600;
+  }
+
+  .health-detail-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+
+  .health-detail-row .label { color: var(--text-dim); }
+  .health-detail-row .value { font-weight: 600; }
+
+  /* ── Quick Note ─────────────────────────────────────────────── */
+  .quick-note {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+    position: relative;
+  }
+
+  .quick-note input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--mono);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .quick-note input:focus { border-color: var(--green); }
+  .quick-note input::placeholder { color: var(--text-dim); }
+
+  .quick-note button {
+    background: var(--green);
+    color: var(--bg);
+    border: none;
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+  }
+
+  .quick-note button:hover { opacity: 0.85; }
+
+  .quick-note-toast {
+    position: absolute;
+    right: 0;
+    top: -28px;
+    font-size: 12px;
+    font-family: var(--mono);
+    color: var(--green);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    pointer-events: none;
+  }
+
+  .quick-note-toast.visible { opacity: 1; }
+
+  /* ── Memory Timeline ────────────────────────────────────────── */
+  .timeline-group-date {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 10px 16px 6px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .timeline-item {
+    display: flex;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    align-items: flex-start;
+  }
+
+  .timeline-item:last-child { border-bottom: none; }
+
+  .timeline-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-top: 6px;
+    flex-shrink: 0;
+  }
+
+  .timeline-dot.episodic { background: var(--accent); }
+  .timeline-dot.semantic { background: var(--purple); }
+  .timeline-dot.procedural { background: var(--orange); }
+  .timeline-dot.archived { background: var(--text-dim); }
+
+  .timeline-content { flex: 1; min-width: 0; }
+
+  .timeline-text {
+    color: var(--text);
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .timeline-time {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
 </style>
 </head>
 <body>
@@ -388,6 +566,12 @@
 
   <!-- ── Main column ──────────────────────────────────────────── -->
   <div class="main-col">
+    <div class="quick-note">
+      <span class="quick-note-toast" id="quick-note-toast">Remembered!</span>
+      <input type="text" id="quick-note-input" placeholder="Quick note... remember something" />
+      <button id="quick-note-btn">Remember</button>
+    </div>
+
     <div class="search-bar">
       <input type="text" id="search-input" placeholder="Search memories..." />
       <button id="search-btn">Search</button>
@@ -399,10 +583,42 @@
         <div class="empty-state">Loading...</div>
       </div>
     </div>
+
+    <div class="panel" style="margin-top: 20px;">
+      <div class="panel-header" id="timeline-header">Memory Timeline</div>
+      <div id="timeline-list">
+        <div class="empty-state">Loading timeline...</div>
+      </div>
+    </div>
   </div>
 
   <!-- ── Sidebar ──────────────────────────────────────────────── -->
   <div class="sidebar">
+
+    <!-- Health Score -->
+    <div class="panel">
+      <div class="panel-header">Health Score</div>
+      <div class="panel-body">
+        <div class="health-score-card" id="health-score-card">
+          <div class="health-gauge">
+            <svg viewBox="0 0 80 80">
+              <circle class="health-gauge-bg" cx="40" cy="40" r="34"></circle>
+              <circle class="health-gauge-fill" id="health-gauge-fill" cx="40" cy="40" r="34"
+                stroke-dasharray="213.6" stroke-dashoffset="213.6"></circle>
+            </svg>
+            <div class="health-gauge-text" id="health-gauge-text">--</div>
+          </div>
+          <div class="health-details">
+            <div class="health-details-title">Dimensions</div>
+            <div class="health-detail-row"><span class="label">Freshness</span><span class="value" id="hd-freshness">--</span></div>
+            <div class="health-detail-row"><span class="label">Coverage</span><span class="value" id="hd-coverage">--</span></div>
+            <div class="health-detail-row"><span class="label">Coherence</span><span class="value" id="hd-coherence">--</span></div>
+            <div class="health-detail-row"><span class="label">Efficiency</span><span class="value" id="hd-efficiency">--</span></div>
+            <div class="health-detail-row"><span class="label">Reachability</span><span class="value" id="hd-reachability">--</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- Stats -->
     <div class="panel">
@@ -609,6 +825,108 @@ function renderSync(health) {
   `;
 }
 
+function renderHealthScore(data) {
+  if (!data) return;
+
+  const total = (data.episodic || 0) + (data.semantic || 0) + (data.procedural || 0) + (data.archived || 0);
+  const freshness = data.episodic > 0 ? 0.8 : 0.0;
+  const coverage = total > 0 ? Math.min((data.semantic || 0) / total, 1.0) : 0;
+  const coherence = (data.beliefs || 0) > 0 ? 0.7 : 0.3;
+  const efficiency = total > 0 ? 1.0 - ((data.archived || 0) / total) : 1.0;
+  const reachability = (data.people || 0) > 0 ? 0.8 : 0.4;
+  const healthScore = (freshness * 0.25 + coverage * 0.25 + coherence * 0.20 + efficiency * 0.15 + reachability * 0.15) * 100;
+
+  const circumference = 2 * Math.PI * 34; // ~213.6
+  const offset = circumference - (healthScore / 100) * circumference;
+
+  const fill = document.getElementById("health-gauge-fill");
+  const text = document.getElementById("health-gauge-text");
+
+  let color = "var(--green)";
+  if (healthScore < 40) color = "var(--red)";
+  else if (healthScore < 70) color = "var(--orange)";
+
+  fill.style.stroke = color;
+  fill.style.strokeDashoffset = offset;
+  text.textContent = Math.round(healthScore);
+  text.style.color = color;
+
+  document.getElementById("hd-freshness").textContent = (freshness * 100).toFixed(0) + "%";
+  document.getElementById("hd-coverage").textContent = (coverage * 100).toFixed(0) + "%";
+  document.getElementById("hd-coherence").textContent = (coherence * 100).toFixed(0) + "%";
+  document.getElementById("hd-efficiency").textContent = (efficiency * 100).toFixed(0) + "%";
+  document.getElementById("hd-reachability").textContent = (reachability * 100).toFixed(0) + "%";
+}
+
+function renderTimeline(items) {
+  const el = document.getElementById("timeline-list");
+  const header = document.getElementById("timeline-header");
+
+  if (!items || items.length === 0) {
+    el.innerHTML = '<div class="empty-state">No recent memories</div>';
+    header.textContent = "Memory Timeline";
+    return;
+  }
+
+  header.textContent = `Memory Timeline (${items.length})`;
+
+  const grouped = {};
+  items.forEach(m => {
+    const date = new Date(m.created_at);
+    const key = date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(m);
+  });
+
+  let html = "";
+  Object.entries(grouped).forEach(([date, memories]) => {
+    html += `<div class="timeline-group-date">${escapeHtml(date)}</div>`;
+    memories.forEach(m => {
+      const tier = (m.tier || "episodic").toLowerCase();
+      const time = new Date(m.created_at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+      html += `
+        <div class="timeline-item">
+          <div class="timeline-dot ${tier}"></div>
+          <div class="timeline-content">
+            <div class="timeline-text">${escapeHtml(m.text || "")}</div>
+            <div class="timeline-time">${escapeHtml(time)}</div>
+          </div>
+        </div>
+      `;
+    });
+  });
+
+  el.innerHTML = html;
+}
+
+async function submitQuickNote() {
+  const input = document.getElementById("quick-note-input");
+  const text = input.value.trim();
+  if (!text) return;
+
+  const btn = document.getElementById("quick-note-btn");
+  btn.textContent = "Saving...";
+  btn.disabled = true;
+
+  const result = await apiFetch("/api/quick-note", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: text, channel: "dashboard" }),
+  });
+
+  btn.textContent = "Remember";
+  btn.disabled = false;
+
+  if (result !== null) {
+    input.value = "";
+    const toast = document.getElementById("quick-note-toast");
+    toast.classList.add("visible");
+    setTimeout(() => toast.classList.remove("visible"), 2000);
+    loadRecentMemories();
+    loadTimeline();
+  }
+}
+
 // ── Data loading ──────────────────────────────────────────────
 
 async function loadHealth() {
@@ -628,6 +946,7 @@ async function loadHealth() {
 async function loadStats() {
   const data = await apiFetch("/v1/stats");
   renderStats(data);
+  renderHealthScore(data);
 }
 
 async function loadBeliefs() {
@@ -646,6 +965,15 @@ async function loadRecentMemories() {
     renderMemoryList(data.results, false);
   } else {
     renderMemoryList([], false);
+  }
+}
+
+async function loadTimeline() {
+  const data = await apiFetch("/v1/memories/recent?limit=20");
+  if (data && data.results) {
+    renderTimeline(data.results);
+  } else {
+    renderTimeline([]);
   }
 }
 
@@ -681,6 +1009,14 @@ document.getElementById("search-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doSearch(e.target.value);
 });
 
+document.getElementById("quick-note-btn").addEventListener("click", () => {
+  submitQuickNote();
+});
+
+document.getElementById("quick-note-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submitQuickNote();
+});
+
 // ── Init ──────────────────────────────────────────────────────
 
 async function init() {
@@ -690,6 +1026,7 @@ async function init() {
     loadBeliefs(),
     loadPeople(),
     loadRecentMemories(),
+    loadTimeline(),
   ]);
 }
 

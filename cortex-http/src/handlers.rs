@@ -535,6 +535,40 @@ pub async fn compress(
     })))
 }
 
+// ── Quick Note (mobile capture) ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct QuickNoteRequest {
+    pub text: String,
+    #[serde(default = "default_quick_note_channel")]
+    pub channel: String,
+}
+
+fn default_quick_note_channel() -> String {
+    "quick-note".to_string()
+}
+
+pub async fn quick_note(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<QuickNoteRequest>,
+) -> AppResult {
+    if req.text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "text is required"})),
+        ));
+    }
+    let mem = state
+        .cortex
+        .ingest(&req.text, &req.channel, None, None, None)
+        .map_err(cortex_err)?;
+    Ok(Json(json!({
+        "id": mem.id.to_string(),
+        "status": "remembered",
+        "tier": mem.tier.as_str(),
+    })))
+}
+
 // ── Relationship extraction ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]

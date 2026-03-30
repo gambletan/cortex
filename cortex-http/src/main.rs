@@ -98,6 +98,8 @@ async fn main() {
         // Phase 5: Compression & Relationships
         .route("/v1/memories/compress", post(handlers::compress))
         .route("/v1/relationships/extract", post(handlers::extract_relationships))
+        // Quick note (mobile capture)
+        .route("/api/quick-note", post(handlers::quick_note))
         .with_state(state)
         // Dashboard — embedded HTML, no external files needed
         .route("/", get(|| async {
