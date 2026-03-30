@@ -43,11 +43,23 @@ function getPlatformSuffix() {
   return `${osSuffix}-${archSuffix}`;
 }
 
-function httpsGet(url) {
+const TRUSTED_HOSTS = ["api.github.com", "github.com", "objects.githubusercontent.com"];
+const MAX_REDIRECTS = 5;
+
+function httpsGet(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
+    if (redirectCount > MAX_REDIRECTS) {
+      reject(new Error(`Too many redirects (max ${MAX_REDIRECTS})`));
+      return;
+    }
     const request = https.get(url, { headers: { "User-Agent": "cortex-memory-npm" } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        httpsGet(res.headers.location).then(resolve, reject);
+        const redirectUrl = new URL(res.headers.location);
+        if (!TRUSTED_HOSTS.includes(redirectUrl.hostname)) {
+          reject(new Error(`Untrusted redirect host: ${redirectUrl.hostname}`));
+          return;
+        }
+        httpsGet(res.headers.location, redirectCount + 1).then(resolve, reject);
         return;
       }
       if (res.statusCode !== 200) {
@@ -70,7 +82,15 @@ function httpsGet(url) {
 async function fetchLatestRelease() {
   const url = `https://api.github.com/repos/${REPO}/releases/latest`;
   const data = await httpsGet(url);
-  return JSON.parse(data.toString());
+  try {
+    return JSON.parse(data.toString());
+  } catch {
+    throw new Error(
+      `Failed to parse GitHub API response. ` +
+      `This may be due to rate limiting. Try again in a few minutes, or ` +
+      `download manually from: https://github.com/${REPO}/releases/latest`
+    );
+  }
 }
 
 async function install() {
