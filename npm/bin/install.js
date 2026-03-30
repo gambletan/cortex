@@ -11,6 +11,7 @@ const REPO = "gambletan/cortex";
 const BINARY_NAME = "cortex-mcp-server";
 const BIN_DIR = path.join(__dirname);
 const BINARY_PATH = path.join(BIN_DIR, BINARY_NAME);
+const PKG_VERSION = require("../package.json").version;
 
 function getPlatformSuffix() {
   const platform = os.platform();
@@ -79,16 +80,19 @@ function httpsGet(url, redirectCount = 0) {
   });
 }
 
-async function fetchLatestRelease() {
-  const url = `https://api.github.com/repos/${REPO}/releases/latest`;
+async function fetchRelease() {
+  // Pin to the version in package.json for reproducible installs
+  const tag = `v${PKG_VERSION}`;
+  const url = `https://api.github.com/repos/${REPO}/releases/tags/${tag}`;
   const data = await httpsGet(url);
   try {
     return JSON.parse(data.toString());
   } catch {
     throw new Error(
-      `Failed to parse GitHub API response. ` +
-      `This may be due to rate limiting. Try again in a few minutes, or ` +
-      `download manually from: https://github.com/${REPO}/releases/latest`
+      `Failed to parse GitHub API response for v${PKG_VERSION}. ` +
+      `This may be due to rate limiting or a missing release tag. ` +
+      `Try again in a few minutes, or download manually from: ` +
+      `https://github.com/${REPO}/releases/tag/v${PKG_VERSION}`
     );
   }
 }
@@ -100,7 +104,7 @@ async function install() {
   console.log(`[cortex-memory] Detected platform: ${suffix}`);
   console.log(`[cortex-memory] Fetching latest release from ${REPO}...`);
 
-  const release = await fetchLatestRelease();
+  const release = await fetchRelease();
   const asset = release.assets.find((a) => a.name === assetName);
 
   if (!asset) {

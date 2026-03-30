@@ -1017,6 +1017,14 @@ fn tool_memory_ingest_batch(cortex: &Arc<Cortex>, args: &Value) -> Result<String
         return Err(format!("batch too large: {} items (max {})", items_arr.len(), MAX_BATCH_SIZE));
     }
 
+    // Validate each item's text size (same guard as memory_ingest)
+    for (i, item) in items_arr.iter().enumerate() {
+        let text_len = item.get("text").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+        if text_len > MAX_INGEST_TEXT_BYTES {
+            return Err(format!("item[{}] text too large: {} bytes (max {})", i, text_len, MAX_INGEST_TEXT_BYTES));
+        }
+    }
+
     let items: Vec<cortex_core::types::BatchIngestItem> = items_arr.iter().map(|item| {
         cortex_core::types::BatchIngestItem {
             text: item.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -1049,8 +1057,14 @@ fn tool_tag_list_taxonomy(cortex: &Arc<Cortex>) -> Result<String, String> {
         cortex_core::types::MemoryTier::Procedural,
     ];
 
+    let mut scanned_total: usize = 0;
+    let mut truncated = false;
     for tier in &tiers {
         if let Ok(mems) = cortex.storage().list_by_tier(*tier, MAX_TAG_SCAN_PER_TIER) {
+            if mems.len() >= MAX_TAG_SCAN_PER_TIER {
+                truncated = true;
+            }
+            scanned_total += mems.len();
             for mem in mems {
                 for tag in &mem.tags {
                     *tag_counts.entry(tag.clone()).or_insert(0) += 1;
@@ -1069,6 +1083,8 @@ fn tool_tag_list_taxonomy(cortex: &Arc<Cortex>) -> Result<String, String> {
     Ok(json!({
         "tags": items,
         "total_unique": items.len(),
+        "scanned": scanned_total,
+        "truncated": truncated,
     }).to_string())
 }
 
