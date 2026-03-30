@@ -87,7 +87,7 @@ impl CortexWasm {
         let query_lower = query.to_lowercase();
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
-        let mut scored: Vec<SearchResult> = self.memories.iter().map(|m| {
+        let mut scored: Vec<SearchResult> = self.memories.iter().enumerate().map(|(i, m)| {
             let text_lower = m.text.to_lowercase();
             let mut score: f32 = 0.0;
 
@@ -104,8 +104,7 @@ impl CortexWasm {
             }
 
             // Recency boost (newer = higher)
-            let idx = self.memories.iter().position(|x| x.id == m.id).unwrap_or(0);
-            let recency = idx as f32 / self.memories.len().max(1) as f32;
+            let recency = i as f32 / self.memories.len().max(1) as f32;
             score += recency * 0.2;
 
             SearchResult {
@@ -191,6 +190,16 @@ impl CortexWasm {
     /// without breaking values that contain "and" ("Research and Development").
     /// Recurses for 3+ clauses. Accepts "I" prefix in second clause.
     fn extract_facts(&mut self, text: &str) {
+        self.extract_facts_inner(text, 0);
+    }
+
+    fn extract_facts_inner(&mut self, text: &str, depth: u8) {
+        // Guard against unbounded recursion (crafted input with many " and work at " repetitions)
+        if depth >= 10 {
+            self.extract_single(text.trim());
+            return;
+        }
+
         let verb_prefixes = [
             "work at ", "work for ", "i work at ", "i work for ",
             "i'm a ", "i am a ", "i'm an ", "i am an ",
@@ -198,15 +207,27 @@ impl CortexWasm {
             "based in ",
         ];
 
-        // Scan ALL " and " / " And " / " AND " positions to find clause boundaries.
-        // Search in original text to avoid Unicode byte offset mismatch.
-        let lower = text.to_lowercase();
+        // Search for " and " case-insensitively by scanning the original text.
+        // We avoid lowercasing the whole string and using its byte offsets, because
+        // to_lowercase() can change byte lengths (e.g. Turkish İ → i̇).
+        let bytes = text.as_bytes();
         let mut search_from = 0;
-        while let Some(rel_pos) = lower[search_from..].find(" and ") {
-            let pos = search_from + rel_pos;
-            // Verify pos is valid in original text (ASCII " and " guarantees this for text before it,
-            // but lowercasing can shift bytes for chars like İ→i̇. Use original text search as fallback.)
-            if pos + 5 > text.len() { break; }
+        while search_from + 5 <= bytes.len() {
+            let rest = &text[search_from..];
+            // Find next " and " (case-insensitive) in the original string
+            let rel_pos = match rest.to_lowercase().find(" and ") {
+                Some(p) => p,
+                None => break,
+            };
+            // Map lowered offset back to original: since " and " is pure ASCII,
+            // we need the character count up to rel_pos to find the right byte offset.
+            let orig_char_pos = rest[..rel_pos].chars().count();
+            let orig_byte_pos: usize = rest.chars().take(orig_char_pos).map(|c| c.len_utf8()).sum();
+            let pos = search_from + orig_byte_pos;
+            // Verify the next 5 bytes in the original are " and " (case-insensitive)
+            if pos + 5 > text.len() || !text.is_char_boundary(pos) || !text.is_char_boundary(pos + 5) {
+                break;
+            }
             let after = text[pos + 5..].trim_start().to_lowercase();
             if verb_prefixes.iter().any(|p| after.starts_with(p)) {
                 let first = text[..pos].trim();
@@ -222,7 +243,7 @@ impl CortexWasm {
                 } else {
                     second.to_string()
                 };
-                self.extract_facts(&normalized);
+                self.extract_facts_inner(&normalized, depth + 1);
                 return;
             }
             search_from = pos + 5;
@@ -259,7 +280,7 @@ impl CortexWasm {
             if let Some(rest) = lower.strip_prefix(pattern) {
                 let obj = rest.split(&[',', '.', '!', '?'][..]).next().unwrap_or("").trim();
                 if !obj.is_empty() {
-                    self.add_fact("User", "is_a", obj, 0.80);
+                    self.add_fact("User", "is_a", &capitalize(obj), 0.80);
                 }
             }
         }
