@@ -162,13 +162,6 @@ impl<'a> ConsolidationEngine<'a> {
             offset += page_size;
         }
 
-        // Collect IDs that were already grouped by hash so we can skip them
-        // in the semantic pass.
-        let hash_grouped_ids: HashSet<Uuid> = fact_groups
-            .values()
-            .flat_map(|ids| ids.iter().copied())
-            .collect();
-
         // Also add memories that had a hash key but whose group is too small
         // (they won't be promoted by hash, so give them a chance via embedding).
         // We need to re-scan fact_groups to find singleton/small groups with embeddings.
@@ -199,8 +192,13 @@ impl<'a> ConsolidationEngine<'a> {
             .collect();
 
         // --- Pass 2: greedy single-pass embedding clustering for ungrouped memories ---
-        // Remove any memory that already belongs to a promoted hash group.
-        ungrouped_with_embeddings.retain(|(id, _)| !hash_grouped_ids.contains(id));
+        // Only exclude IDs that belong to *promoted* hash groups (large enough).
+        // Undersized hash groups should still participate in semantic clustering.
+        let promoted_ids: HashSet<Uuid> = results
+            .iter()
+            .flat_map(|ids| ids.iter().copied())
+            .collect();
+        ungrouped_with_embeddings.retain(|(id, _)| !promoted_ids.contains(id));
 
         if ungrouped_with_embeddings.len() >= min_occurrences {
             let semantic_groups = self.cluster_by_embedding(&ungrouped_with_embeddings);
@@ -300,7 +298,12 @@ impl<'a> ConsolidationEngine<'a> {
         let mut failed_count = 0;
         for id in &ids_to_sweep {
             match self.storage.archive_memory(*id) {
-                Ok(()) => archived_count += 1,
+                Ok(()) => {
+                    // Also remove from vector index so archived embeddings
+                    // don't displace active memories in retrieval.
+                    self.index.remove(id);
+                    archived_count += 1;
+                }
                 Err(_) => failed_count += 1,
             }
         }
