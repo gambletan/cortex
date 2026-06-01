@@ -15,12 +15,12 @@ cd cortex
 ls bench/data/locomo10.json
 
 # Run the harness
-cargo run --release -p cortex-core --bench locomo   # (see bench/ for the exact entrypoint)
+python3 bench/locomo_bench.py
 ```
 
 **Notes on methodology:**
-- Numbers are from `cargo bench` on an M-series Mac.
-- Ingest figures **include proactive inference** (fact/preference/relationship extraction) on every write — raw ingest without inference is ~15µs.
+- Setup: Claude Sonnet 4 as QA + judge, `nomic-embed-text` embeddings via Ollama, top-30 retrieval.
 - Cortex scores **73.7%**, ahead of Mem0 on the same set.
+- Results land in `bench/results/`.
 
 If your run differs, post your machine + exact command here and we'll dig in. PRs that improve the harness or add comparison baselines are very welcome.
