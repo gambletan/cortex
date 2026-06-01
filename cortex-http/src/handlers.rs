@@ -76,7 +76,7 @@ pub async fn recent_memories(State(state): State<Arc<AppState>>) -> AppResult {
         mems.extend(tier_mems);
     }
     // Sort by ingestion time descending, take top 20
-    mems.sort_by(|a, b| b.temporal.ingestion_time.cmp(&a.temporal.ingestion_time));
+    mems.sort_by_key(|m| std::cmp::Reverse(m.temporal.ingestion_time));
     mems.truncate(20);
 
     let results: Vec<serde_json::Value> = mems.iter().map(|m| {
