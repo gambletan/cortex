@@ -331,6 +331,36 @@ fn test_list_by_tier_and_namespace() {
     assert_eq!(all.len(), 4);
 }
 
+#[test]
+fn test_list_by_tier_and_namespace_orders_by_ingestion_time() {
+    use chrono::TimeZone;
+    let s = storage();
+    let whole = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+
+    // Insertion order != ingestion order, and include the whole-second edge.
+    let mut newest = make_mem_with_ns("newest", "ns1");
+    newest.temporal.ingestion_time = whole + Duration::milliseconds(500);
+    s.store_memory(&newest).unwrap();
+
+    let mut oldest = make_mem_with_ns("oldest", "ns1");
+    oldest.temporal.ingestion_time = whole - Duration::minutes(60);
+    s.store_memory(&oldest).unwrap();
+
+    let mut mid = make_mem_with_ns("mid", "ns1");
+    mid.temporal.ingestion_time = whole; // whole second, no fraction
+    s.store_memory(&mid).unwrap();
+
+    // Different namespace — must be excluded.
+    s.store_memory(&make_mem_with_ns("other", "ns2")).unwrap();
+
+    let got = s
+        .list_by_tier_and_namespace(MemoryTier::Episodic, Some("ns1"), 10)
+        .unwrap();
+    let ids: Vec<_> = got.iter().map(|m| m.id).collect();
+    // Ingestion-time DESC, namespace-scoped.
+    assert_eq!(ids, vec![newest.id, mid.id, oldest.id]);
+}
+
 // ── Archive / Restore ────────────────────────────────────────────────────
 
 #[test]
