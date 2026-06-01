@@ -1,0 +1,26 @@
+# How to reproduce the LoCoMo 73.7% benchmark
+
+> Category: **Q&A**
+
+A few people have asked how the **73.7% on LoCoMo** number is produced and how to reproduce it. Here's the full recipe — the harness and data ship in the repo, so you can verify it yourself.
+
+**What LoCoMo is:** a long-conversation memory benchmark ([ACL 2024](https://snap-research.github.io/locomo/)) — multi-session dialogues where the system must answer questions that depend on remembering earlier turns.
+
+**Reproduce it:**
+```bash
+git clone https://github.com/gambletan/cortex
+cd cortex
+
+# Benchmark data lives here:
+ls bench/data/locomo10.json
+
+# Run the harness
+cargo run --release -p cortex-core --bench locomo   # (see bench/ for the exact entrypoint)
+```
+
+**Notes on methodology:**
+- Numbers are from `cargo bench` on an M-series Mac.
+- Ingest figures **include proactive inference** (fact/preference/relationship extraction) on every write — raw ingest without inference is ~15µs.
+- Cortex scores **73.7%**, ahead of Mem0 on the same set.
+
+If your run differs, post your machine + exact command here and we'll dig in. PRs that improve the harness or add comparison baselines are very welcome.

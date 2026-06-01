@@ -1,0 +1,60 @@
+name: 🐛 Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to file a bug! Please fill out the sections below.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: When I ingest "...", search for "..." returns nothing, but I expected the memory to match.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps (ideally a curl command, code snippet, or MCP call).
+      placeholder: |
+        1. Start `cortex-http --port 3315`
+        2. POST /v1/memories with {...}
+        3. POST /v1/memories/search with {...}
+        4. See empty result
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which interface?
+      options:
+        - HTTP server (cortex-http)
+        - MCP server (cortex-mcp-server)
+        - Python SDK (cortex-ai-memory)
+        - WASM / browser demo
+        - cortex-core (library)
+        - Cloud sync
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Cortex version
+      placeholder: v2.1.0 (or git commit)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: macOS 15 (Apple Silicon) / Ubuntu 24.04 x86_64 / Docker
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any error output (set `RUST_LOG=cortex_http=debug` for more detail). Redact anything private.
+      render: shell

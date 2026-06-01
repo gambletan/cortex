@@ -120,5 +120,30 @@ async fn main() {
         .await
         .expect("failed to bind");
 
+    // Derive the displayed address from the actual bound socket, not the pre-bind
+    // CLI string: this reflects the real port when `--port 0` picks an ephemeral
+    // one, and rewrites an unspecified bind (0.0.0.0 / ::) to a navigable loopback.
+    let local = listener.local_addr().expect("listener missing local addr");
+    let host = if local.ip().is_unspecified() {
+        // 0.0.0.0 -> IPv4 loopback, :: -> IPv6 loopback (reachable on v6-only hosts)
+        if local.is_ipv6() { "[::1]".to_string() } else { "127.0.0.1".to_string() }
+    } else if local.is_ipv6() {
+        format!("[{}]", local.ip())
+    } else {
+        local.ip().to_string()
+    };
+    let url = format!("http://{host}:{}", local.port());
+
+    // First-run banner — dashboard URL + a gentle star nudge.
+    println!();
+    println!("  🧠 Cortex memory engine v{}", env!("CARGO_PKG_VERSION"));
+    println!("     API:       {url}/v1");
+    println!("     Dashboard: {url}/");
+    println!("     DB:        {db_path}");
+    println!();
+    println!("  ⭐ Enjoying Cortex? Star it — it helps others find it:");
+    println!("     https://github.com/gambletan/cortex");
+    println!();
+
     axum::serve(listener, app).await.unwrap();
 }
