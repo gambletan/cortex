@@ -193,7 +193,12 @@ impl SqliteStorage {
         let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
         let tier = MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Episodic);
         let content: MemContent = serde_json::from_str(&content_json).unwrap();
-        let embedding = embedding_blob.map(|b| std::sync::Arc::new(bytes_to_f32_vec(&b)));
+        // Treat a malformed/empty decoded blob as "no embedding" rather than storing a
+        // degenerate (empty or wrong-dimension) vector that would poison vector search.
+        let embedding = embedding_blob
+            .map(|b| bytes_to_f32_vec(&b))
+            .filter(|v| !v.is_empty())
+            .map(std::sync::Arc::new);
         let temporal: TemporalInfo = serde_json::from_str(&temporal_json).unwrap();
         let source: MemSource = serde_json::from_str(&source_json).unwrap();
         let salience: Salience = serde_json::from_str(&salience_json).unwrap();
@@ -360,6 +365,11 @@ fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
     // Check for f16 magic prefix
     if b.len() >= 2 && b[0] == F16_MAGIC[0] && b[1] == F16_MAGIC[1] {
         let data = &b[2..];
+        // A truncated body would otherwise be silently shortened by chunks_exact,
+        // yielding a wrong-dimension vector. Reject the whole blob instead.
+        if !data.len().is_multiple_of(2) {
+            return Vec::new();
+        }
         let mut result = Vec::with_capacity(data.len() / 2);
         for chunk in data.chunks_exact(2) {
             result.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
@@ -367,7 +377,11 @@ fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
         return result;
     }
 
-    // Legacy f32 format (no prefix)
+    // Legacy f32 format (no prefix). Reject a misaligned blob rather than silently
+    // truncating it to a partial (wrong-dimension) vector.
+    if !b.len().is_multiple_of(4) {
+        return Vec::new();
+    }
     let mut result = Vec::with_capacity(b.len() / 4);
     for chunk in b.chunks_exact(4) {
         result.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
@@ -1725,4 +1739,50 @@ fn parse_pattern_row(row: &rusqlite::Row) -> Result<Pattern, rusqlite::Error> {
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })
+}
+
+#[cfg(test)]
+mod embedding_codec_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_legacy_f32_exactly() {
+        let v = [1.0f32, -2.5, 3.25];
+        let mut bytes = Vec::new();
+        for x in &v {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        assert_eq!(bytes_to_f32_vec(&bytes), v);
+    }
+
+    #[test]
+    fn misaligned_legacy_f32_is_rejected_not_truncated() {
+        // 6 bytes (no magic) — a multiple-of-4 truncation would silently yield 1 float.
+        let bytes = vec![0u8, 0, 0x80, 0x3f, 0x00, 0x00];
+        assert!(
+            bytes_to_f32_vec(&bytes).is_empty(),
+            "misaligned blob must be rejected, not truncated to a partial vector"
+        );
+    }
+
+    #[test]
+    fn misaligned_f16_body_is_rejected() {
+        let mut bytes = F16_MAGIC.to_vec();
+        bytes.push(0x00); // odd-length body
+        assert!(bytes_to_f32_vec(&bytes).is_empty());
+    }
+
+    #[test]
+    fn f16_roundtrip_preserves_dimension() {
+        let v = vec![0.5f32, -0.25, 0.125, 1.0];
+        let mut bytes = F16_MAGIC.to_vec();
+        for x in &v {
+            bytes.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
+        }
+        let back = bytes_to_f32_vec(&bytes);
+        assert_eq!(back.len(), v.len());
+        for (a, b) in back.iter().zip(&v) {
+            assert!((a - b).abs() < 0.01);
+        }
+    }
 }
