@@ -245,4 +245,130 @@ mod tests {
         let prob = recompute_belief_probability(&obs);
         assert!(prob > 0.5);
     }
+
+    // ── apply_op merge semantics ────────────────────────────────────────────
+    use crate::sync::hlc::HlcTimestamp;
+    use uuid::Uuid;
+
+    fn belief_op(key: &str, obs_ms: i64, wall_ms: u64, device: &str) -> SyncOp {
+        use crate::belief::{Belief, Evidence, Observation};
+        let ts = chrono::DateTime::from_timestamp_millis(obs_ms).unwrap();
+        let belief = Belief {
+            id: Uuid::new_v4(),
+            key: key.to_string(),
+            probability: 0.5,
+            observations: vec![Observation {
+                timestamp: ts,
+                evidence: Evidence::Supports(0.8),
+                prior: 0.5,
+                posterior: 0.8,
+            }],
+            last_updated: ts,
+        };
+        SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(wall_ms, 0, device),
+            payload: SyncPayload::BeliefUpsert { belief },
+        }
+    }
+
+    fn obs_timestamps(s: &SqliteStorage, key: &str) -> Vec<i64> {
+        let mut ts: Vec<i64> = s
+            .get_belief(key)
+            .unwrap()
+            .unwrap()
+            .observations
+            .iter()
+            .map(|o| o.timestamp.timestamp_millis())
+            .collect();
+        ts.sort_unstable();
+        ts
+    }
+
+    #[test]
+    fn test_belief_upsert_is_idempotent() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        let op = belief_op("likes_rust", 1000, 100, "dev-a");
+        apply_op(&op, &s, &idx).unwrap();
+        apply_op(&op, &s, &idx).unwrap(); // replay
+        assert_eq!(
+            obs_timestamps(&s, "likes_rust"),
+            vec![1000],
+            "replaying the same op must not duplicate observations"
+        );
+    }
+
+    #[test]
+    fn test_belief_upsert_unions_observations_regardless_of_hlc() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        // Local op carries a HIGH hlc.
+        apply_op(&belief_op("k", 2000, 500, "dev-a"), &s, &idx).unwrap();
+        // Remote op carries a LOWER hlc but a distinct observation.
+        apply_op(&belief_op("k", 1000, 100, "dev-b"), &s, &idx).unwrap();
+        // Beliefs are an add-only CRDT — the lower-HLC observation must be merged,
+        // not skipped. (Guards against "adding an LWW skip" to BeliefUpsert.)
+        assert_eq!(obs_timestamps(&s, "k"), vec![1000, 2000]);
+    }
+
+    #[test]
+    fn test_belief_upsert_is_commutative() {
+        let ab = {
+            let s = SqliteStorage::open_in_memory().unwrap();
+            let idx = MemoryIndex::new();
+            apply_op(&belief_op("k", 1000, 100, "a"), &s, &idx).unwrap();
+            apply_op(&belief_op("k", 2000, 200, "b"), &s, &idx).unwrap();
+            obs_timestamps(&s, "k")
+        };
+        let ba = {
+            let s = SqliteStorage::open_in_memory().unwrap();
+            let idx = MemoryIndex::new();
+            apply_op(&belief_op("k", 2000, 200, "b"), &s, &idx).unwrap();
+            apply_op(&belief_op("k", 1000, 100, "a"), &s, &idx).unwrap();
+            obs_timestamps(&s, "k")
+        };
+        assert_eq!(ab, ba, "merged observation set must be order-independent");
+    }
+
+    #[test]
+    fn test_memory_upsert_skips_older_hlc() {
+        use crate::types::{MemContent, MemObjectBuilder, MemSource, MemoryTier};
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        let mut mem = MemObjectBuilder::new(
+            MemoryTier::Episodic,
+            MemContent::Text("v1".into()),
+            MemSource::new("t"),
+        )
+        .build();
+        let id = mem.id;
+
+        let op_new = SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(200, 0, "a"),
+            payload: SyncPayload::MemoryUpsert { memory: mem.clone() },
+        };
+        assert!(matches!(
+            apply_op(&op_new, &s, &idx).unwrap(),
+            MergeResult::Applied
+        ));
+
+        // An op with an older HLC must not overwrite, even with changed content.
+        mem.content = MemContent::Text("v2".into());
+        let op_old = SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(100, 0, "b"),
+            payload: SyncPayload::MemoryUpsert { memory: mem.clone() },
+        };
+        assert!(matches!(
+            apply_op(&op_old, &s, &idx).unwrap(),
+            MergeResult::Skipped
+        ));
+
+        match s.get_memory(id).unwrap().unwrap().content {
+            MemContent::Text(t) => assert_eq!(t, "v1"),
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
 }
