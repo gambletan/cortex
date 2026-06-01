@@ -184,7 +184,7 @@ println!("Applied {} remote changes", applied);
 | **Encryption** | AES-256-GCM with Argon2id key derivation (per-line random nonce) |
 | **Privacy levels** | Private (default, never syncs), Shared, Public |
 | **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
-| **Zero telemetry** | No analytics, no phone-home. Verify: `grep -r "reqwest\|hyper\|TcpStream" cortex-core/src/` |
+| **Zero telemetry** | No analytics, no phone-home — **enforced in CI**: the build fails if any network or telemetry crate enters `cortex-core`'s default dependency tree (`scripts/check-no-network-egress.sh`). The default build pulls zero HTTP-client/telemetry crates. |
 | **No accounts** | No API key, no registration, no cloud dependency |
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
