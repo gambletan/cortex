@@ -1,0 +1,31 @@
+name: 💡 Feature request
+description: Suggest an idea or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not just the feature. What does your AI agent need to remember or do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like it to work? API shape, MCP tool, config option, etc.
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does it respect Cortex's constraints?
+      options:
+        - label: It works fully local (no required hosted service)
+        - label: It adds no telemetry or third-party data egress
+        - label: It keeps the binary lean (no heavy new dependencies)
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you're using today, or other approaches you weighed.

@@ -258,7 +258,7 @@ print(f"Consolidated: {promoted} memories promoted, {swept} stale swept")
 
 ## LangGraph
 
-Cortex integrates with [LangGraph](https://github.com/langchain-ai/langgraph) via [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters). All 27 Cortex MCP tools become available to your LangGraph agent automatically.
+Cortex integrates with [LangGraph](https://github.com/langchain-ai/langgraph) via [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters). All 29 Cortex MCP tools become available to your LangGraph agent automatically.
 
 ### Install
 
@@ -290,7 +290,7 @@ async with MultiServerMCPClient({
     })
 ```
 
-Your LangGraph agent gets instant access to `memory_search`, `memory_ingest`, `fact_add`, `belief_observe`, `person_resolve`, and 22 more tools -- all running locally.
+Your LangGraph agent gets instant access to `memory_search`, `memory_ingest`, `fact_add`, `belief_observe`, `person_resolve`, and 24 more tools -- all running locally.
 
 See the [LangGraph section in README.md](../README.md#integration-with-langgraph) for full details.
 
@@ -320,7 +320,7 @@ mcp_servers:
       - ~/.cortex/deerflow.db
 ```
 
-All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 27 memory tools -- cross-session memory, fact storage, people graph, and belief tracking across all channels.
+All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 29 memory tools -- cross-session memory, fact storage, people graph, and belief tracking across all channels.
 
 See the [DeerFlow section in README.md](../README.md#integration-with-deerflow-bytedance) for full details.
 
@@ -401,4 +401,3 @@ curl -X POST http://localhost:3315/v1/facts \
 ```
 
 See the [HTTP API section in README.md](../README.md#http-api) for the full endpoint reference.
-# test

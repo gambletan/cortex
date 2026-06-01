@@ -26,7 +26,7 @@ A breach of a memory service exposes not individual queries but complete, struct
 
 **3. Latency kills the experience.**
 
-Cloud memory adds 200-500ms to every query. You feel it. Your AI hesitates before it can recall anything. Cortex does the same operation in 253µs — that's 1000x faster. The difference between "instant recall" and "thinking..."
+Cloud memory adds 200-500ms to every query. You feel it. Your AI hesitates before it can recall anything. Cortex does the same operation in 568µs — hundreds of times faster. The difference between "instant recall" and "thinking..."
 
 **4. You lose control.**
 
@@ -44,8 +44,8 @@ Your Device                    Your Cloud Storage
 │  SQLCipher DB │         │  iCloud / GDrive /   │
 │  (encrypted)  │ ──────> │  OneDrive / Dropbox  │
 │               │ <────── │                      │
-│  62µs ingest  │         │  AES-256-GCM oplog   │
-│  253µs search │         │  (your key, your     │
+│  156µs ingest │         │  AES-256-GCM oplog   │
+│  568µs search │         │  (your key, your     │
 │  3.8MB binary │         │   account, encrypted) │
 └──────────────┘         └──────────────────────┘
 ```
@@ -91,10 +91,10 @@ No two devices ever write to the same file, so cloud providers never see write c
 
 | Operation | Cortex | Mem0 (cloud) |
 |-----------|--------|-------------|
-| Ingest | **62µs** | ~200ms |
-| Search (top-10) | **253µs** | ~300ms |
-| Context generation | **111µs** | ~500ms |
-| Belief update | **28µs** | N/A |
+| Ingest | **156µs** | ~200ms |
+| Search (top-10) | **568µs** | ~300ms |
+| Context generation | **621µs** | ~500ms |
+| Belief update | **66µs** | N/A |
 
 Binary size: **3.8 MB**. Dependencies: **0 runtime**. Cost: **$0, forever**.
 

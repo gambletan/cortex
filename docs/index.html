@@ -12,6 +12,8 @@
   .header h1 { font-size: 20px; font-weight: 600; }
   .header .tag { background: var(--green); color: #000; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
   .header .stats { margin-left: auto; font-size: 13px; color: var(--dim); font-family: var(--mono); }
+  .star-btn { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; transition: border-color .15s, color .15s; }
+  .star-btn:hover { border-color: var(--green); color: var(--green); }
   .container { max-width: 900px; margin: 0 auto; padding: 24px 32px; }
   .section { margin-bottom: 24px; }
   .section h2 { font-size: 14px; text-transform: uppercase; color: var(--dim); margin-bottom: 8px; letter-spacing: 1px; }
@@ -44,6 +46,7 @@
   <h1>🧠 Cortex</h1>
   <span class="tag">WASM Demo — 124KB, runs in your browser</span>
   <div class="stats" id="stats">Loading...</div>
+  <a class="star-btn" href="https://github.com/gambletan/cortex" target="_blank" rel="noopener">⭐ Star on GitHub</a>
 </div>
 
 <div class="container">

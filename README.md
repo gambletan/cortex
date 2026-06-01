@@ -47,7 +47,7 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 | **Chinese NLP** | Native (inference, retrieval, relationships) | No | Limited |
 | **Namespace isolation** | Per-user/context memory separation | No | No |
 | **Plugin system** | Compile-time hooks for ingest/retrieve/consolidation | No | No |
-| **MCP tools** | 25 tools for Claude/LLM integration | 3rd party | N/A |
+| **MCP tools** | 29 tools for Claude/LLM integration | 3rd party | N/A |
 
 ### Performance Benchmarks
 
@@ -657,7 +657,7 @@ Two Cortex MCP servers: `cortex-project` (project DB) and `cortex-global` (globa
 
 This gives you two independent Cortex instances per project — complete isolation with shared user knowledge.
 
-### 27 Tools
+### 29 Tools
 
 | Tool | Purpose |
 |------|---------|
@@ -681,6 +681,15 @@ This gives you two independent Cortex instances per project — complete isolati
 | `relationship_extract` | Extract relationships from text |
 | `sync_status` | Cloud sync status (provider, devices, pending ops) |
 | `sync_providers` | Detect available cloud storage providers |
+| `sync_enable` | Enable cross-device cloud sync with optional encryption |
+| `sync_pull` | Pull and apply remote changes from other devices |
+| `memory_archive` | Archive a memory to cold storage |
+| `memory_restore` | Restore an archived memory back to an active tier |
+| `memory_delete` | Permanently delete a memory by ID |
+| `memory_ingest_batch` | Ingest multiple memories in a single transaction |
+| `tag_list_taxonomy` | List all tags in use across memories with counts |
+| `namespace_list` | List all namespaces with memory counts |
+| `person_merge` | Merge two person identities into one |
 
 ## OpenClaw Plugin
 
@@ -821,7 +830,8 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.6** ✅ — Int8 quantization (75% storage reduction), materialized column indexes, FTS5 triggers, LRU caches (MemObject + entity-facts), rayon parallel decay, Arc embedding, generation-based cache invalidation, 25 MCP tools, batch inference, enhanced Chinese NLP
 - **v1.7** ✅ — **Cloud sync** (changelog-based, HLC ordering, LWW merge), **AES-256-GCM encryption** (Argon2id KDF), **privacy enforcement** (Private/Shared/Public), **zeroize** (memory wiping), SECURITY.md, 27 MCP tools, 400+ tests
 - **v2.0** ✅ — Background sync (filesystem watcher + polling), Web Dashboard, Homebrew tap, integration docs (CrewAI/AutoGen/LangGraph/DeerFlow), `/v1/memories/recent` API, 12 rounds Codex review fixes, 489 tests
-- **v2.1** — Mobile targets (iOS/Android), multi-modal memory, WASM build
+- **v2.1** ✅ — WASM build (124KB, runs entirely in the browser, GitHub Pages demo)
+- **v2.2** — Mobile targets (iOS/Android), multi-modal memory
 
 ---
 

@@ -520,19 +520,26 @@ fn main() {
                 std::process::exit(1);
             });
 
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+            let now = chrono::Utc::now();
+            let cutoff = now - chrono::Duration::days(days as i64);
 
-            // Fetch recent episodic memories
+            // Two-stage window so the digest scales with the requested period, not total
+            // DB size, while still using event-time semantics:
+            //   1. Bound the SQL scan by created_at (the only indexed time column) to rows
+            //      inserted in [cutoff, now]. created_at >= ingestion_time for live and
+            //      imported/synced memories, so this is a small superset of the window.
+            //   2. Filter by temporal.ingestion_time (the user-visible event time) so
+            //      old history that was *inserted* recently (e.g. a sync onto a new device)
+            //      but *happened* long ago is excluded from a "last N days" digest.
             let episodes = cortex.storage()
-                .list_by_tier(cortex_core::types::MemoryTier::Episodic, 500)
+                .list_in_time_range(cortex_core::types::MemoryTier::Episodic, cutoff, now)
                 .unwrap_or_default();
             let recent: Vec<_> = episodes.iter()
                 .filter(|m| m.temporal.ingestion_time >= cutoff)
                 .collect();
 
-            // Fetch recent semantic facts
             let semantics = cortex.storage()
-                .list_by_tier(cortex_core::types::MemoryTier::Semantic, 200)
+                .list_in_time_range(cortex_core::types::MemoryTier::Semantic, cutoff, now)
                 .unwrap_or_default();
             let recent_facts: Vec<_> = semantics.iter()
                 .filter(|m| m.temporal.ingestion_time >= cutoff)

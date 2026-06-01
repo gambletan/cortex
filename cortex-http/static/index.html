@@ -899,11 +899,16 @@ function renderTimeline(items) {
   el.innerHTML = html;
 }
 
+let quickNoteInFlight = false;
 async function submitQuickNote() {
+  // Ignore re-entry (e.g. a second Enter) while a save is still in flight,
+  // otherwise the same text is submitted twice and duplicate memories are created.
+  if (quickNoteInFlight) return;
   const input = document.getElementById("quick-note-input");
   const text = input.value.trim();
   if (!text) return;
 
+  quickNoteInFlight = true;
   const btn = document.getElementById("quick-note-btn");
   btn.textContent = "Saving...";
   btn.disabled = true;
@@ -916,6 +921,7 @@ async function submitQuickNote() {
 
   btn.textContent = "Remember";
   btn.disabled = false;
+  quickNoteInFlight = false;
 
   if (result !== null) {
     input.value = "";

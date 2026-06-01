@@ -1104,7 +1104,7 @@ fn tool_tag_list_taxonomy(cortex: &Arc<Cortex>) -> Result<String, String> {
     }
 
     let mut sorted: Vec<_> = tag_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let items: Vec<Value> = sorted.iter().map(|(tag, count)| {
         json!({ "tag": tag, "count": count })

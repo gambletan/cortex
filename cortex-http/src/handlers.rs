@@ -76,7 +76,7 @@ pub async fn recent_memories(State(state): State<Arc<AppState>>) -> AppResult {
         mems.extend(tier_mems);
     }
     // Sort by ingestion time descending, take top 20
-    mems.sort_by(|a, b| b.temporal.ingestion_time.cmp(&a.temporal.ingestion_time));
+    mems.sort_by_key(|m| std::cmp::Reverse(m.temporal.ingestion_time));
     mems.truncate(20);
 
     let results: Vec<serde_json::Value> = mems.iter().map(|m| {
@@ -542,6 +542,8 @@ pub struct QuickNoteRequest {
     pub text: String,
     #[serde(default = "default_quick_note_channel")]
     pub channel: String,
+    /// Optional scope — honor per-user/namespace isolation like /v1/memories does.
+    pub user_id: Option<String>,
 }
 
 fn default_quick_note_channel() -> String {
@@ -560,7 +562,7 @@ pub async fn quick_note(
     }
     let mem = state
         .cortex
-        .ingest(&req.text, &req.channel, None, None, None)
+        .ingest(&req.text, &req.channel, req.user_id.as_deref(), None, None)
         .map_err(cortex_err)?;
     Ok(Json(json!({
         "id": mem.id.to_string(),

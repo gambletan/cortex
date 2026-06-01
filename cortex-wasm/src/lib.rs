@@ -214,16 +214,20 @@ impl CortexWasm {
         let mut search_from = 0;
         while search_from + 5 <= bytes.len() {
             let rest = &text[search_from..];
-            // Find next " and " (case-insensitive) in the original string
-            let rel_pos = match rest.to_lowercase().find(" and ") {
+            // Find next " and " (case-insensitive) directly in the ORIGINAL bytes.
+            // " and " is pure ASCII, so an ASCII-case-insensitive byte-window match can
+            // never start inside a multi-byte char — the offset is always a valid char
+            // boundary. Going via to_lowercase() byte offsets is wrong: lowercasing can
+            // change byte length (e.g. İ → i̇), shifting the split point and dropping a clause.
+            let rest_bytes = rest.as_bytes();
+            let needle = b" and ";
+            let rel_pos = match (0..=rest_bytes.len() - needle.len())
+                .find(|&i| rest_bytes[i..i + needle.len()].eq_ignore_ascii_case(needle))
+            {
                 Some(p) => p,
                 None => break,
             };
-            // Map lowered offset back to original: since " and " is pure ASCII,
-            // we need the character count up to rel_pos to find the right byte offset.
-            let orig_char_pos = rest[..rel_pos].chars().count();
-            let orig_byte_pos: usize = rest.chars().take(orig_char_pos).map(|c| c.len_utf8()).sum();
-            let pos = search_from + orig_byte_pos;
+            let pos = search_from + rel_pos;
             // Verify the next 5 bytes in the original are " and " (case-insensitive)
             if pos + 5 > text.len() || !text.is_char_boundary(pos) || !text.is_char_boundary(pos + 5) {
                 break;
@@ -292,4 +296,33 @@ fn capitalize(s: &str) -> String {
     if s.is_empty() { return String::new(); }
     let mut chars = s.chars();
     chars.next().unwrap().to_uppercase().to_string() + chars.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a code point whose lowercase form changes byte length before the
+    // " and " separator (İ U+0130 → i̇, 2→3 bytes) must not shift the clause split.
+    // The buggy version derived the split offset from text.to_lowercase() and reused
+    // it on the original string, dropping the second clause ("work at Google").
+    #[test]
+    fn split_survives_unicode_titlecase_before_separator() {
+        let mut c = CortexWasm::new();
+        c.extract_facts_inner("İ live in Berlin and work at Google", 0);
+        assert!(
+            c.facts.iter().any(|f| f.predicate == "works_at" && f.object == "Google"),
+            "second clause after a unicode-titlecase char should still extract; got {:?}",
+            c.facts
+        );
+    }
+
+    // Happy path stays intact: plain ASCII splits both clauses.
+    #[test]
+    fn split_plain_ascii_clauses() {
+        let mut c = CortexWasm::new();
+        c.extract_facts_inner("I live in Berlin and work at Google", 0);
+        assert!(c.facts.iter().any(|f| f.predicate == "lives_in" && f.object == "Berlin"));
+        assert!(c.facts.iter().any(|f| f.predicate == "works_at" && f.object == "Google"));
+    }
 }

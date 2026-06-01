@@ -19,7 +19,7 @@ Cortex 解决了这个问题。它为你的 AI 提供结构化、可查询、自
 | | Cortex | Mem0 | OpenAI Memory |
 |---|---|---|---|
 | **隐私** | 100% 本地，零云端 | 云端 API（数据在他们服务器） | OpenAI 服务器 |
-| **延迟** | **62µs** 写入，**253µs** 搜索 | ~200-500ms | ~300-800ms |
+| **延迟** | **156µs** 写入，**568µs** 搜索 | ~200-500ms | ~300-800ms |
 | **费用** | 永久免费 | $99+/月（Pro） | ChatGPT Plus $20/月 |
 | **记忆层级** | 4 层（工作/情景/语义/程序） | 1 层（扁平） | 1 层（扁平） |
 | **贝叶斯信念** | 自修正，基于证据更新 | 不支持 | 不支持 |
@@ -45,15 +45,17 @@ Cortex 解决了这个问题。它为你的 AI 提供结构化、可查询、自
 
 | 操作 | Cortex | Mem0（云端） | 文件方案 |
 |------|--------|------------|---------|
-| 写入 | **62µs** | ~200ms | ~1ms |
-| 搜索（top-10） | **253µs** | ~300ms | ~10ms |
-| 上下文生成 | **111µs** | ~500ms | 手动拼接 |
-| 信念更新 | **28µs** | 不支持 | 不支持 |
-| 社交图谱 | **20µs** | 付费版 | 不支持 |
-| 结构化事实 | **8µs** | 不支持 | 不支持 |
-| 1K 条记忆搜索 | **1.1ms** | ~500ms | ~50ms |
+| 写入 | **156µs** | ~200ms | ~1ms |
+| 搜索（top-10） | **568µs** | ~300ms | ~10ms |
+| 上下文生成 | **621µs** | ~500ms | 手动拼接 |
+| 信念更新 | **66µs** | 不支持 | 不支持 |
+| 社交图谱 | **51µs** | 付费版 | 不支持 |
+| 结构化事实 | **45µs** | 不支持 | 不支持 |
+| 1K 条记忆搜索 | **1.6ms** | ~500ms | ~50ms |
 
-比 Mem0 云端**快 1,182 倍**。并且提供 Mem0 和 OpenAI Memory 都没有的功能。
+比 Mem0 云端**快 528 倍**。并且提供 Mem0 和 OpenAI Memory 都没有的功能。
+
+> **说明：** 基准测试包含每次写入时的主动推理（自动抽取事实、偏好、关系）。不含推理的纯写入约 **15µs**。数据来自 M 系列 Mac 上的 `cargo bench`。
 
 ### LoCoMo 基准测试（[ACL 2024](https://snap-research.github.io/locomo/)）
 
@@ -531,7 +533,7 @@ cortex-mcp-server sync pull
 
 这样每个项目拥有两个独立的 Cortex 实例 — 完全隔离，同时共享用户级知识。
 
-### 25 个工具
+### 29 个工具
 
 | 工具 | 用途 |
 |------|------|
@@ -543,6 +545,10 @@ cortex-mcp-server sync pull
 | `memory_compress` | 压缩旧对话会话 |
 | `memory_stats` | 获取记忆统计（各层数量、索引大小） |
 | `memory_decay` | 对情景记忆执行时间衰减 |
+| `memory_archive` | 将记忆归档到冷存储 |
+| `memory_restore` | 将已归档记忆恢复到活跃层 |
+| `memory_delete` | 按 ID 永久删除记忆 |
+| `memory_ingest_batch` | 单次事务批量写入多条记忆 |
 | `belief_observe` | 用证据更新贝叶斯信念 |
 | `belief_list` | 查询高于阈值的信念 |
 | `fact_add` | 存储结构化知识（主语-谓语-宾语） |
@@ -551,8 +557,15 @@ cortex-mcp-server sync pull
 | `preference_query` | 按键模式查询偏好 |
 | `person_resolve` | 跨渠道身份解析 |
 | `person_list` | 列出所有已知人物 |
+| `person_merge` | 将两个人物身份合并为一个 |
 | `contradiction_check` | 检查事实矛盾 |
 | `relationship_extract` | 从文本中提取关系 |
+| `tag_list_taxonomy` | 列出所有标签及数量 |
+| `namespace_list` | 列出所有命名空间及记忆数量 |
+| `sync_enable` | 启用跨设备云同步（可选加密） |
+| `sync_pull` | 从其他设备拉取并应用远程变更 |
+| `sync_status` | 云同步状态（提供商、设备、待处理操作） |
+| `sync_providers` | 检测可用的云存储提供商 |
 
 ## OpenClaw 插件
 
@@ -631,7 +644,8 @@ cortex/
 - **v1.5** ✅ — Docker 镜像（GHCR 自动发布），功能冻结
 - **v1.7** ✅ — **云同步**（基于变更日志，HLC 排序，LWW 合并），**AES-256-GCM 加密**（Argon2id 密钥派生），**隐私执行**（Private/Shared/Public），**内存清零**（zeroize），SECURITY.md，27 个 MCP 工具，400+ 测试
 - **v2.0** ✅ — 后台同步（文件系统监听 + 轮询），Web Dashboard，Homebrew，集成文档（CrewAI/AutoGen/LangGraph/DeerFlow），489 测试
-- **v2.1** — 移动端（iOS/Android），多模态记忆，WASM 构建
+- **v2.1** ✅ — WASM 构建（124KB，完全在浏览器中运行，GitHub Pages 演示）
+- **v2.2** — 移动端（iOS/Android），多模态记忆
 
 ## 许可证
 

@@ -120,5 +120,42 @@ async fn main() {
         .await
         .expect("failed to bind");
 
+    // Derive the displayed address from the actual bound socket, not the pre-bind
+    // CLI string: this reflects the real port when `--port 0` picks an ephemeral
+    // one, and rewrites an unspecified bind (0.0.0.0 / ::) to a navigable loopback.
+    let local = listener.local_addr().expect("listener missing local addr");
+    let port = local.port();
+    let ip = local.ip();
+    // For a wildcard bind (0.0.0.0 / ::) the externally-reachable host depends on the
+    // network, so advertise a clickable loopback for local use AND note the real
+    // all-interfaces bind — rather than printing an unclickable 0.0.0.0 (bad locally)
+    // or silently rewriting it to loopback (misleading on Docker / a remote host).
+    let (display_host, all_interfaces) = if ip.is_unspecified() {
+        let loopback = if ip.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+        let bind = if ip.is_ipv6() { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") };
+        (loopback.to_string(), Some(bind))
+    } else if ip.is_ipv6() {
+        (format!("[{ip}]"), None)
+    } else {
+        (ip.to_string(), None)
+    };
+    let url = format!("http://{display_host}:{port}");
+
+    // First-run banner — dashboard URL + a gentle star nudge.
+    println!();
+    println!("  🧠 Cortex memory engine v{}", env!("CARGO_PKG_VERSION"));
+    println!("     API:       {url}/v1");
+    println!("     Dashboard: {url}/");
+    if let Some(bind) = all_interfaces {
+        // Describe the wildcard bind plainly — 0.0.0.0 / [::] are bind targets, not
+        // reachable URLs, so don't format them as a clickable http:// address.
+        println!("     (also bound to all interfaces on {bind} — reach it via this host's IP)");
+    }
+    println!("     DB:        {db_path}");
+    println!();
+    println!("  ⭐ Enjoying Cortex? Star it — it helps others find it:");
+    println!("     https://github.com/gambletan/cortex");
+    println!();
+
     axum::serve(listener, app).await.unwrap();
 }
