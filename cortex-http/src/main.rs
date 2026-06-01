@@ -147,7 +147,9 @@ async fn main() {
     println!("     API:       {url}/v1");
     println!("     Dashboard: {url}/");
     if let Some(bind) = all_interfaces {
-        println!("     (listening on all interfaces — reachable at http://{bind}/ from the network)");
+        // Describe the wildcard bind plainly — 0.0.0.0 / [::] are bind targets, not
+        // reachable URLs, so don't format them as a clickable http:// address.
+        println!("     (also bound to all interfaces on {bind} — reach it via this host's IP)");
     }
     println!("     DB:        {db_path}");
     println!();
