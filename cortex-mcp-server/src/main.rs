@@ -520,23 +520,21 @@ fn main() {
                 std::process::exit(1);
             });
 
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+            let now = chrono::Utc::now();
+            let cutoff = now - chrono::Duration::days(days as i64);
 
-            // Fetch recent episodic memories
+            // Query the requested window directly. Capping rows first (e.g.
+            // list_by_tier(.., 500)) and filtering by cutoff afterwards silently drops
+            // part of the period for a busy user with more than `cap` memories inside it.
             let episodes = cortex.storage()
-                .list_by_tier(cortex_core::types::MemoryTier::Episodic, 500)
+                .list_in_time_range(cortex_core::types::MemoryTier::Episodic, cutoff, now)
                 .unwrap_or_default();
-            let recent: Vec<_> = episodes.iter()
-                .filter(|m| m.temporal.ingestion_time >= cutoff)
-                .collect();
+            let recent: Vec<_> = episodes.iter().collect();
 
-            // Fetch recent semantic facts
             let semantics = cortex.storage()
-                .list_by_tier(cortex_core::types::MemoryTier::Semantic, 200)
+                .list_in_time_range(cortex_core::types::MemoryTier::Semantic, cutoff, now)
                 .unwrap_or_default();
-            let recent_facts: Vec<_> = semantics.iter()
-                .filter(|m| m.temporal.ingestion_time >= cutoff)
-                .collect();
+            let recent_facts: Vec<_> = semantics.iter().collect();
 
             // Output Markdown
             println!("# Cortex Memory Digest");
