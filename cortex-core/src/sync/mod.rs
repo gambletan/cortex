@@ -383,7 +383,7 @@ impl SyncEngine {
     /// Create a compressed snapshot for new-device bootstrap.
     pub fn create_snapshot(&self, storage: &dyn StorageBackend) -> Result<std::path::PathBuf, CortexError> {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
-        snapshot::create_snapshot(storage, &snapshots_dir)
+        snapshot::create_snapshot(storage, &snapshots_dir, self.crypto.as_deref())
     }
 
     /// Restore from the latest snapshot. Returns None if no snapshot exists.
@@ -395,7 +395,8 @@ impl SyncEngine {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
         match snapshot::find_latest_snapshot(&snapshots_dir)? {
             Some(path) => {
-                let (report, _) = snapshot::restore_from_snapshot(&path, storage, index)?;
+                let (report, _) =
+                    snapshot::restore_from_snapshot(&path, storage, index, self.crypto.as_deref())?;
                 Ok(Some(report))
             }
             None => Ok(None),

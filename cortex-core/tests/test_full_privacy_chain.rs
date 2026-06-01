@@ -112,23 +112,36 @@ fn test_full_privacy_chain_encrypted_db_to_encrypted_sync() {
     // Step 7: Create snapshot for new-device bootstrap
     // ══════════════════════════════════════════════════════════════════
     let snapshots_dir = sync_dir.join("snapshots");
-    let snapshot_path = snapshot::create_snapshot(cortex_a.storage(), &snapshots_dir).unwrap();
+    // The snapshot is the one place a full DB copy reaches the cloud — it must be
+    // encrypted end-to-end like the oplog, not plaintext.
+    let snap_crypto = cortex_core::sync::crypto::derive_key(
+        "full-chain-test-passphrase",
+        &cortex_core::sync::crypto::new_encryption_manifest(),
+    )
+    .unwrap();
+    let snapshot_path =
+        snapshot::create_snapshot(cortex_a.storage(), &snapshots_dir, Some(&snap_crypto)).unwrap();
     assert!(snapshot_path.exists());
 
-    // Verify snapshot is compressed (zstd)
+    // Verify the cloud-bound snapshot is AES-256-GCM encrypted, not plaintext zstd.
     let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
-    // Zstd magic number: 0xFD2FB528
-    assert_eq!(&snapshot_bytes[0..4], &[0x28, 0xB5, 0x2F, 0xFD], "Snapshot should be zstd-compressed");
-    println!("✅ Step 7: Snapshot created ({} bytes, zstd-compressed)", snapshot_bytes.len());
+    assert!(snapshot_bytes.starts_with(b"ENC1:"), "Snapshot must be encrypted");
+    assert_ne!(
+        &snapshot_bytes[0..4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "Encrypted snapshot must not be plaintext zstd"
+    );
+    println!("✅ Step 7: Snapshot created ({} bytes, AES-256-GCM encrypted)", snapshot_bytes.len());
 
     // ══════════════════════════════════════════════════════════════════
-    // Step 8: New device restores from snapshot
+    // Step 8: New device restores from the encrypted snapshot (needs the key)
     // ══════════════════════════════════════════════════════════════════
     let cortex_c = Cortex::in_memory().unwrap();
     let (report, _) = snapshot::restore_from_snapshot(
         &snapshot_path,
         cortex_c.storage(),
         cortex_c.index(),
+        Some(&snap_crypto),
     ).unwrap();
     assert!(report.memories > 0, "Should restore memories from snapshot");
 
