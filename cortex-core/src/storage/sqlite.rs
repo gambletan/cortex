@@ -1382,35 +1382,27 @@ impl StorageBackend for SqliteStorage {
         namespace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
+        // No namespace filter is exactly list_by_tier_ordered_by_ingestion — reuse it
+        // so the ordering stays consistent (and index-served) in one place.
+        let ns = match namespace {
+            Some(ns) => ns,
+            None => return self.list_by_tier_ordered_by_ingestion(tier, limit),
+        };
+        // Order by event time (ingestion_time), not the created_at insertion column —
+        // see list_by_tier_ordered_by_ingestion for the rationale (parse the RFC3339
+        // timestamp with julianday rather than comparing it as text).
         let conn = self.read_conn()?;
         let mut results = Vec::new();
-        match namespace {
-            Some(ns) => {
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND namespace = ?2 ORDER BY created_at DESC LIMIT ?3",
-                    )
-                    .map_err(|e| CortexError::Storage(e.to_string()))?;
-                let rows = stmt
-                    .query_map(params![tier.as_str(), ns, limit as i64], Self::parse_mem_row)
-                    .map_err(|e| CortexError::Storage(e.to_string()))?;
-                for row in rows {
-                    results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
-                }
-            }
-            None => {
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 ORDER BY created_at DESC LIMIT ?2",
-                    )
-                    .map_err(|e| CortexError::Storage(e.to_string()))?;
-                let rows = stmt
-                    .query_map(params![tier.as_str(), limit as i64], Self::parse_mem_row)
-                    .map_err(|e| CortexError::Storage(e.to_string()))?;
-                for row in rows {
-                    results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
-                }
-            }
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 AND namespace = ?2 ORDER BY julianday(json_extract(temporal_json, '$.ingestion_time')) DESC LIMIT ?3",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![tier.as_str(), ns, limit as i64], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
         }
         Ok(results)
     }
