@@ -104,6 +104,39 @@ fn test_list_by_tier_respects_limit() {
 }
 
 #[test]
+fn test_list_by_tier_ordered_by_ingestion_uses_event_time_not_insertion() {
+    use chrono::TimeZone;
+    let s = storage();
+
+    // Deterministic times that also exercise the whole-second vs fractional-second
+    // edge: chrono serializes "…00Z" and "…00.500Z", which do NOT sort chronologically
+    // by plain string comparison ('.' < 'Z'), so the ordering must parse the timestamp.
+    let whole = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let frac_after = whole + Duration::milliseconds(500); // 12:00:00.500 — latest
+    let frac_before = whole - Duration::milliseconds(500); // 11:59:59.500 — earliest
+
+    // Insert in a scrambled order so neither insertion nor string order matches.
+    let mut a = make_mem("whole", MemoryTier::Episodic);
+    a.temporal.ingestion_time = whole;
+    s.store_memory(&a).unwrap();
+
+    let mut b = make_mem("frac_before", MemoryTier::Episodic);
+    b.temporal.ingestion_time = frac_before;
+    s.store_memory(&b).unwrap();
+
+    let mut c = make_mem("frac_after", MemoryTier::Episodic);
+    c.temporal.ingestion_time = frac_after;
+    s.store_memory(&c).unwrap();
+
+    let ordered = s
+        .list_by_tier_ordered_by_ingestion(MemoryTier::Episodic, 10)
+        .unwrap();
+    let ids: Vec<_> = ordered.iter().map(|m| m.id).collect();
+    // Chronological DESC: frac_after (.500), whole (.000), frac_before (prev .500).
+    assert_eq!(ids, vec![c.id, a.id, b.id]);
+}
+
+#[test]
 fn test_list_by_channel() {
     let s = storage();
     let mut m1 = make_mem("a", MemoryTier::Episodic);

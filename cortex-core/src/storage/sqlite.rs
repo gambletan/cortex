@@ -400,6 +400,10 @@ impl StorageBackend for SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_memories_source_channel
                 ON memories(json_extract(source_json, '$.channel'));
+            -- Serves list_by_tier_ordered_by_ingestion: ORDER BY event time without a
+            -- full computed sort. Expression must match the query's ORDER BY exactly.
+            CREATE INDEX IF NOT EXISTS idx_memories_tier_ingestion
+                ON memories(tier, julianday(json_extract(temporal_json, '$.ingestion_time')) DESC);
             -- salience_score materialized column indexed via migration below
 
             CREATE TABLE IF NOT EXISTS links (
@@ -700,7 +704,25 @@ impl StorageBackend for SqliteStorage {
         tier: MemoryTier,
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
-        self.list_by_tier(tier, limit)
+        // Order by the event time (temporal.ingestion_time), not the created_at
+        // insertion column — they diverge for imported/synced memories. Parse the
+        // RFC3339 timestamp with julianday() rather than sorting the raw string:
+        // chrono emits variable fractional precision ("…00Z" vs "…00.500Z") that does
+        // not compare chronologically as text.
+        let conn = self.read_conn()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE tier = ?1 ORDER BY julianday(json_extract(temporal_json, '$.ingestion_time')) DESC LIMIT ?2",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![tier.as_str(), limit as i64], Self::parse_mem_row)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
+        }
+        Ok(results)
     }
 
     fn list_by_channel(
