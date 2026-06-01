@@ -906,7 +906,7 @@ impl StorageBackend for SqliteStorage {
             .query_row(
                 params![id.to_string()],
                 |row| {
-                    Ok(parse_person_row(row))
+                    parse_person_row(row)
                 },
             )
             .optional()
@@ -938,7 +938,7 @@ impl StorageBackend for SqliteStorage {
         let person = stmt
             .query_row(
                 params![channel, channel_user_id],
-                |row| Ok(parse_person_row(row)),
+                parse_person_row,
             )
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1005,7 +1005,7 @@ impl StorageBackend for SqliteStorage {
             .prepare_cached("SELECT id, display_name, relationship, first_seen, last_seen, interaction_count, tags_json, notes_json, communication_style_json FROM people ORDER BY last_seen DESC")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| Ok(parse_person_row(row)))
+            .query_map([], parse_person_row)
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut results = Vec::new();
         for row in rows {
@@ -1685,18 +1685,20 @@ impl SqliteStorage {
     }
 }
 
-fn parse_person_row(row: &rusqlite::Row) -> Person {
-    let id_str: String = row.get(0).unwrap();
-    let display_name: String = row.get(1).unwrap();
-    let relationship: String = row.get(2).unwrap();
-    let first_seen_str: String = row.get(3).unwrap();
-    let last_seen_str: String = row.get(4).unwrap();
-    let interaction_count: u32 = row.get(5).unwrap();
-    let tags_json: String = row.get(6).unwrap();
-    let notes_json: String = row.get(7).unwrap();
-    let style_json: String = row.get(8).unwrap();
+fn parse_person_row(row: &rusqlite::Row) -> Result<Person, rusqlite::Error> {
+    // Propagate column-read failures instead of unwrapping — a corrupt/tampered
+    // people row should fail the query gracefully, not panic the engine.
+    let id_str: String = row.get(0)?;
+    let display_name: String = row.get(1)?;
+    let relationship: String = row.get(2)?;
+    let first_seen_str: String = row.get(3)?;
+    let last_seen_str: String = row.get(4)?;
+    let interaction_count: u32 = row.get(5)?;
+    let tags_json: String = row.get(6)?;
+    let notes_json: String = row.get(7)?;
+    let style_json: String = row.get(8)?;
 
-    Person {
+    Ok(Person {
         id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
         identities: Vec::new(), // loaded separately
         display_name,
@@ -1711,7 +1713,7 @@ fn parse_person_row(row: &rusqlite::Row) -> Person {
         communication_style: serde_json::from_str(&style_json).unwrap_or_default(),
         tags: serde_json::from_str(&tags_json).unwrap_or_default(),
         notes: serde_json::from_str(&notes_json).unwrap_or_default(),
-    }
+    })
 }
 
 fn parse_belief_row(row: &rusqlite::Row) -> Result<Belief, rusqlite::Error> {
