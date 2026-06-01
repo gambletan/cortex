@@ -542,6 +542,8 @@ pub struct QuickNoteRequest {
     pub text: String,
     #[serde(default = "default_quick_note_channel")]
     pub channel: String,
+    /// Optional scope — honor per-user/namespace isolation like /v1/memories does.
+    pub user_id: Option<String>,
 }
 
 fn default_quick_note_channel() -> String {
@@ -560,7 +562,7 @@ pub async fn quick_note(
     }
     let mem = state
         .cortex
-        .ingest(&req.text, &req.channel, None, None, None)
+        .ingest(&req.text, &req.channel, req.user_id.as_deref(), None, None)
         .map_err(cortex_err)?;
     Ok(Json(json!({
         "id": mem.id.to_string(),
