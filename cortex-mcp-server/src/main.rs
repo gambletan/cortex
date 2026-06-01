@@ -520,21 +520,27 @@ fn main() {
                 std::process::exit(1);
             });
 
-            let now = chrono::Utc::now();
-            let cutoff = now - chrono::Duration::days(days as i64);
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
 
-            // Query the requested window directly. Capping rows first (e.g.
-            // list_by_tier(.., 500)) and filtering by cutoff afterwards silently drops
-            // part of the period for a busy user with more than `cap` memories inside it.
+            // Window on the user-visible event time (temporal.ingestion_time), NOT the
+            // SQLite created_at column: created_at is the insertion timestamp, so imported
+            // or synced history would otherwise show up in a "last N days" digest just for
+            // being written recently. Fetch the tier uncapped (i64::MAX limit) and filter in
+            // memory — a fixed row cap before the cutoff silently truncates a busy period.
+            let no_cap = i64::MAX as usize;
             let episodes = cortex.storage()
-                .list_in_time_range(cortex_core::types::MemoryTier::Episodic, cutoff, now)
+                .list_by_tier(cortex_core::types::MemoryTier::Episodic, no_cap)
                 .unwrap_or_default();
-            let recent: Vec<_> = episodes.iter().collect();
+            let recent: Vec<_> = episodes.iter()
+                .filter(|m| m.temporal.ingestion_time >= cutoff)
+                .collect();
 
             let semantics = cortex.storage()
-                .list_in_time_range(cortex_core::types::MemoryTier::Semantic, cutoff, now)
+                .list_by_tier(cortex_core::types::MemoryTier::Semantic, no_cap)
                 .unwrap_or_default();
-            let recent_facts: Vec<_> = semantics.iter().collect();
+            let recent_facts: Vec<_> = semantics.iter()
+                .filter(|m| m.temporal.ingestion_time >= cutoff)
+                .collect();
 
             // Output Markdown
             println!("# Cortex Memory Digest");
