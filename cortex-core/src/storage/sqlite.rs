@@ -174,6 +174,15 @@ impl SqliteStorage {
         }
     }
 
+    /// Deserialize a JSON column, mapping a parse failure to a SQL conversion error
+    /// rather than panicking — a corrupted or tampered row should fail the read
+    /// gracefully, not crash the whole engine.
+    fn json_col<T: serde::de::DeserializeOwned>(col: usize, s: &str) -> Result<T, rusqlite::Error> {
+        serde_json::from_str(s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e))
+        })
+    }
+
     fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
         let id_str: String = row.get(0)?;
         let tier_str: String = row.get(1)?;
@@ -192,36 +201,36 @@ impl SqliteStorage {
 
         let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
         let tier = MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Episodic);
-        let content: MemContent = serde_json::from_str(&content_json).unwrap();
+        let content: MemContent = Self::json_col(2, &content_json)?;
         // Treat a malformed/empty decoded blob as "no embedding" rather than storing a
         // degenerate (empty or wrong-dimension) vector that would poison vector search.
         let embedding = embedding_blob
             .map(|b| bytes_to_f32_vec(&b))
             .filter(|v| !v.is_empty())
             .map(std::sync::Arc::new);
-        let temporal: TemporalInfo = serde_json::from_str(&temporal_json).unwrap();
-        let source: MemSource = serde_json::from_str(&source_json).unwrap();
-        let salience: Salience = serde_json::from_str(&salience_json).unwrap();
+        let temporal: TemporalInfo = Self::json_col(4, &temporal_json)?;
+        let source: MemSource = Self::json_col(5, &source_json)?;
+        let salience: Salience = Self::json_col(6, &salience_json)?;
         // Fast-path: skip serde for common default values (avoids ~40% of JSON parsing)
         let privacy: PrivacyLevel = if privacy_json == "\"Private\"" {
             PrivacyLevel::Private
         } else {
-            serde_json::from_str(&privacy_json).unwrap()
+            Self::json_col(7, &privacy_json)?
         };
         let tags: Vec<String> = if tags_json == "[]" {
             Vec::new()
         } else {
-            serde_json::from_str(&tags_json).unwrap()
+            Self::json_col(8, &tags_json)?
         };
         let metadata: std::collections::HashMap<String, serde_json::Value> = if metadata_json == "{}" {
             std::collections::HashMap::new()
         } else {
-            serde_json::from_str(&metadata_json).unwrap()
+            Self::json_col(9, &metadata_json)?
         };
         let links: Vec<MemLink> = if links_json == "[]" {
             Vec::new()
         } else {
-            serde_json::from_str(&links_json).unwrap()
+            Self::json_col(10, &links_json)?
         };
 
         Ok(MemObject {
@@ -1784,5 +1793,21 @@ mod embedding_codec_tests {
         for (a, b) in back.iter().zip(&v) {
             assert!((a - b).abs() < 0.01);
         }
+    }
+}
+
+#[cfg(test)]
+mod row_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn json_col_returns_error_on_malformed_json_instead_of_panicking() {
+        // Valid JSON deserializes.
+        let ok: Vec<String> = SqliteStorage::json_col(8, r#"["a","b"]"#).unwrap();
+        assert_eq!(ok, vec!["a".to_string(), "b".to_string()]);
+
+        // Malformed JSON (e.g. a corrupted/tampered row) returns an Err, not a panic.
+        let err = SqliteStorage::json_col::<Vec<String>>(8, "not valid json");
+        assert!(err.is_err(), "malformed JSON must map to an error, never panic");
     }
 }
