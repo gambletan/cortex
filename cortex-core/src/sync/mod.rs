@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// Configuration for cloud sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,8 +79,17 @@ impl SyncConfig {
         self.sync_dir.join("devices")
     }
 
-    fn my_device_dir(&self) -> PathBuf {
+    pub fn my_device_dir(&self) -> PathBuf {
         self.devices_dir().join(&self.device_id)
+    }
+}
+
+impl Drop for SyncConfig {
+    fn drop(&mut self) {
+        // Zeroize passphrase from memory when config is dropped
+        if let Some(ref mut passphrase) = self.encryption_passphrase {
+            passphrase.zeroize();
+        }
     }
 }
 

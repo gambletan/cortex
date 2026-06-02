@@ -84,21 +84,25 @@ impl OpLogWriter {
 
     /// Append without flushing — use with `flush()` after a batch.
     pub fn append_buffered(&mut self, op: &SyncOp) -> Result<(), CortexError> {
+        use zeroize::Zeroize;
         self.rotate_if_needed()?;
 
-        let json = serde_json::to_string(op)
+        let mut json = serde_json::to_string(op)
             .map_err(|e| CortexError::Serialization(e.to_string()))?;
 
         let line = if let Some(ref ctx) = self.crypto {
             crate::sync::crypto::encrypt_line(ctx, json.as_bytes())?
         } else {
-            json
+            json.clone()
         };
 
         let file = self.current_file.as_mut()
             .ok_or_else(|| CortexError::Storage("No open oplog file".into()))?;
         writeln!(file, "{}", line)
             .map_err(|e| CortexError::Storage(format!("Failed to write oplog: {}", e)))?;
+
+        // Zeroize plaintext JSON from memory
+        json.zeroize();
 
         Ok(())
     }
@@ -219,7 +223,16 @@ pub fn read_oplog(
             trimmed.to_string()
         };
 
-        match serde_json::from_str::<SyncOp>(&json_str) {
+        let result = serde_json::from_str::<SyncOp>(&json_str);
+
+        // Zeroize plaintext JSON from memory (both success and error paths)
+        {
+            use zeroize::Zeroize;
+            let mut disposable = json_str;
+            disposable.zeroize();
+        }
+
+        match result {
             Ok(op) => {
                 ops.push(op);
                 offset += bytes_read as u64;
