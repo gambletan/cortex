@@ -9,6 +9,37 @@ use crate::storage::traits::StorageBackend;
 use crate::types::*;
 use crate::CortexError;
 
+/// Constant-time string comparison to prevent timing attacks.
+/// Compares two strings without early exit on mismatch.
+fn const_time_str_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    // Length mismatch is always different (safe to early exit on length)
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+
+    // Compare bytes without short-circuiting on first mismatch
+    let mut result = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
+/// Constant-time UUID comparison to prevent timing-based enumeration.
+fn const_time_uuid_eq(a: Uuid, b: Uuid) -> bool {
+    // XOR all bytes together - timing is constant regardless of which bytes differ
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut result = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
 /// Multi-signal retrieval query.
 pub struct RetrievalQuery {
     pub text: String,
@@ -232,9 +263,13 @@ impl<'a> RetrievalEngine<'a> {
         let mut results = Vec::new();
         for (&id, &sim_score) in &candidate_scores {
             if let Some(mem) = mem_map.get(&id) {
-                // Namespace isolation: skip memories that don't match requested namespace
+                // Namespace isolation: constant-time comparison to prevent enumeration attacks
                 if let Some(ref ns) = query.namespace {
-                    if mem.namespace.as_deref() != Some(ns.as_str()) {
+                    let matches = match mem.namespace.as_deref() {
+                        Some(mem_ns) => const_time_str_eq(mem_ns, ns),
+                        None => false,
+                    };
+                    if !matches {
                         continue;
                     }
                 }
@@ -444,25 +479,35 @@ impl<'a> RetrievalEngine<'a> {
         let salience = mem.salience.effective_score;
 
         // Social: boost if memory is about the queried person
+        // Uses constant-time comparison to prevent person ID enumeration
         let social = if let Some(person_id) = query.person_id {
-            match &mem.source.identity_id {
-                Some(id) if *id == person_id => 1.0,
-                _ => match &mem.content {
-                    MemContent::Relationship { person_a, person_b, .. }
-                        if *person_a == person_id || *person_b == person_id =>
-                    {
-                        1.0
-                    }
-                    _ => 0.0,
-                },
+            let mut matches = false;
+
+            // Check identity_id with constant-time comparison
+            if let Some(id) = &mem.source.identity_id {
+                if const_time_uuid_eq(*id, person_id) {
+                    matches = true;
+                }
             }
+
+            // Check relationship endpoints with constant-time comparison
+            if !matches {
+                if let MemContent::Relationship { person_a, person_b, .. } = &mem.content {
+                    if const_time_uuid_eq(*person_a, person_id) || const_time_uuid_eq(*person_b, person_id) {
+                        matches = true;
+                    }
+                }
+            }
+
+            if matches { 1.0 } else { 0.0 }
         } else {
             0.0
         };
 
         // Channel: boost if memory is from the same channel
+        // Uses constant-time string comparison to prevent channel enumeration
         let channel = if let Some(ref ch) = query.channel {
-            if mem.source.channel == *ch {
+            if const_time_str_eq(&mem.source.channel, ch) {
                 1.0
             } else {
                 0.0
