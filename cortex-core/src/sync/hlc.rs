@@ -71,15 +71,33 @@ impl HlcClock {
     }
 
     /// Generate a new timestamp for a local event.
+    /// Enforces monotonic clock to prevent time-travel attacks via clock manipulation.
     pub fn tick(&self) -> HlcTimestamp {
         let mut state = self.state.lock().unwrap();
         let now = now_ms();
 
-        if now > state.last_wall_ms {
+        // Enforce monotonic wall_ms: never allow clock to go backward
+        // This prevents attackers from using system clock manipulation to create
+        // older timestamps that would overwrite newer data via LWW.
+        if now < state.last_wall_ms {
+            // Clock was set backward — use last known time instead
+            // This ensures causality: new events always have timestamp >= last event
+            state.counter = state.counter.saturating_add(1);
+            if state.counter == 0 {
+                // Overflow: advance wall_ms by 1ms to maintain ordering
+                state.last_wall_ms = state.last_wall_ms.saturating_add(1);
+            }
+        } else if now > state.last_wall_ms {
+            // Clock advanced normally
             state.last_wall_ms = now;
             state.counter = 0;
         } else {
-            state.counter += 1;
+            // Same millisecond: increment counter
+            state.counter = state.counter.saturating_add(1);
+            if state.counter == 0 {
+                // Overflow: advance wall_ms
+                state.last_wall_ms = state.last_wall_ms.saturating_add(1);
+            }
         }
 
         HlcTimestamp {
