@@ -444,14 +444,16 @@ impl<'a> RetrievalEngine<'a> {
         let salience = mem.salience.effective_score;
 
         // Social: boost if memory is about the queried person
+        // Constant-time comparison: evaluate both person_a and person_b without short-circuit
+        // to prevent timing attacks revealing which field matched
         let social = if let Some(person_id) = query.person_id {
             match &mem.source.identity_id {
                 Some(id) if *id == person_id => 1.0,
                 _ => match &mem.content {
-                    MemContent::Relationship { person_a, person_b, .. }
-                        if *person_a == person_id || *person_b == person_id =>
-                    {
-                        1.0
+                    MemContent::Relationship { person_a, person_b, .. } => {
+                        let matches_a = *person_a == person_id;
+                        let matches_b = *person_b == person_id;
+                        if matches_a | matches_b { 1.0 } else { 0.0 }
                     }
                     _ => 0.0,
                 },
