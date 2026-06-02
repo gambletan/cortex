@@ -25,6 +25,27 @@ fn cortex_err(e: cortex_core::CortexError) -> (StatusCode, Json<Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+// ── Input bounds (parity with the MCP tool layer) ────────────────────────────
+// Clamp client-supplied sizes so a malformed/hostile request can't exhaust memory,
+// and floor the compression window so a negative value can't invert its meaning.
+const MAX_SEARCH_LIMIT: usize = 100;
+const MAX_CONTEXT_TOKENS: usize = 8_000;
+
+fn search_limit(req: Option<usize>) -> usize {
+    req.unwrap_or(10).min(MAX_SEARCH_LIMIT)
+}
+fn context_tokens(req: Option<usize>) -> usize {
+    req.unwrap_or(2000).min(MAX_CONTEXT_TOKENS)
+}
+fn compress_min_messages(req: Option<usize>) -> usize {
+    req.unwrap_or(5).max(1)
+}
+fn compress_max_age_days(req: Option<i64>) -> i64 {
+    // max(1): a negative window would set the cutoff in the future and compress
+    // fresh memories instead of old ones.
+    req.unwrap_or(7).max(1)
+}
+
 fn content_to_string(content: &MemContent) -> String {
     match content {
         MemContent::Text(t) => t.clone(),
@@ -154,7 +175,7 @@ pub async fn search(
         .cortex
         .retrieve(
             &req.query,
-            req.limit.unwrap_or(10),
+            search_limit(req.limit),
             req.channel.as_deref(),
             person_id,
             None,
@@ -202,7 +223,7 @@ pub async fn context(
     let ctx = state
         .cortex
         .get_context(
-            q.max_tokens.unwrap_or(2000),
+            context_tokens(q.max_tokens),
             q.channel.as_deref(),
             person_id,
         )
@@ -523,8 +544,8 @@ pub async fn compress(
     let report = state
         .cortex
         .run_compression(
-            req.min_messages.unwrap_or(5),
-            req.max_age_days.unwrap_or(7),
+            compress_min_messages(req.min_messages),
+            compress_max_age_days(req.max_age_days),
         )
         .map_err(cortex_err)?;
 
@@ -600,4 +621,32 @@ pub async fn extract_relationships(
         "relationships": items,
         "total": items.len(),
     })))
+}
+
+#[cfg(test)]
+mod input_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn search_limit_defaults_and_clamps() {
+        assert_eq!(search_limit(None), 10);
+        assert_eq!(search_limit(Some(25)), 25);
+        assert_eq!(search_limit(Some(usize::MAX)), MAX_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn context_tokens_defaults_and_clamps() {
+        assert_eq!(context_tokens(None), 2000);
+        assert_eq!(context_tokens(Some(500)), 500);
+        assert_eq!(context_tokens(Some(usize::MAX)), MAX_CONTEXT_TOKENS);
+    }
+
+    #[test]
+    fn compress_args_floor_at_one() {
+        assert_eq!(compress_max_age_days(None), 7);
+        assert_eq!(compress_max_age_days(Some(30)), 30);
+        // A negative window must not invert into the future.
+        assert_eq!(compress_max_age_days(Some(-365)), 1);
+        assert_eq!(compress_min_messages(Some(0)), 1);
+    }
 }
