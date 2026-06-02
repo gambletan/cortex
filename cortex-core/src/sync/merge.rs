@@ -102,6 +102,15 @@ pub fn apply_op(
         SyncPayload::PersonUpsert { person } => {
             let entity_type = EntityType::Person;
 
+            // A delete with a newer-or-equal HLC tombstones the person; a stale upsert
+            // must not resurrect it (mirrors the MemoryUpsert tombstone guard).
+            let tomb = storage.with_write_conn(|c| state::is_tombstoned(c, entity_type, person.id))?;
+            if let Some(tomb_hlc) = tomb {
+                if tomb_hlc >= op.hlc {
+                    return Ok(MergeResult::Tombstoned);
+                }
+            }
+
             let local_hlc = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, person.id))?;
             let local_wins = local_hlc.map(|l| l >= op.hlc).unwrap_or(false);
 
@@ -139,6 +148,10 @@ pub fn apply_op(
                     storage.update_person(&merged)?;
                 }
                 None => {
+                    if local_wins {
+                        // Newer-or-equal local HLC but no record (e.g. deleted) — don't (re)create.
+                        return Ok(MergeResult::Skipped);
+                    }
                     storage.store_person(person)?;
                 }
             }
@@ -440,5 +453,28 @@ mod tests {
         assert_eq!(p.interaction_count, 10, "a newer op must not lower the count");
         assert_eq!(p.last_seen.timestamp_millis(), 2000, "a newer op must not move last_seen back");
         assert_eq!(p.first_seen.timestamp_millis(), 800, "first_seen takes the earliest");
+    }
+
+    #[test]
+    fn test_person_upsert_does_not_resurrect_after_delete() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        let id = Uuid::new_v4();
+        apply_op(&person_op(id, 1, 1000, 1000, 100, "a"), &s, &idx).unwrap();
+        // Delete with a newer hlc.
+        let del = SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(200, 0, "a"),
+            payload: SyncPayload::PersonDelete { id },
+        };
+        apply_op(&del, &s, &idx).unwrap();
+        assert!(s.get_person(id).unwrap().is_none());
+
+        // A stale upsert (older than the delete) must NOT resurrect the person.
+        apply_op(&person_op(id, 5, 3000, 500, 150, "b"), &s, &idx).unwrap();
+        assert!(
+            s.get_person(id).unwrap().is_none(),
+            "a stale upsert must not resurrect a tombstoned person"
+        );
     }
 }
