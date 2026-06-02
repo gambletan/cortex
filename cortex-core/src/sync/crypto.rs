@@ -6,10 +6,15 @@
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{Aes256Gcm, AeadCore, Key, KeyInit};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::CortexError;
+
+type HmacSha256 = Hmac<Sha256>;
 
 const ENC_PREFIX: &str = "ENC1:";
 const NONCE_LEN: usize = 12;
@@ -19,12 +24,28 @@ const SALT_LEN: usize = 16;
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CryptoContext {
     key_bytes: [u8; 32],
+    hmac_key: [u8; 32], // Separate key for HMAC
 }
 
 impl CryptoContext {
     fn cipher(&self) -> Aes256Gcm {
         let key = Key::<Aes256Gcm>::from_slice(&self.key_bytes);
         Aes256Gcm::new(key)
+    }
+
+    fn compute_hmac(&self, data: &[u8]) -> [u8; 32] {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.hmac_key)
+            .expect("HMAC key size is valid");
+        mac.update(data);
+        let result = mac.finalize();
+        let mut hmac_bytes = [0u8; 32];
+        hmac_bytes.copy_from_slice(result.into_bytes().as_slice());
+        hmac_bytes
+    }
+
+    fn verify_hmac(&self, data: &[u8], expected: &[u8; 32]) -> bool {
+        let computed = self.compute_hmac(data);
+        computed.as_slice().ct_eq(expected.as_slice()).into()
     }
 }
 
@@ -62,7 +83,8 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
     }
 }
 
-/// Derive an encryption key from a passphrase and manifest.
+/// Derive encryption and HMAC keys from passphrase and manifest.
+/// Uses KDF expansion to derive two independent keys from one passphrase.
 pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<CryptoContext, CortexError> {
     let salt = base64::engine::general_purpose::STANDARD
         .decode(&manifest.salt)
@@ -72,18 +94,24 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         manifest.kdf_params.mem_cost,
         manifest.kdf_params.time_cost,
         manifest.kdf_params.parallelism,
-        Some(32),
+        Some(64), // Derive 64 bytes: 32 for AES-256 + 32 for HMAC-SHA256
     )
     .map_err(|e| CortexError::Storage(format!("Invalid Argon2 params: {}", e)))?;
 
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-    let mut key_bytes = [0u8; 32];
+    let mut key_material = [0u8; 64];
     argon2
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut key_bytes)
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut key_material)
         .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
 
-    Ok(CryptoContext { key_bytes })
+    let mut key_bytes = [0u8; 32];
+    let mut hmac_key = [0u8; 32];
+    key_bytes.copy_from_slice(&key_material[0..32]);
+    hmac_key.copy_from_slice(&key_material[32..64]);
+    key_material.zeroize(); // Clear intermediate material
+
+    Ok(CryptoContext { key_bytes, hmac_key })
 }
 
 /// Encrypt a plaintext line → `ENC1:<base64(nonce || ciphertext || tag)>`

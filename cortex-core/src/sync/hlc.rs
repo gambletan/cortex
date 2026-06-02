@@ -120,13 +120,26 @@ impl HlcClock {
         } else if remote.wall_ms > state.last_wall_ms {
             // Remote is ahead — adopt remote wall, increment counter
             state.last_wall_ms = remote.wall_ms;
-            state.counter = remote.counter + 1;
+            state.counter = remote.counter.saturating_add(1);
+            if state.counter == 0 {
+                // Overflow: advance wall_ms to prevent collision
+                state.last_wall_ms = state.last_wall_ms.saturating_add(1);
+            }
         } else if state.last_wall_ms == remote.wall_ms {
             // Same wall — take max counter + 1
-            state.counter = state.counter.max(remote.counter) + 1;
+            let max_counter = state.counter.max(remote.counter);
+            state.counter = max_counter.saturating_add(1);
+            if state.counter == 0 {
+                // Overflow: advance wall_ms to prevent collision
+                state.last_wall_ms = state.last_wall_ms.saturating_add(1);
+            }
         } else {
             // Local is ahead — just increment
-            state.counter += 1;
+            state.counter = state.counter.saturating_add(1);
+            if state.counter == 0 {
+                // Overflow: advance wall_ms to prevent collision
+                state.last_wall_ms = state.last_wall_ms.saturating_add(1);
+            }
         }
 
         HlcTimestamp {
