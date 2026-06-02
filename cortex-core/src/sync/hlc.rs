@@ -120,10 +120,12 @@ impl HlcClock {
         } else if remote.wall_ms > state.last_wall_ms {
             // Remote is ahead — adopt remote wall, increment counter
             state.last_wall_ms = remote.wall_ms;
-            state.counter = remote.counter.saturating_add(1);
-            if state.counter == 0 {
-                // Overflow: advance wall_ms to prevent collision
+            if remote.counter == u32::MAX {
+                // Remote is at max counter: advance wall_ms instead of overflowing
                 state.last_wall_ms = state.last_wall_ms.saturating_add(1);
+                state.counter = 0;
+            } else {
+                state.counter = remote.counter + 1;
             }
         } else if state.last_wall_ms == remote.wall_ms {
             // Same wall — take max counter + 1

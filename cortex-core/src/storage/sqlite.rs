@@ -1608,11 +1608,6 @@ impl SqliteStorage {
     /// Filters out Private memories to prevent privacy bypass.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(Uuid, f64)>, CortexError> {
         let conn = self.read_conn()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT m.id, m.rank FROM memories_fts m WHERE m.memories_fts MATCH ?1 ORDER BY m.rank LIMIT ?2",
-            )
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
 
         // FTS5 match syntax: escape special chars, use implicit AND
         let safe_query: String = query
@@ -1623,8 +1618,17 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
+        // Over-fetch to compensate for privacy filtering (estimate ~20% will be Private)
+        let fetch_limit = (limit * 5).min(1000);
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, rank FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
         let rows = stmt
-            .query_map(params![safe_query, limit as i64], |row| {
+            .query_map(params![safe_query, fetch_limit as i64], |row| {
                 let id_str: String = row.get(0)?;
                 let rank: f64 = row.get(1)?;
                 Ok((id_str, rank))
@@ -1637,6 +1641,10 @@ impl SqliteStorage {
         let mut raw: Vec<(Uuid, f64)> = Vec::new();
 
         for row in rows {
+            if raw.len() >= limit {
+                // Got enough results, stop processing
+                break;
+            }
             let (id_str, rank) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
             if let Ok(id) = Uuid::parse_str(&id_str) {
                 // Check if memory is Private — skip if it is (privacy enforcement)

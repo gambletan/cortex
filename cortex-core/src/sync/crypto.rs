@@ -90,7 +90,8 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
 }
 
 /// Derive encryption and HMAC keys from passphrase and manifest.
-/// Uses KDF expansion to derive two independent keys from one passphrase.
+/// Maintains backward compatibility: AES key derived from 32-byte output,
+/// HMAC key derived separately to avoid breaking existing encrypted data.
 pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<CryptoContext, CortexError> {
     let salt = base64::engine::general_purpose::STANDARD
         .decode(&manifest.salt)
@@ -100,22 +101,30 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         manifest.kdf_params.mem_cost,
         manifest.kdf_params.time_cost,
         manifest.kdf_params.parallelism,
-        Some(64), // Derive 64 bytes: 32 for AES-256 + 32 for HMAC-SHA256
+        Some(32), // Original output length for AES key derivation (backward compatible)
     )
     .map_err(|e| CortexError::Storage(format!("Invalid Argon2 params: {}", e)))?;
 
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-    let mut key_material = [0u8; 64];
+    // Derive AES key (preserved for backward compatibility)
+    let mut key_bytes = [0u8; 32];
     argon2
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut key_material)
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut key_bytes)
         .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
 
-    let mut key_bytes = [0u8; 32];
+    // Derive HMAC key separately using passphrase + "HMAC" domain separator
+    let mut hmac_salt = salt.clone();
+    // Append domain separator to salt to ensure HMAC key is independent
+    let salt_len = hmac_salt.len();
+    for i in 0..3.min(salt_len) {
+        hmac_salt[salt_len - 1 - i] ^= b"HMAC"[i] as u8;
+    }
+
     let mut hmac_key = [0u8; 32];
-    key_bytes.copy_from_slice(&key_material[0..32]);
-    hmac_key.copy_from_slice(&key_material[32..64]);
-    key_material.zeroize(); // Clear intermediate material
+    argon2
+        .hash_password_into(passphrase.as_bytes(), &hmac_salt, &mut hmac_key)
+        .map_err(|e| CortexError::Storage(format!("HMAC key derivation failed: {}", e)))?;
 
     Ok(CryptoContext { key_bytes, hmac_key })
 }
@@ -196,14 +205,16 @@ fn compute_manifest_hmac_with_salt(
 }
 
 /// Compute HMAC for manifest integrity protection.
-/// Uses the passphrase to derive an HMAC key, then computes HMAC of the manifest content.
-pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<String, CortexError> {
+/// Returns (hmac_value, salt) so salt can be persisted and reused for verification.
+pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<(String, String), CortexError> {
     // Generate random salt for HMAC key derivation
     let mut salt = [0u8; 16];
     use rand::RngCore;
     OsRng.fill_bytes(&mut salt);
 
-    compute_manifest_hmac_with_salt(manifest_json, passphrase, &salt)
+    let hmac_value = compute_manifest_hmac_with_salt(manifest_json, passphrase, &salt)?;
+    let salt_b64 = base64::engine::general_purpose::STANDARD.encode(&salt);
+    Ok((hmac_value, salt_b64))
 }
 
 /// Internal: Verify manifest integrity with explicit salt (for testing)
@@ -219,12 +230,31 @@ fn verify_manifest_integrity_with_salt(
 }
 
 /// Verify manifest integrity using HMAC.
+/// If salt_b64 is provided, it uses the stored salt; otherwise generates a new one.
 pub fn verify_manifest_integrity(
     manifest_json: &[u8],
     expected_hmac: &str,
     passphrase: &str,
+    salt_b64: Option<&str>,
 ) -> Result<bool, CortexError> {
-    let computed = compute_manifest_hmac(manifest_json, passphrase)?;
+    let computed = match salt_b64 {
+        Some(salt_b64_str) => {
+            // Use stored salt for verification
+            let salt_bytes = base64::engine::general_purpose::STANDARD
+                .decode(salt_b64_str)
+                .map_err(|e| CortexError::Storage(format!("Invalid HMAC salt: {}", e)))?;
+            if salt_bytes.len() != 16 {
+                return Err(CortexError::Storage("Invalid HMAC salt length".into()));
+            }
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&salt_bytes);
+            compute_manifest_hmac_with_salt(manifest_json, passphrase, &salt)?
+        }
+        None => {
+            // Generate new salt (legacy path for old manifests)
+            compute_manifest_hmac(manifest_json, passphrase)?.0
+        }
+    };
     // Use constant-time comparison
     Ok(computed.as_bytes().ct_eq(expected_hmac.as_bytes()).into())
 }
