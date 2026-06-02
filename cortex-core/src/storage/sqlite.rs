@@ -646,6 +646,7 @@ impl StorageBackend for SqliteStorage {
         Ok(result)
     }
 
+
     fn update_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
         let conn = self.write_conn.lock();
         let now = Utc::now().to_rfc3339();
@@ -1217,6 +1218,7 @@ impl StorageBackend for SqliteStorage {
                  content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
                  AND (fact_subject LIKE ?1 OR fact_object LIKE ?1) \
+                 AND privacy_json != '\"Private\"' \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1251,6 +1253,7 @@ impl StorageBackend for SqliteStorage {
              salience_json, privacy_json, tags_json, metadata_json, links_json, \
              content_hash, namespace \
              FROM memories WHERE tier = 'semantic' AND ({}) \
+             AND privacy_json != '\"Private\"' \
              ORDER BY created_at DESC",
             conditions.join(" OR ")
         );
@@ -1280,6 +1283,7 @@ impl StorageBackend for SqliteStorage {
                  content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
                  AND pref_key LIKE ?1 \
+                 AND privacy_json != '\"Private\"' \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1601,11 +1605,12 @@ impl StorageBackend for SqliteStorage {
 impl SqliteStorage {
     /// Full-text search using FTS5. Returns (id, BM25 rank) pairs.
     /// Rank is normalized to 0.0–1.0 range.
+    /// Filters out Private memories to prevent privacy bypass.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(Uuid, f64)>, CortexError> {
         let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, rank FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+                "SELECT m.id, m.rank FROM memories_fts m WHERE m.memories_fts MATCH ?1 ORDER BY m.rank LIMIT ?2",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
 
@@ -1634,14 +1639,21 @@ impl SqliteStorage {
         for row in rows {
             let (id_str, rank) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
             if let Ok(id) = Uuid::parse_str(&id_str) {
-                if raw.is_empty() {
-                    min_rank = rank;
-                    max_rank = rank;
-                } else {
-                    min_rank = min_rank.min(rank);
-                    max_rank = max_rank.max(rank);
+                // Check if memory is Private — skip if it is (privacy enforcement)
+                if let Ok(Some(mem)) = self.get_memory(id) {
+                    if !mem.privacy.is_syncable() {
+                        // Skip Private memories
+                        continue;
+                    }
+                    if raw.is_empty() {
+                        min_rank = rank;
+                        max_rank = rank;
+                    } else {
+                        min_rank = min_rank.min(rank);
+                        max_rank = max_rank.max(rank);
+                    }
+                    raw.push((id, rank));
                 }
-                raw.push((id, rank));
             }
         }
 

@@ -32,6 +32,13 @@ pub fn apply_op(
 ) -> Result<MergeResult, CortexError> {
     match &op.payload {
         SyncPayload::MemoryUpsert { memory } => {
+            // Reject Private memories from remote sync — only Shared/Public allowed
+            if !memory.privacy.is_syncable() {
+                return Err(CortexError::InvalidInput(
+                    "Remote device attempted to sync Private memory — rejected".into(),
+                ));
+            }
+
             let entity_type = EntityType::Memory;
             let entity_id = memory.id;
 
@@ -364,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_memory_upsert_skips_older_hlc() {
-        use crate::types::{MemContent, MemObjectBuilder, MemSource, MemoryTier};
+        use crate::types::{MemContent, MemObjectBuilder, MemSource, MemoryTier, PrivacyLevel};
         let s = SqliteStorage::open_in_memory().unwrap();
         let idx = MemoryIndex::new();
         let mut mem = MemObjectBuilder::new(
@@ -372,6 +379,7 @@ mod tests {
             MemContent::Text("v1".into()),
             MemSource::new("t"),
         )
+        .privacy(PrivacyLevel::Public)
         .build();
         let id = mem.id;
 

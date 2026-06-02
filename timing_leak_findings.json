@@ -1,0 +1,140 @@
+[
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 237,
+    "summary": "Namespace isolation uses direct string equality comparison (!=) on potentially sensitive namespace identifier without constant-time guarantee. Timing varies based on string length and content match position.",
+    "failure_scenario": "Attacker can infer valid namespace values by measuring response time variations. Early exit on mismatch vs. full processing of matching namespaces leaks namespace existence/validity."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 243,
+    "summary": "Memory tier filtering skips archived memories via early-exit continue. Accessing query.namespace check (line 237) before tier filtering creates data-dependent control flow timing. Archived memories are filtered before expensive scoring computation.",
+    "failure_scenario": "Attacker can determine if memory is archived by observing response time. Memories that match namespace but are archived skip expensive compute_scores(), saving milliseconds. Non-archived memories go through full scoring pipeline."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 289,
+    "summary": "Case-sensitive string containment check on fact subject/object after lowercasing. String comparison timing varies with content length and match position. No constant-time string comparison used.",
+    "failure_scenario": "Memory content patterns can be inferred from query expansion timing. Fact matching uses .contains() which short-circuits on mismatch, leaking how early the query entity appears in subject/object text."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 310,
+    "summary": "expand_query() uses HashSet.retain() with non-constant-time string comparison (e != \"User\"). Timing depends on length of expanded set and content. Filter operation is observable.",
+    "failure_scenario": "Expansion term filtering timing leaks information about query entity uniqueness. Generic vs. rare entities have different filtering times due to HashSet operations and string comparisons."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 449,
+    "summary": "Person_id matching uses direct Uuid equality (== person_id) without constant-time comparison. Social scoring logic has early-exit in nested match: hits Some(id) and returns 1.0 immediately vs. fallthrough to 0.0.",
+    "failure_scenario": "Querying with a valid person_id returns faster than invalid person_id because Social score is set to 1.0 immediately on match vs. continuing through all candidates. Timing side-channel reveals valid person IDs."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 452,
+    "summary": "Relationship person_a/person_b matching uses OR logic (||) without constant-time evaluation. If person_a matches, short-circuits and doesn't evaluate person_b equality check.",
+    "failure_scenario": "Attacker can infer relationship structure by timing queries. Relationships where person_a matches return faster (skip person_b check) than those matching only person_b. Pattern of timing differences reveals social graph topology."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 465,
+    "summary": "Channel matching uses direct string equality (mem.source.channel == *ch) in conditional. Early exit to score 1.0 or 0.0 means matching channels have different execution path than non-matching.",
+    "failure_scenario": "Valid channel names can be enumerated by timing. Matching channel = fast scoring path (1.0). Non-matching channel = different timing path. Attacker discovers valid channel names through repeated queries."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 25,
+    "summary": "Zero-norm check (denom == 0.0) in distance function has early return for zero vectors. Non-zero vectors proceed through division, causing variable execution time based on norm value.",
+    "failure_scenario": "Query vectors with zero-norm are distinguishable from non-zero vectors by timing. Reveals information about query embedding characteristics. Zero-embedding queries are detectable as timing anomalies."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 166,
+    "summary": "Early return when total==0 before entering search logic. Empty index vs. large index have dramatically different code paths and timing. No constant-time guarantee.",
+    "failure_scenario": "Attacker can infer if index is empty or populated by query latency. Empty index returns immediately. Populated index goes through complex HNSW/brute-force logic. Timing gap easily exceeds 10ms."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 171,
+    "summary": "Collection size threshold check (total < min_size) determines if brute-force or HNSW search is used. Different algorithms have 10-100x timing differences. No attempt to normalize execution time.",
+    "failure_scenario": "Index size can be inferred from query latency profile. Collections under 1000 items (brute-force) have vastly different response times than 1000+ (HNSW). Reveals approximate number of stored embeddings."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 176,
+    "summary": "Rebuild necessity check (needs_rebuild) triggers different paths: read-only search vs. write lock + rebuild. HNSW rebuild is expensive operation (seconds). Timing reveals if rebuild is pending.",
+    "failure_scenario": "Query latency spikes by orders of magnitude when rebuild is triggered. Attacker observes when rebuild becomes necessary based on insertion patterns. Can infer pending/stable set sizes from timing variance."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 186,
+    "summary": "Pending buffer overflow check uses multiplication (pending.len() as f32 > size_at_build as f32 * ratio). Comparison result determines search path. Variable-time arithmetic on observable state.",
+    "failure_scenario": "Pending buffer size can be inferred from timing patterns. Overflow condition triggers rebuild, creating observable timing discontinuity at size_at_build * ratio threshold."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 197,
+    "summary": "Cooldown elapsed check (last_rebuild.elapsed() < cooldown) returns stale results vs. triggering rebuild. Two different timing profiles: fast stale-search vs. slow fresh-rebuild.",
+    "failure_scenario": "Attacker can infer rebuild timing state. Queries arriving within cooldown window return faster (stale index search only). Queries after cooldown trigger rebuild (slower). Reveals rebuild schedule."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 252,
+    "summary": "Stable set membership check (inner.stable.contains_key(&id)) filters HNSW results. Entry removal timing varies by iteration position in HashMap. No constant-time lookup guarantee for removed entries.",
+    "failure_scenario": "Removed entry detection timing varies. If entry is in stable set, fast lookup succeeds. If removed, lookup fails (but HashMap iteration order is deterministic based on hash). Observable timing in filtered result."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 305,
+    "summary": "Query norm zero-check (query_norm == 0.0) in brute_force_search_both causes early return. Zero-norm vs. non-zero norm queries have different execution paths. No padding to constant time.",
+    "failure_scenario": "All zero-embedding queries return in constant time (Vec::new()). Non-zero queries proceed through full brute-force comparison loop. Timing difference (ms) reveals if input embedding is zero."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 313,
+    "summary": "Entry norm zero-check (entry.norm == 0.0) filters results via early return None in filter_map. Entries with zero norm are excluded before similarity computation. Variable results based on zero-norm entry count.",
+    "failure_scenario": "Query timing varies with count of zero-norm entries in index. Indexes with many zero-norm entries return faster (filtered early). Reveals data corruption or pattern of zero-vectors in dataset."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 318,
+    "summary": "is_finite() check on similarity score filters results. NaN/Inf scores cause early filter rejection. Queries producing many NaN results have different timing than those with all finite scores.",
+    "failure_scenario": "Embedding dimension mismatches or degenerate queries produce NaN values, creating timing anomalies. Attacker can infer embedding format/dimensions from is_finite() filtering timing patterns."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/storage/memory_index.rs",
+    "line": 323,
+    "summary": "select_nth_unstable_by only runs if results.len() > limit. Skipping quickselect for small result sets saves significant time. Condition on result size creates observable timing cliff.",
+    "failure_scenario": "Queries returning exactly limit results skip quickselect. Queries returning limit+1 trigger expensive partition. Timing jump at boundary reveals information about result cardinality."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 133,
+    "summary": "HNSW search early returns if embedding is Some() vs. fallback branch when None. Different code paths: vector search vs. tier-based fallback. Embedding presence is observable from timing.",
+    "failure_scenario": "Queries without embeddings fall back to tier-based search (slower). Queries with embeddings use HNSW (faster with index). Timing reveals whether caller provided query embedding."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 139,
+    "summary": "candidate_scores.is_empty() check determines if embedding search found results or fallback is used. Early exit to fallback retrieval. Timing varies dramatically between empty and populated results.",
+    "failure_scenario": "Embedding search that returns 0 results triggers expensive fallback (list_by_tier x2). Non-empty embedding results skip fallback. Timing spike reveals if embedding search failed."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 153,
+    "summary": "Query expansion check (if !expanded_entities.is_empty()) controls multi-hop expansion. Empty expansion skips entity-based lookups. Timing depends on query content complexity.",
+    "failure_scenario": "Queries with many extractable entities trigger expensive multi-hop logic. Simple queries with no entities skip expansion. Timing reveals query content linguistic complexity and entity density."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 161,
+    "summary": "Temporal intent detection (if temporal_intent != TemporalIntent::None) triggers temporal-specific candidate gathering. No temporal intent vs. temporal intent has vastly different code paths.",
+    "failure_scenario": "Temporal queries trigger extra list_by_tier_ordered_by_ingestion() calls and temporal score computation. Non-temporal queries skip this. Timing reveals if query contains temporal intent markers."
+  },
+  {
+    "file": "/Users/alvinclaw/work/cortex/cortex-core/src/retrieval.rs",
+    "line": 431,
+    "summary": "mem.temporal.event_time.is_some() check creates two-branch scoring (0.7 vs. 0.4). Early exit on Some() vs. continuing to None. Observable timing difference in temporal score assignment.",
+    "failure_scenario": "Memories with event_time set return different timing than those without. Observer can infer if memory has temporal grounding from compute_scores() latency."
+  }
+]
