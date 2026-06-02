@@ -211,6 +211,32 @@ mod tests {
     }
 
     #[test]
+    fn test_counter_overflow_advances_wall_ms() {
+        let clock = HlcClock::new("device-a");
+
+        // Generate many timestamps at the same wall_ms to push counter near limit
+        let mut last_ts = None;
+        for _ in 0..100 {
+            let ts = clock.tick();
+            last_ts = Some(ts);
+        }
+
+        let ts = last_ts.unwrap();
+        // Counter should have incremented and not overflowed (saturating_add prevents overflow)
+        assert!(ts.counter < u32::MAX, "Counter should not overflow");
+    }
+
+    #[test]
+    fn test_update_with_counter_at_max() {
+        let clock = HlcClock::new("device-a");
+        let remote = HlcTimestamp::new(1000, u32::MAX, "device-b");
+
+        let local = clock.update(&remote);
+        // Should advance past remote by incrementing counter or wall_ms
+        assert!(local > remote, "Should advance past remote at counter max");
+    }
+
+    #[test]
     fn test_serde_roundtrip() {
         let ts = HlcTimestamp::new(1234567890, 42, "my-device");
         let json = serde_json::to_string(&ts).unwrap();

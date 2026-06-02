@@ -57,7 +57,9 @@ pub struct EncryptionManifest {
     pub salt: String, // base64-encoded
     pub kdf_params: KdfParams,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hmac: Option<String>, // base64-encoded HMAC of manifest content (computed without this field)
+    pub hmac_salt: Option<String>, // base64-encoded salt for HMAC key derivation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>, // base64-encoded HMAC of manifest content (computed without hmac and hmac_salt fields)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +84,8 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
             mem_cost: 65536, // 64 MB
             parallelism: 1,
         },
-        hmac: None, // HMAC will be computed during sync initialization
+        hmac_salt: None, // Will be computed during sync initialization
+        hmac: None,      // HMAC will be computed during sync initialization
     }
 }
 
@@ -163,15 +166,12 @@ pub fn is_encrypted_line(line: &str) -> bool {
     line.starts_with(ENC_PREFIX)
 }
 
-/// Compute HMAC for manifest integrity protection.
-/// Uses the passphrase to derive an HMAC key, then computes HMAC of the manifest content.
-pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<String, CortexError> {
-    // Derive HMAC key from passphrase using a quick derivation (not for encryption, just HMAC)
-    // Using Argon2 with fast params for manifest verification
-    let mut salt = [0u8; 16];
-    use rand::RngCore;
-    OsRng.fill_bytes(&mut salt);
-
+/// Internal: Compute HMAC with explicit salt (for testing and verification)
+fn compute_manifest_hmac_with_salt(
+    manifest_json: &[u8],
+    passphrase: &str,
+    salt: &[u8; 16],
+) -> Result<String, CortexError> {
     let params = argon2::Params::new(
         8192,     // 8MB for manifest verification (faster than oplog encryption)
         1,        // 1 iteration
@@ -183,7 +183,7 @@ pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<S
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut hmac_key = [0u8; 32];
     argon2
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut hmac_key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut hmac_key)
         .map_err(|e| CortexError::Storage(format!("HMAC key derivation failed: {}", e)))?;
 
     let mut mac = <HmacSha256 as Mac>::new_from_slice(&hmac_key)
@@ -193,6 +193,29 @@ pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<S
 
     hmac_key.zeroize();
     Ok(base64::engine::general_purpose::STANDARD.encode(result.into_bytes()))
+}
+
+/// Compute HMAC for manifest integrity protection.
+/// Uses the passphrase to derive an HMAC key, then computes HMAC of the manifest content.
+pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<String, CortexError> {
+    // Generate random salt for HMAC key derivation
+    let mut salt = [0u8; 16];
+    use rand::RngCore;
+    OsRng.fill_bytes(&mut salt);
+
+    compute_manifest_hmac_with_salt(manifest_json, passphrase, &salt)
+}
+
+/// Internal: Verify manifest integrity with explicit salt (for testing)
+fn verify_manifest_integrity_with_salt(
+    manifest_json: &[u8],
+    expected_hmac: &str,
+    passphrase: &str,
+    salt: &[u8; 16],
+) -> Result<bool, CortexError> {
+    let computed = compute_manifest_hmac_with_salt(manifest_json, passphrase, salt)?;
+    // Use constant-time comparison
+    Ok(computed.as_bytes().ct_eq(expected_hmac.as_bytes()).into())
 }
 
 /// Verify manifest integrity using HMAC.
@@ -284,6 +307,46 @@ mod tests {
 
         let result = decrypt_line(&ctx, &tampered);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_manifest_hmac_computation_deterministic() {
+        let manifest_json = br#"{"algorithm":"aes-256-gcm","kdf":"argon2id","salt":"test","kdf_params":{"time_cost":1,"mem_cost":1024,"parallelism":1}}"#;
+        let passphrase = "test-passphrase";
+        let fixed_salt = [0u8; 16]; // Fixed salt for reproducible tests
+
+        let hmac1 = compute_manifest_hmac_with_salt(manifest_json, passphrase, &fixed_salt).unwrap();
+        let hmac2 = compute_manifest_hmac_with_salt(manifest_json, passphrase, &fixed_salt).unwrap();
+
+        // Same content, passphrase, and salt should produce same HMAC
+        assert_eq!(hmac1, hmac2, "HMAC should be deterministic with same salt");
+    }
+
+    #[test]
+    fn test_manifest_hmac_verification_success() {
+        let manifest_json = br#"{"algorithm":"aes-256-gcm","kdf":"argon2id","salt":"test","kdf_params":{"time_cost":1,"mem_cost":1024,"parallelism":1}}"#;
+        let passphrase = "test-passphrase";
+        let fixed_salt = [0u8; 16];
+
+        let hmac = compute_manifest_hmac_with_salt(manifest_json, passphrase, &fixed_salt).unwrap();
+        let verified = verify_manifest_integrity_with_salt(manifest_json, &hmac, passphrase, &fixed_salt).unwrap();
+
+        assert!(verified, "Valid HMAC should verify successfully");
+    }
+
+    #[test]
+    fn test_manifest_hmac_verification_fails_on_tampering() {
+        let manifest_json = br#"{"algorithm":"aes-256-gcm","kdf":"argon2id","salt":"test","kdf_params":{"time_cost":1,"mem_cost":1024,"parallelism":1}}"#;
+        let passphrase = "test-passphrase";
+        let fixed_salt = [0u8; 16];
+
+        let hmac = compute_manifest_hmac_with_salt(manifest_json, passphrase, &fixed_salt).unwrap();
+
+        // Tamper with manifest content
+        let tampered = br#"{"algorithm":"aes-256-gcm","kdf":"argon2id","salt":"tampered","kdf_params":{"time_cost":1,"mem_cost":1024,"parallelism":1}}"#;
+        let verified = verify_manifest_integrity_with_salt(tampered, &hmac, passphrase, &fixed_salt).unwrap();
+
+        assert!(!verified, "Tampered manifest should fail verification");
     }
 
     #[test]
