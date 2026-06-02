@@ -173,11 +173,31 @@ impl SyncEngine {
             };
 
             let enc_manifest = if let Some(enc) = manifest_json.get("encryption") {
-                serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
-                    .map_err(|e| CortexError::Serialization(e.to_string()))?
+                let mut manifest = serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
+                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
+
+                // Verify manifest integrity if HMAC is present
+                if let Some(ref stored_hmac) = manifest.hmac.take() {
+                    // Recompute HMAC to verify integrity
+                    let manifest_without_hmac = serde_json::to_vec(&manifest)
+                        .map_err(|e| CortexError::Serialization(e.to_string()))?;
+                    if !crypto::verify_manifest_integrity(&manifest_without_hmac, stored_hmac, passphrase)? {
+                        return Err(CortexError::Storage(
+                            "Manifest integrity check failed: HMAC mismatch. Data may be corrupted or tampered.".into()
+                        ));
+                    }
+                }
+
+                manifest
             } else {
                 // First time: generate salt and write to manifest
-                let new_manifest = crypto::new_encryption_manifest();
+                let mut new_manifest = crypto::new_encryption_manifest();
+
+                // Compute HMAC for new manifest
+                let manifest_json_bytes = serde_json::to_vec(&new_manifest)
+                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
+                new_manifest.hmac = Some(crypto::compute_manifest_hmac(&manifest_json_bytes, passphrase)?);
+
                 let mut updated = manifest_json.clone();
                 updated["encryption"] = serde_json::to_value(&new_manifest)
                     .map_err(|e| CortexError::Serialization(e.to_string()))?;
