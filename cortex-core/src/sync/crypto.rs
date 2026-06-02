@@ -56,6 +56,8 @@ pub struct EncryptionManifest {
     pub kdf: String,
     pub salt: String, // base64-encoded
     pub kdf_params: KdfParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>, // base64-encoded HMAC of manifest content (computed without this field)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +82,7 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
             mem_cost: 65536, // 64 MB
             parallelism: 1,
         },
+        hmac: None, // HMAC will be computed during sync initialization
     }
 }
 
@@ -158,6 +161,49 @@ pub fn decrypt_line(ctx: &CryptoContext, encrypted_line: &str) -> Result<Vec<u8>
 /// Check if a line is encrypted.
 pub fn is_encrypted_line(line: &str) -> bool {
     line.starts_with(ENC_PREFIX)
+}
+
+/// Compute HMAC for manifest integrity protection.
+/// Uses the passphrase to derive an HMAC key, then computes HMAC of the manifest content.
+pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<String, CortexError> {
+    // Derive HMAC key from passphrase using a quick derivation (not for encryption, just HMAC)
+    // Using Argon2 with fast params for manifest verification
+    let mut salt = [0u8; 16];
+    use rand::RngCore;
+    OsRng.fill_bytes(&mut salt);
+
+    let params = argon2::Params::new(
+        8192,     // 8MB for manifest verification (faster than oplog encryption)
+        1,        // 1 iteration
+        1,        // 1 parallelism
+        Some(32), // 32-byte HMAC key
+    )
+    .map_err(|e| CortexError::Storage(format!("Invalid Argon2 params: {}", e)))?;
+
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut hmac_key = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut hmac_key)
+        .map_err(|e| CortexError::Storage(format!("HMAC key derivation failed: {}", e)))?;
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&hmac_key)
+        .expect("HMAC key size is valid");
+    mac.update(manifest_json);
+    let result = mac.finalize();
+
+    hmac_key.zeroize();
+    Ok(base64::engine::general_purpose::STANDARD.encode(result.into_bytes()))
+}
+
+/// Verify manifest integrity using HMAC.
+pub fn verify_manifest_integrity(
+    manifest_json: &[u8],
+    expected_hmac: &str,
+    passphrase: &str,
+) -> Result<bool, CortexError> {
+    let computed = compute_manifest_hmac(manifest_json, passphrase)?;
+    // Use constant-time comparison
+    Ok(computed.as_bytes().ct_eq(expected_hmac.as_bytes()).into())
 }
 
 #[cfg(test)]
