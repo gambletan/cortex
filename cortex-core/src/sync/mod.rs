@@ -305,6 +305,17 @@ impl SyncEngine {
 
                 // Apply each operation
                 for op in &ops {
+                    // Validate that the operation's device_id matches the directory it came from
+                    // Prevents device spoofing where attacker creates sync/devices/legitimate-device/
+                    // and fills it with operations claiming a different device_id
+                    if op.hlc.device_id != dir_name {
+                        tracing::warn!(
+                            "Rejecting operation from device '{}' in directory '{}' — device ID mismatch",
+                            op.hlc.device_id, dir_name
+                        );
+                        continue;
+                    }
+
                     // Advance local HLC past remote
                     self.hlc.update(&op.hlc);
 
