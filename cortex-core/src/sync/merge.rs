@@ -102,27 +102,45 @@ pub fn apply_op(
         SyncPayload::PersonUpsert { person } => {
             let entity_type = EntityType::Person;
 
-            let local = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, person.id))?;
-            if let Some(local_hlc) = local {
-                if local_hlc >= op.hlc {
-                    if let Ok(Some(local_person)) = storage.get_person(person.id) {
-                        if person.interaction_count > local_person.interaction_count {
+            let local_hlc = storage.with_write_conn(|c| state::get_entity_hlc(c, entity_type, person.id))?;
+            let local_wins = local_hlc.map(|l| l >= op.hlc).unwrap_or(false);
+
+            match storage.get_person(person.id)? {
+                Some(local_person) => {
+                    // Descriptive fields are LWW by HLC, but interaction_count and
+                    // last_seen are monotonic (a count never decreases; last_seen is the
+                    // most recent contact) and first_seen is the earliest. Merge those
+                    // from both sides so an out-of-order op can never regress them.
+                    let count = local_person.interaction_count.max(person.interaction_count);
+                    let last_seen = local_person.last_seen.max(person.last_seen);
+                    let first_seen = local_person.first_seen.min(person.first_seen);
+
+                    if local_wins {
+                        // Local descriptive fields win; only write if a monotonic field advanced.
+                        if count != local_person.interaction_count
+                            || last_seen != local_person.last_seen
+                            || first_seen != local_person.first_seen
+                        {
                             let mut merged = local_person;
-                            merged.interaction_count = person.interaction_count;
-                            if person.last_seen > merged.last_seen {
-                                merged.last_seen = person.last_seen;
-                            }
+                            merged.interaction_count = count;
+                            merged.last_seen = last_seen;
+                            merged.first_seen = first_seen;
                             storage.update_person(&merged)?;
                         }
+                        return Ok(MergeResult::Skipped);
                     }
-                    return Ok(MergeResult::Skipped);
-                }
-            }
 
-            if storage.get_person(person.id)?.is_some() {
-                storage.update_person(person)?;
-            } else {
-                storage.store_person(person)?;
+                    // Remote descriptive fields win; apply them but never regress the
+                    // monotonic fields below the local values.
+                    let mut merged = person.clone();
+                    merged.interaction_count = count;
+                    merged.last_seen = last_seen;
+                    merged.first_seen = first_seen;
+                    storage.update_person(&merged)?;
+                }
+                None => {
+                    storage.store_person(person)?;
+                }
             }
 
             storage.with_write_conn(|c| state::set_entity_hlc(c, entity_type, person.id, &op.hlc))?;
@@ -370,5 +388,57 @@ mod tests {
             MemContent::Text(t) => assert_eq!(t, "v1"),
             other => panic!("unexpected content: {other:?}"),
         }
+    }
+
+    fn person_op(id: Uuid, count: u32, last_ms: i64, first_ms: i64, wall_ms: u64, device: &str) -> SyncOp {
+        use crate::people::Person;
+        let person = Person {
+            id,
+            identities: Vec::new(),
+            display_name: "P".to_string(),
+            relationship_to_user: String::new(),
+            first_seen: chrono::DateTime::from_timestamp_millis(first_ms).unwrap(),
+            last_seen: chrono::DateTime::from_timestamp_millis(last_ms).unwrap(),
+            interaction_count: count,
+            communication_style: std::collections::HashMap::new(),
+            tags: Vec::new(),
+            notes: Vec::new(),
+        };
+        SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(wall_ms, 0, device),
+            payload: SyncPayload::PersonUpsert { person },
+        }
+    }
+
+    #[test]
+    fn test_person_upsert_does_not_regress_on_older_op() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        let id = Uuid::new_v4();
+        // Local: count 10, last_seen 2000, first_seen 1000, HIGH hlc.
+        apply_op(&person_op(id, 10, 2000, 1000, 500, "a"), &s, &idx).unwrap();
+        // Older op with lower count / older last_seen / earlier first_seen.
+        apply_op(&person_op(id, 5, 1500, 900, 100, "b"), &s, &idx).unwrap();
+        let p = s.get_person(id).unwrap().unwrap();
+        assert_eq!(p.interaction_count, 10, "count must not regress");
+        assert_eq!(p.last_seen.timestamp_millis(), 2000, "last_seen must not regress");
+        assert_eq!(p.first_seen.timestamp_millis(), 900, "first_seen takes the earliest");
+    }
+
+    #[test]
+    fn test_person_upsert_newer_op_does_not_regress_monotonic_fields() {
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        let id = Uuid::new_v4();
+        // Local: count 10, last_seen 2000, LOW hlc.
+        apply_op(&person_op(id, 10, 2000, 1000, 100, "a"), &s, &idx).unwrap();
+        // A NEWER op with a LOWER count and OLDER last_seen: its descriptive fields apply,
+        // but the monotonic fields must not move backward.
+        apply_op(&person_op(id, 5, 1500, 800, 500, "b"), &s, &idx).unwrap();
+        let p = s.get_person(id).unwrap().unwrap();
+        assert_eq!(p.interaction_count, 10, "a newer op must not lower the count");
+        assert_eq!(p.last_seen.timestamp_millis(), 2000, "a newer op must not move last_seen back");
+        assert_eq!(p.first_seen.timestamp_millis(), 800, "first_seen takes the earliest");
     }
 }
