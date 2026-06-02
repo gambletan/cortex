@@ -28,55 +28,106 @@ impl CryptoContext {
     }
 }
 
+/// Single encryption key version for key rotation support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyVersion {
+    pub version: u32,
+    pub salt: String, // base64-encoded
+    pub kdf_params: KdfParams,
+    pub created_at: String, // ISO 8601 timestamp
+}
+
 /// Encryption metadata stored in manifest.json.
+/// Supports key rotation via multiple KeyVersion entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptionManifest {
     pub algorithm: String,
     pub kdf: String,
-    pub salt: String, // base64-encoded
-    pub kdf_params: KdfParams,
+    pub versions: Vec<KeyVersion>, // Multiple key versions for rotation support
+    pub current_version: u32, // Which version to use for new encryptions
+    #[serde(default)] // For backward compatibility with old single-key format
+    pub salt: String, // Legacy: single salt (deprecated, use versions instead)
+    #[serde(default)] // For backward compatibility
+    pub kdf_params: KdfParams, // Legacy: single params (deprecated, use versions instead)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KdfParams {
     pub time_cost: u32,
     pub mem_cost: u32,
     pub parallelism: u32,
 }
 
-/// Generate a new encryption manifest with random salt.
+/// Generate a new encryption manifest with key rotation support.
+/// Creates the first key version (v1) for new encryption systems.
 pub fn new_encryption_manifest() -> EncryptionManifest {
     use rand::RngCore;
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
 
+    let kdf_params = KdfParams {
+        time_cost: 3,
+        mem_cost: 65536, // 64 MB
+        parallelism: 1,
+    };
+
+    let key_v1 = KeyVersion {
+        version: 1,
+        salt: base64::engine::general_purpose::STANDARD.encode(salt),
+        kdf_params: kdf_params.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
     EncryptionManifest {
         algorithm: "aes-256-gcm".to_string(),
         kdf: "argon2id".to_string(),
-        salt: base64::engine::general_purpose::STANDARD.encode(salt),
+        versions: vec![key_v1],
+        current_version: 1,
+        // Legacy fields for backward compatibility
+        salt: String::new(),
         kdf_params: KdfParams {
-            time_cost: 3,
-            mem_cost: 65536, // 64 MB
-            parallelism: 1,
+            time_cost: 0,
+            mem_cost: 0,
+            parallelism: 0,
         },
     }
 }
 
-/// Derive an encryption key from a passphrase and manifest.
+/// Derive the current (latest) encryption key from a passphrase and manifest.
+/// Uses the current_version specified in the manifest.
 pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<CryptoContext, CortexError> {
+    // Try new format with versioned keys
+    if let Some(key_version) = manifest.versions.iter().find(|v| v.version == manifest.current_version) {
+        derive_key_for_version(passphrase, key_version)
+    } else if !manifest.salt.is_empty() {
+        // Fallback to legacy single-key format for backward compatibility
+        derive_key_legacy(passphrase, &manifest.salt, &manifest.kdf_params)
+    } else {
+        Err(CortexError::Storage("No encryption key version available".into()))
+    }
+}
+
+/// Derive a key for a specific version (used for decryption of old data).
+/// Supports key rotation by allowing decryption with any historical key version.
+pub fn derive_key_for_version(passphrase: &str, key_version: &KeyVersion) -> Result<CryptoContext, CortexError> {
+    derive_key_legacy(passphrase, &key_version.salt, &key_version.kdf_params)
+}
+
+/// Legacy key derivation (backward compatible).
+fn derive_key_legacy(passphrase: &str, salt_b64: &str, params: &KdfParams) -> Result<CryptoContext, CortexError> {
     let salt = base64::engine::general_purpose::STANDARD
-        .decode(&manifest.salt)
+        .decode(salt_b64)
         .map_err(|e| CortexError::Storage(format!("Invalid salt: {}", e)))?;
 
-    let params = argon2::Params::new(
-        manifest.kdf_params.mem_cost,
-        manifest.kdf_params.time_cost,
-        manifest.kdf_params.parallelism,
+    let kdf_params = argon2::Params::new(
+        params.mem_cost,
+        params.time_cost,
+        params.parallelism,
         Some(32),
     )
     .map_err(|e| CortexError::Storage(format!("Invalid Argon2 params: {}", e)))?;
 
-    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, kdf_params);
 
     let mut key_bytes = [0u8; 32];
     argon2
@@ -84,6 +135,32 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
 
     Ok(CryptoContext { key_bytes })
+}
+
+/// Try decrypting with all available key versions (for forward secrecy).
+/// Returns the decrypted plaintext if any key version succeeds.
+pub fn decrypt_line_any_version(manifest: &EncryptionManifest, encrypted_line: &str, passphrase: &str) -> Result<Vec<u8>, CortexError> {
+    // Try current version first
+    if let Some(key_version) = manifest.versions.iter().find(|v| v.version == manifest.current_version) {
+        if let Ok(ctx) = derive_key_for_version(passphrase, key_version) {
+            if let Ok(plaintext) = decrypt_line(&ctx, encrypted_line) {
+                return Ok(plaintext);
+            }
+        }
+    }
+
+    // Try all other versions (for data encrypted with older keys)
+    for key_version in &manifest.versions {
+        if key_version.version != manifest.current_version {
+            if let Ok(ctx) = derive_key_for_version(passphrase, key_version) {
+                if let Ok(plaintext) = decrypt_line(&ctx, encrypted_line) {
+                    return Ok(plaintext);
+                }
+            }
+        }
+    }
+
+    Err(CortexError::Storage("Decryption failed with all available key versions".into()))
 }
 
 /// Encrypt a plaintext line → `ENC1:<base64(nonce || ciphertext || tag)>`
@@ -130,6 +207,34 @@ pub fn decrypt_line(ctx: &CryptoContext, encrypted_line: &str) -> Result<Vec<u8>
 /// Check if a line is encrypted.
 pub fn is_encrypted_line(line: &str) -> bool {
     line.starts_with(ENC_PREFIX)
+}
+
+/// Rotate the encryption key by creating a new key version.
+/// New encryptions will use this new key.
+/// Old data remains encrypted with old keys and can still be decrypted.
+/// This provides forward secrecy: old passphrases don't expose future data.
+pub fn rotate_key(manifest: &mut EncryptionManifest) -> Result<(), CortexError> {
+    use rand::RngCore;
+
+    let new_version = manifest.versions.iter().map(|v| v.version).max().unwrap_or(0) + 1;
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+
+    let new_key_version = KeyVersion {
+        version: new_version,
+        salt: base64::engine::general_purpose::STANDARD.encode(salt),
+        kdf_params: KdfParams {
+            time_cost: 3,
+            mem_cost: 65536,
+            parallelism: 1,
+        },
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    manifest.versions.push(new_key_version);
+    manifest.current_version = new_version;
+
+    Ok(())
 }
 
 #[cfg(test)]
