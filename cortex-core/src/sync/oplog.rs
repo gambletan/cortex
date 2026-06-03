@@ -106,10 +106,11 @@ impl OpLogWriter {
                 hlc: op.hlc.clone(),
                 payload: op.payload.clone(),
             };
+            // Serialize without whitespace (canonical form) for deterministic HMAC
             let hmac_json = serde_json::to_string(&op_without_hmac)
                 .map_err(|e| CortexError::Serialization(e.to_string()))?;
 
-            // Compute HMAC-SHA256 of the operation (without the hmac field itself)
+            // Compute HMAC-SHA256 of the canonical JSON (without the hmac field itself)
             let hmac_bytes = ctx.compute_operation_hmac(hmac_json.as_bytes());
             op.hmac = Some(base64::engine::general_purpose::STANDARD.encode(hmac_bytes));
         }
@@ -263,20 +264,45 @@ pub fn read_oplog(
                             hlc: op.hlc.clone(),
                             payload: op.payload.clone(),
                         };
+                        // Re-serialize in canonical form (same as write-time) for verification
                         if let Ok(hmac_json) = serde_json::to_string(&op_without_hmac) {
                             match ctx.verify_operation_hmac(hmac_json.as_bytes(), hmac_str) {
                                 Ok(valid) => {
                                     if !valid {
-                                        tracing::warn!("HMAC verification failed for operation {} at offset {} — possible tampering", op.op_id, offset);
-                                        // Continue but flag as suspicious — let caller decide
+                                        tracing::error!("HMAC verification FAILED for operation {} at offset {} — REJECTING (possible tampering or corruption)", op.op_id, offset);
+                                        // Zeroize plaintext JSON and skip this corrupted operation
+                                        {
+                                            use zeroize::Zeroize;
+                                            let mut disposable = json_str;
+                                            disposable.zeroize();
+                                        }
+                                        offset += bytes_read as u64;
+                                        continue;  // Skip this operation, do not add to ops
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("HMAC verification error at offset {}: {}", offset, e);
-                                    // Continue on error (malformed HMAC encoding)
+                                    tracing::error!("HMAC verification error at offset {} — REJECTING (unable to verify integrity): {}", offset, e);
+                                    // Zeroize plaintext JSON and skip this operation
+                                    {
+                                        use zeroize::Zeroize;
+                                        let mut disposable = json_str;
+                                        disposable.zeroize();
+                                    }
+                                    offset += bytes_read as u64;
+                                    continue;  // Skip this operation, do not add to ops
                                 }
                             }
                         }
+                    } else {
+                        tracing::warn!("Encrypted operation with HMAC but no crypto context at offset {} — skipping", offset);
+                        // Zeroize plaintext JSON and skip
+                        {
+                            use zeroize::Zeroize;
+                            let mut disposable = json_str;
+                            disposable.zeroize();
+                        }
+                        offset += bytes_read as u64;
+                        continue;
                     }
                 }
 

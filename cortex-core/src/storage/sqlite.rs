@@ -1623,6 +1623,7 @@ impl SqliteStorage {
         let mut min_rank = 0.0_f64;
         let mut max_rank = 0.0_f64;
         let mut raw: Vec<(Uuid, f64)> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();  // Prevent duplicates across retries
 
         // Progressive over-fetching: start with 10x multiplier, scale up if needed
         // This prevents result count from leaking privacy distribution info
@@ -1653,10 +1654,16 @@ impl SqliteStorage {
                 }
                 let (id_str, rank) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
                 if let Ok(id) = Uuid::parse_str(&id_str) {
+                    // Skip if already seen (prevent duplicates across retries)
+                    if seen_ids.contains(&id) {
+                        continue;
+                    }
+
                     // Check if memory is Private — skip if it is (privacy enforcement)
                     if let Ok(Some(mem)) = self.get_memory(id) {
                         if !mem.privacy.is_syncable() {
-                            // Skip Private memories
+                            // Skip Private memories but mark as seen to avoid rechecking
+                            seen_ids.insert(id);
                             continue;
                         }
                         if raw.is_empty() {
@@ -1667,6 +1674,7 @@ impl SqliteStorage {
                             max_rank = max_rank.max(rank);
                         }
                         raw.push((id, rank));
+                        seen_ids.insert(id);
                     }
                 }
             }

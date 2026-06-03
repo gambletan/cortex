@@ -136,23 +136,15 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key_bytes)
         .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
 
-    // Apply key rotation if version > 0: use PBKDF2 with version-specific salt
+    // Key versioning: currently unused. Will be implemented in iteration 14
+    // when version tracking is added to encrypted payloads (oplog, snapshots).
+    // For now, always use version 0 derivation to maintain compatibility.
+    #[allow(unused_variables)]
     let key_version = manifest.key_version.unwrap_or(0);
-    if key_version > 0 {
-        let mut version_salt = salt.clone();
-        // Append version bytes to salt to make each rotation distinct
-        let v_bytes = key_version.to_le_bytes();
-        for i in 0..4.min(version_salt.len()) {
-            version_salt[i] ^= v_bytes[i];
-        }
-        // Apply PBKDF2 with 10000 iterations for key rotation
-        let _ = pbkdf2::<hmac::Hmac<sha2::Sha256>>(
-            passphrase.as_bytes(),
-            &version_salt,
-            10000,
-            &mut key_bytes,
-        );
-    }
+    // TODO (iteration 14): When encrypting, if key_version > 0:
+    //   1. Record version number with encrypted payload
+    //   2. At decrypt time, use recorded version to select correct key
+    //   3. Support multiple versions in derive_key() with version parameter
 
     // Derive HMAC key separately using passphrase + "HMAC" domain separator
     let mut hmac_salt = salt.clone();
@@ -167,20 +159,7 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         .hash_password_into(passphrase.as_bytes(), &hmac_salt, &mut hmac_key)
         .map_err(|e| CortexError::Storage(format!("HMAC key derivation failed: {}", e)))?;
 
-    // Apply HMAC key rotation if version > 0
-    if key_version > 0 {
-        let mut version_salt = hmac_salt.clone();
-        let v_bytes = key_version.to_le_bytes();
-        for i in 0..4.min(version_salt.len()) {
-            version_salt[i] ^= v_bytes[i];
-        }
-        let _ = pbkdf2::<hmac::Hmac<sha2::Sha256>>(
-            passphrase.as_bytes(),
-            &version_salt,
-            10000,
-            &mut hmac_key,
-        );
-    }
+    // HMAC key versioning deferred to iteration 14 (see comment above)
 
     Ok(CryptoContext { key_bytes, hmac_key })
 }
