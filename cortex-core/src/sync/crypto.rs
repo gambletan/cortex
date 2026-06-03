@@ -50,12 +50,15 @@ impl CryptoContext {
 }
 
 /// Encryption metadata stored in manifest.json.
+/// Supports key versioning for forward secrecy and key rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptionManifest {
     pub algorithm: String,
     pub kdf: String,
     pub salt: String, // base64-encoded
     pub kdf_params: KdfParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_version: Option<u32>, // For key rotation: version 0 is default, higher = newer rotations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hmac_salt: Option<String>, // base64-encoded salt for HMAC key derivation
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,8 +87,9 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
             mem_cost: 65536, // 64 MB
             parallelism: 1,
         },
-        hmac_salt: None, // Will be computed during sync initialization
-        hmac: None,      // HMAC will be computed during sync initialization
+        key_version: Some(0), // Start at version 0; higher versions for rotated keys
+        hmac_salt: None,      // Will be computed during sync initialization
+        hmac: None,           // HMAC will be computed during sync initialization
     }
 }
 

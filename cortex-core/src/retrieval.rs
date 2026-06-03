@@ -261,8 +261,19 @@ impl<'a> RetrievalEngine<'a> {
             }
         }
 
-        // Sort by score descending
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score descending (constant-time: always evaluate full comparison)
+        // Avoid timing leaks from short-circuit comparisons on NaN/Inf patterns
+        results.sort_by(|a, b| {
+            // Compare b vs a (descending) — evaluate both bounds unconditionally
+            let cmp_val = b.score.partial_cmp(&a.score);
+            match cmp_val {
+                Some(ord) => ord,
+                None => {
+                    // NaN comparison: use consistent tiebreaker (memory ID)
+                    b.memory.id.cmp(&a.memory.id)
+                }
+            }
+        });
         results.truncate(query.limit);
 
         Ok(results)
