@@ -307,7 +307,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(wall_ms, 0, device),
             payload: SyncPayload::BeliefUpsert { belief },
-        }
+            hmac: None,}
     }
 
     fn obs_timestamps(s: &SqliteStorage, key: &str) -> Vec<i64> {
@@ -387,7 +387,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(200, 0, "a"),
             payload: SyncPayload::MemoryUpsert { memory: mem.clone() },
-        };
+            hmac: None,};
         assert!(matches!(
             apply_op(&op_new, &s, &idx).unwrap(),
             MergeResult::Applied
@@ -399,7 +399,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(100, 0, "b"),
             payload: SyncPayload::MemoryUpsert { memory: mem.clone() },
-        };
+            hmac: None,};
         assert!(matches!(
             apply_op(&op_old, &s, &idx).unwrap(),
             MergeResult::Skipped
@@ -429,7 +429,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(wall_ms, 0, device),
             payload: SyncPayload::PersonUpsert { person },
-        }
+            hmac: None,}
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(200, 0, "a"),
             payload: SyncPayload::PersonDelete { id },
-        };
+            hmac: None,};
         apply_op(&del, &s, &idx).unwrap();
         assert!(s.get_person(id).unwrap().is_none());
 

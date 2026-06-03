@@ -1605,7 +1605,8 @@ impl StorageBackend for SqliteStorage {
 impl SqliteStorage {
     /// Full-text search using FTS5. Returns (id, BM25 rank) pairs.
     /// Rank is normalized to 0.0–1.0 range.
-    /// Filters out Private memories to prevent privacy bypass.
+    /// Filters out Private memories with adaptive privacy padding.
+    /// Uses progressive over-fetching to prevent privacy distribution leaks.
     pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<(Uuid, f64)>, CortexError> {
         let conn = self.read_conn()?;
 
@@ -1618,52 +1619,69 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
-        // Over-fetch to compensate for privacy filtering (estimate ~20% will be Private)
-        let fetch_limit = (limit * 5).min(1000);
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, rank FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-            )
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-
-        let rows = stmt
-            .query_map(params![safe_query, fetch_limit as i64], |row| {
-                let id_str: String = row.get(0)?;
-                let rank: f64 = row.get(1)?;
-                Ok((id_str, rank))
-            })
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-
         let mut results = Vec::new();
         let mut min_rank = 0.0_f64;
         let mut max_rank = 0.0_f64;
         let mut raw: Vec<(Uuid, f64)> = Vec::new();
 
-        for row in rows {
-            if raw.len() >= limit {
-                // Got enough results, stop processing
-                break;
-            }
-            let (id_str, rank) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
-            if let Ok(id) = Uuid::parse_str(&id_str) {
-                // Check if memory is Private — skip if it is (privacy enforcement)
-                if let Ok(Some(mem)) = self.get_memory(id) {
-                    if !mem.privacy.is_syncable() {
-                        // Skip Private memories
-                        continue;
+        // Progressive over-fetching: start with 10x multiplier, scale up if needed
+        // This prevents result count from leaking privacy distribution info
+        let mut fetch_multiplier = 10;
+        let max_fetch_size = 5000;
+
+        loop {
+            let fetch_limit = (limit * fetch_multiplier).min(max_fetch_size);
+
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, rank FROM memories_fts WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+                )
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![safe_query, fetch_limit as i64], |row| {
+                    let id_str: String = row.get(0)?;
+                    let rank: f64 = row.get(1)?;
+                    Ok((id_str, rank))
+                })
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+            for row in rows {
+                if raw.len() >= limit {
+                    // Got enough results, stop processing
+                    break;
+                }
+                let (id_str, rank) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
+                if let Ok(id) = Uuid::parse_str(&id_str) {
+                    // Check if memory is Private — skip if it is (privacy enforcement)
+                    if let Ok(Some(mem)) = self.get_memory(id) {
+                        if !mem.privacy.is_syncable() {
+                            // Skip Private memories
+                            continue;
+                        }
+                        if raw.is_empty() {
+                            min_rank = rank;
+                            max_rank = rank;
+                        } else {
+                            min_rank = min_rank.min(rank);
+                            max_rank = max_rank.max(rank);
+                        }
+                        raw.push((id, rank));
                     }
-                    if raw.is_empty() {
-                        min_rank = rank;
-                        max_rank = rank;
-                    } else {
-                        min_rank = min_rank.min(rank);
-                        max_rank = max_rank.max(rank);
-                    }
-                    raw.push((id, rank));
                 }
             }
+
+            // Check if we have enough results or hit the fetch limit
+            if raw.len() >= limit || fetch_limit >= max_fetch_size {
+                break;
+            }
+
+            // Need more results: increase multiplier and try again
+            fetch_multiplier *= 2;
         }
+
+        // Truncate to requested limit (in case we got more than needed)
+        raw.truncate(limit);
 
         // Normalize ranks to 0.0–1.0 (FTS5 ranks are negative, more negative = better match)
         let range = (max_rank - min_rank).abs();

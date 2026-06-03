@@ -233,8 +233,9 @@ impl SyncEngine {
             op_id: Uuid::new_v4(),
             hlc,
             payload,
+            hmac: None, // HMAC computed by writer
         };
-        self.writer.append(&op)
+        self.writer.append(op)
     }
 
     /// Record a memory event from the EventBus.

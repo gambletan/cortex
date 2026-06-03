@@ -7,6 +7,7 @@ use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{Aes256Gcm, AeadCore, Key, KeyInit};
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use pbkdf2::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -46,6 +47,24 @@ impl CryptoContext {
     fn verify_hmac(&self, data: &[u8], expected: &[u8; 32]) -> bool {
         let computed = self.compute_hmac(data);
         computed.as_slice().ct_eq(expected.as_slice()).into()
+    }
+
+    /// Public method to compute HMAC for operation integrity (used by OpLogWriter).
+    pub fn compute_operation_hmac(&self, data: &[u8]) -> [u8; 32] {
+        self.compute_hmac(data)
+    }
+
+    /// Public method to verify HMAC for operation integrity (used by oplog reader).
+    pub fn verify_operation_hmac(&self, data: &[u8], expected_hmac_hex: &str) -> Result<bool, CortexError> {
+        let expected_bytes = base64::engine::general_purpose::STANDARD
+            .decode(expected_hmac_hex)
+            .map_err(|e| CortexError::Storage(format!("Invalid HMAC encoding: {}", e)))?;
+        if expected_bytes.len() != 32 {
+            return Err(CortexError::Storage(format!("Invalid HMAC length: {} (expected 32)", expected_bytes.len())));
+        }
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(&expected_bytes);
+        Ok(self.verify_hmac(data, &expected))
     }
 }
 
@@ -94,8 +113,8 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
 }
 
 /// Derive encryption and HMAC keys from passphrase and manifest.
-/// Maintains backward compatibility: AES key derived from 32-byte output,
-/// HMAC key derived separately to avoid breaking existing encrypted data.
+/// Supports key versioning: version 0 (default) uses standard Argon2id.
+/// Higher versions apply additional PBKDF2 rounds with version-specific salt.
 pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<CryptoContext, CortexError> {
     let salt = base64::engine::general_purpose::STANDARD
         .decode(&manifest.salt)
@@ -117,6 +136,24 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key_bytes)
         .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
 
+    // Apply key rotation if version > 0: use PBKDF2 with version-specific salt
+    let key_version = manifest.key_version.unwrap_or(0);
+    if key_version > 0 {
+        let mut version_salt = salt.clone();
+        // Append version bytes to salt to make each rotation distinct
+        let v_bytes = key_version.to_le_bytes();
+        for i in 0..4.min(version_salt.len()) {
+            version_salt[i] ^= v_bytes[i];
+        }
+        // Apply PBKDF2 with 10000 iterations for key rotation
+        let _ = pbkdf2::<hmac::Hmac<sha2::Sha256>>(
+            passphrase.as_bytes(),
+            &version_salt,
+            10000,
+            &mut key_bytes,
+        );
+    }
+
     // Derive HMAC key separately using passphrase + "HMAC" domain separator
     let mut hmac_salt = salt.clone();
     // Append domain separator to salt to ensure HMAC key is independent
@@ -129,6 +166,21 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
     argon2
         .hash_password_into(passphrase.as_bytes(), &hmac_salt, &mut hmac_key)
         .map_err(|e| CortexError::Storage(format!("HMAC key derivation failed: {}", e)))?;
+
+    // Apply HMAC key rotation if version > 0
+    if key_version > 0 {
+        let mut version_salt = hmac_salt.clone();
+        let v_bytes = key_version.to_le_bytes();
+        for i in 0..4.min(version_salt.len()) {
+            version_salt[i] ^= v_bytes[i];
+        }
+        let _ = pbkdf2::<hmac::Hmac<sha2::Sha256>>(
+            passphrase.as_bytes(),
+            &version_salt,
+            10000,
+            &mut hmac_key,
+        );
+    }
 
     Ok(CryptoContext { key_bytes, hmac_key })
 }

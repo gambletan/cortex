@@ -31,6 +31,7 @@ rand = "0.8"
 base64 = "0.22"
 hmac = "0.12"
 subtle = "2"
+pbkdf2 = "0.12"
 zstd = "0.13"
 fastembed = { version = "4", optional = true }
 notify = "6"

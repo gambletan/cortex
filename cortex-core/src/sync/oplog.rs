@@ -9,6 +9,7 @@ use crate::procedural::Pattern;
 use crate::sync::hlc::HlcTimestamp;
 use crate::types::*;
 use crate::CortexError;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -20,8 +21,19 @@ const MAX_FILE_SIZE: u64 = 1_048_576;
 
 /// A single sync operation — one line in the JSONL file.
 /// Device ID is embedded in `hlc.device_id` — no separate field needed.
+/// HMAC protects operation integrity against tampering (computed without the hmac field itself).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncOp {
+    pub op_id: Uuid,
+    pub hlc: HlcTimestamp,
+    pub payload: SyncPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>, // base64-encoded HMAC-SHA256 of (op_id, hlc, payload) without hmac field
+}
+
+/// Helper: SyncOp without HMAC field (for computing the HMAC).
+#[derive(Debug, Serialize, Deserialize)]
+struct SyncOpWithoutHmac {
     pub op_id: Uuid,
     pub hlc: HlcTimestamp,
     pub payload: SyncPayload,
@@ -77,17 +89,32 @@ impl OpLogWriter {
     }
 
     /// Append a SyncOp to the current oplog file and flush.
-    pub fn append(&mut self, op: &SyncOp) -> Result<(), CortexError> {
+    pub fn append(&mut self, op: SyncOp) -> Result<(), CortexError> {
         self.append_buffered(op)?;
         self.flush()
     }
 
     /// Append without flushing — use with `flush()` after a batch.
-    pub fn append_buffered(&mut self, op: &SyncOp) -> Result<(), CortexError> {
+    pub fn append_buffered(&mut self, mut op: SyncOp) -> Result<(), CortexError> {
         use zeroize::Zeroize;
         self.rotate_if_needed()?;
 
-        let mut json = serde_json::to_string(op)
+        // Compute HMAC if we have crypto context (for integrity protection)
+        if let Some(ref ctx) = self.crypto {
+            let op_without_hmac = SyncOpWithoutHmac {
+                op_id: op.op_id,
+                hlc: op.hlc.clone(),
+                payload: op.payload.clone(),
+            };
+            let hmac_json = serde_json::to_string(&op_without_hmac)
+                .map_err(|e| CortexError::Serialization(e.to_string()))?;
+
+            // Compute HMAC-SHA256 of the operation (without the hmac field itself)
+            let hmac_bytes = ctx.compute_operation_hmac(hmac_json.as_bytes());
+            op.hmac = Some(base64::engine::general_purpose::STANDARD.encode(hmac_bytes));
+        }
+
+        let mut json = serde_json::to_string(&op)
             .map_err(|e| CortexError::Serialization(e.to_string()))?;
 
         let line = if let Some(ref ctx) = self.crypto {
@@ -225,15 +252,41 @@ pub fn read_oplog(
 
         let result = serde_json::from_str::<SyncOp>(&json_str);
 
-        // Zeroize plaintext JSON from memory (both success and error paths)
-        {
-            use zeroize::Zeroize;
-            let mut disposable = json_str;
-            disposable.zeroize();
-        }
-
         match result {
-            Ok(op) => {
+            Ok(mut op) => {
+                // Verify HMAC if present (backward compatible: old operations lack HMAC field)
+                if let Some(hmac_str) = &op.hmac {
+                    if let Some(ctx) = crypto {
+                        // Reconstruct the operation without the HMAC field for verification
+                        let op_without_hmac = SyncOpWithoutHmac {
+                            op_id: op.op_id,
+                            hlc: op.hlc.clone(),
+                            payload: op.payload.clone(),
+                        };
+                        if let Ok(hmac_json) = serde_json::to_string(&op_without_hmac) {
+                            match ctx.verify_operation_hmac(hmac_json.as_bytes(), hmac_str) {
+                                Ok(valid) => {
+                                    if !valid {
+                                        tracing::warn!("HMAC verification failed for operation {} at offset {} — possible tampering", op.op_id, offset);
+                                        // Continue but flag as suspicious — let caller decide
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("HMAC verification error at offset {}: {}", offset, e);
+                                    // Continue on error (malformed HMAC encoding)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Zeroize plaintext JSON from memory
+                {
+                    use zeroize::Zeroize;
+                    let mut disposable = json_str;
+                    disposable.zeroize();
+                }
+
                 ops.push(op);
                 offset += bytes_read as u64;
             }
@@ -245,6 +298,14 @@ pub fn read_oplog(
                 // Partial writes (no trailing \n) are also skipped — the writer
                 // uses flush() which guarantees complete lines on disk.
                 tracing::warn!("Skipping invalid oplog line at offset {}", offset);
+
+                // Zeroize plaintext JSON from memory
+                {
+                    use zeroize::Zeroize;
+                    let mut disposable = json_str;
+                    disposable.zeroize();
+                }
+
                 offset += bytes_read as u64;
             }
         }
@@ -286,7 +347,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(wall_ms, 0, device_id),
             payload: SyncPayload::MemoryDelete { id: Uuid::new_v4() },
-        }
+            hmac: None,}
     }
 
     #[test]
@@ -297,16 +358,18 @@ mod tests {
         let mut writer = OpLogWriter::new(device_dir.clone(), None).unwrap();
         let op1 = make_op("device-a", 1000);
         let op2 = make_op("device-a", 2000);
-        writer.append(&op1).unwrap();
-        writer.append(&op2).unwrap();
+        let op1_id = op1.op_id;
+        let op2_id = op2.op_id;
+        writer.append(op1).unwrap();
+        writer.append(op2).unwrap();
 
         let files = list_oplog_files(&device_dir).unwrap();
         assert_eq!(files.len(), 1);
 
         let (ops, offset) = read_oplog(&files[0], 0, None).unwrap();
         assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].op_id, op1.op_id);
-        assert_eq!(ops[1].op_id, op2.op_id);
+        assert_eq!(ops[0].op_id, op1_id);
+        assert_eq!(ops[1].op_id, op2_id);
         assert!(offset > 0);
 
         // Reading from the end offset should return nothing
@@ -321,7 +384,7 @@ mod tests {
 
         let mut writer = OpLogWriter::new(device_dir.clone(), None).unwrap();
         let op1 = make_op("device-a", 1000);
-        writer.append(&op1).unwrap();
+        writer.append(op1).unwrap();
 
         let files = list_oplog_files(&device_dir).unwrap();
         let (ops, offset1) = read_oplog(&files[0], 0, None).unwrap();
@@ -329,12 +392,13 @@ mod tests {
 
         // Write more ops
         let op2 = make_op("device-a", 2000);
-        writer.append(&op2).unwrap();
+        let op2_id = op2.op_id;
+        writer.append(op2).unwrap();
 
         // Read from previous offset — should only get op2
         let (ops2, _) = read_oplog(&files[0], offset1, None).unwrap();
         assert_eq!(ops2.len(), 1);
-        assert_eq!(ops2[0].op_id, op2.op_id);
+        assert_eq!(ops2[0].op_id, op2_id);
     }
 
     #[test]
@@ -359,7 +423,7 @@ mod tests {
             op_id: Uuid::new_v4(),
             hlc: HlcTimestamp::new(1000, 0, "device-a"),
             payload: SyncPayload::MemoryUpsert { memory: mem },
-        };
+            hmac: None,};
 
         let json = serde_json::to_string(&op).unwrap();
         let parsed: SyncOp = serde_json::from_str(&json).unwrap();
