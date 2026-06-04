@@ -185,7 +185,8 @@ cargo test --lib --release  # Full test suite
 cargo build --release       # Production binary
 
 # Verify hash matches (integrity check)
-git rev-parse HEAD  # Should be 0354213 (deployment checklist commit)
+git rev-parse HEAD  # Should match the commit SHA from git log above
+# Or use a release tag: git tag v2.0.0 && git describe --tags
 ```
 
 ---
