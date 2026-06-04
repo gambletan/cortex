@@ -185,7 +185,7 @@ cargo test --lib --release  # Full test suite
 cargo build --release       # Production binary
 
 # Verify hash matches (integrity check)
-git rev-parse HEAD  # Should be 91aa589
+git rev-parse HEAD  # Should be 0354213 (deployment checklist commit)
 ```
 
 ---
