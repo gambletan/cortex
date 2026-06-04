@@ -205,6 +205,8 @@ pub fn read_oplog(
 
     let mut ops = Vec::new();
     let mut offset = start_offset;
+    let mut consecutive_hmac_failures = 0;
+    const CORRUPTION_THRESHOLD: u32 = 5; // Alert if 5+ consecutive HMAC failures
 
     loop {
         let mut line = String::new();
@@ -269,7 +271,17 @@ pub fn read_oplog(
                             match ctx.verify_operation_hmac(hmac_json.as_bytes(), hmac_str) {
                                 Ok(valid) => {
                                     if !valid {
-                                        tracing::error!("HMAC verification FAILED for operation {} at offset {} — REJECTING (possible tampering or corruption)", op.op_id, offset);
+                                        consecutive_hmac_failures += 1;
+                                        tracing::error!("HMAC verification FAILED for operation {} at offset {} (failure #{}) — possible tampering or large-scale corruption", op.op_id, offset, consecutive_hmac_failures);
+
+                                        // Check for sustained corruption pattern
+                                        if consecutive_hmac_failures >= CORRUPTION_THRESHOLD {
+                                            return Err(CortexError::Storage(format!(
+                                                "OPLOG corruption detected: {} consecutive HMAC failures from offset {} onwards. Data integrity compromised. Consider restore from backup.",
+                                                consecutive_hmac_failures, offset
+                                            )));
+                                        }
+
                                         // Zeroize plaintext JSON and skip this corrupted operation
                                         {
                                             use zeroize::Zeroize;
@@ -278,10 +290,22 @@ pub fn read_oplog(
                                         }
                                         offset += bytes_read as u64;
                                         continue;  // Skip this operation, do not add to ops
+                                    } else {
+                                        consecutive_hmac_failures = 0;  // Reset on successful verification
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!("HMAC verification error at offset {} — REJECTING (unable to verify integrity): {}", offset, e);
+                                    consecutive_hmac_failures += 1;
+                                    tracing::error!("HMAC verification error at offset {} (failure #{}) — unable to verify integrity: {}", offset, consecutive_hmac_failures, e);
+
+                                    // Check for sustained corruption pattern
+                                    if consecutive_hmac_failures >= CORRUPTION_THRESHOLD {
+                                        return Err(CortexError::Storage(format!(
+                                            "OPLOG corruption detected: {} consecutive verification errors from offset {} onwards. Data integrity compromised. Consider restore from backup.",
+                                            consecutive_hmac_failures, offset
+                                        )));
+                                    }
+
                                     // Zeroize plaintext JSON and skip this operation
                                     {
                                         use zeroize::Zeroize;

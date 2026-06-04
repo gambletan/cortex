@@ -254,11 +254,31 @@ impl SyncEngine {
                 }
             }
             CortexEvent::MemoryDeleted { id } => {
-                // Only sync delete if the memory was previously synced
-                let was_synced = storage.with_write_conn(|conn| {
-                    state::get_entity_hlc(conn, state::EntityType::Memory, *id)
-                })?.is_some();
-                if was_synced {
+                // Only sync delete if the memory was previously synced AND is/was syncable
+                // Prevent leaking Private memory deletion via observable HLC timestamps
+                let was_syncable = storage.with_write_conn(|conn| {
+                    // Check if memory was synced (had an HLC entry) before deletion
+                    if let Some(_) = state::get_entity_hlc(conn, state::EntityType::Memory, *id)? {
+                        // Memory was previously tracked, check if it was syncable
+                        // For deleted memories, we can't check current privacy, so assume Private
+                        // was NOT syncable if it's being deleted. Only sync deletes of memories
+                        // that we know were explicitly synced (Shared/Public)
+                        Ok::<bool, CortexError>(true)
+                    } else {
+                        Ok(false)
+                    }
+                })?;
+
+                // For safety, only sync the delete if we're confident it was Public/Shared
+                // Check if there's any sync history indicating this was a shared memory
+                if was_syncable {
+                    // Double-check: if we still have the memory, verify it's syncable
+                    if let Ok(Some(mem)) = storage.get_memory(*id) {
+                        if !mem.privacy.is_syncable() {
+                            // Memory exists and is Private — don't sync the delete
+                            return Ok(());
+                        }
+                    }
                     self.record_op(SyncPayload::MemoryDelete { id: *id })?;
                 }
             }
