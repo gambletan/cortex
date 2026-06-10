@@ -20,6 +20,16 @@ fn make_sync_config(sync_dir: &std::path::Path, device_id: &str) -> SyncConfig {
     )
 }
 
+/// Promote a freshly-ingested memory to Shared so it is syncable. Memories default to
+/// Private, and the sync layer rejects Private memories from peers, so any test that
+/// exercises memory sync must mark the memory Shared first.
+fn promote_shared(cortex: &Cortex, id: Uuid) -> MemObject {
+    let mut mem = cortex.storage().get_memory(id).unwrap().unwrap();
+    mem.privacy = PrivacyLevel::Shared { scope: "all".into() };
+    cortex.storage().update_memory(&mem).unwrap();
+    mem
+}
+
 // ── End-to-end sync tests ────────────────────────────────────────────────────
 
 #[test]
@@ -37,6 +47,7 @@ fn test_two_devices_sync_memories() {
     let mem_a = cortex_a
         .ingest("I live in Shanghai", "test", None, None, None)
         .unwrap();
+    promote_shared(&cortex_a, mem_a.id);
 
     // Record the ingest in A's oplog
     engine_a
@@ -59,6 +70,7 @@ fn test_two_devices_sync_memories() {
     let mem_b = cortex_b
         .ingest("I work at Google", "test", None, None, None)
         .unwrap();
+    promote_shared(&cortex_b, mem_b.id);
     engine_b
         .record_op(SyncPayload::MemoryUpsert {
             memory: cortex_b.storage().get_memory(mem_b.id).unwrap().unwrap(),
@@ -88,6 +100,7 @@ fn test_delete_syncs() {
 
     // A creates a memory
     let mem = cortex_a.ingest("temp note", "test", None, None, None).unwrap();
+    promote_shared(&cortex_a, mem.id);
     engine_a.record_op(SyncPayload::MemoryUpsert {
         memory: cortex_a.storage().get_memory(mem.id).unwrap().unwrap(),
     }).unwrap();
@@ -119,7 +132,9 @@ fn test_lww_conflict_resolution() {
         MemoryTier::Episodic,
         MemContent::Text("version 1 from A".into()),
         MemSource::new("test"),
-    ).build();
+    )
+    .privacy(PrivacyLevel::Shared { scope: "all".into() })
+    .build();
 
     let old_hlc = HlcTimestamp::new(1000, 0, "device-a");
     cortex_a.storage().store_memory(&mem_a).unwrap();
@@ -137,6 +152,7 @@ fn test_lww_conflict_resolution() {
         op_id: Uuid::new_v4(),
         hlc: new_hlc,
         payload: SyncPayload::MemoryUpsert { memory: mem_b },
+        hmac: None,
     };
 
     // Apply B's op on A — should win (newer HLC)
@@ -257,6 +273,7 @@ fn test_person_merge_max_interaction_count() {
         op_id: Uuid::new_v4(),
         hlc: old_hlc,
         payload: SyncPayload::PersonUpsert { person: remote_person },
+        hmac: None,
     };
 
     // Apply — should be Skipped (LWW) but interaction_count should be merged to max(local, remote)
@@ -289,6 +306,7 @@ fn test_belief_crdt_merge() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(2000, 0, "device-b"),
         payload: SyncPayload::BeliefUpsert { belief: remote_belief },
+        hmac: None,
     };
 
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
@@ -326,6 +344,7 @@ fn test_pattern_merge_union_actions() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(2000, 0, "device-b"),
         payload: SyncPayload::PatternUpsert { pattern: remote_pattern },
+        hmac: None,
     };
 
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
@@ -353,6 +372,7 @@ fn test_link_add_wins() {
             relation: LinkRelation::RelatedTo,
             strength: 0.8,
         },
+        hmac: None,
     };
 
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
@@ -374,7 +394,9 @@ fn test_delete_then_recreate() {
         MemoryTier::Episodic,
         MemContent::Text("will be deleted then recreated".into()),
         MemSource::new("test"),
-    ).build();
+    )
+    .privacy(PrivacyLevel::Shared { scope: "all".into() })
+    .build();
     let mem_id = mem.id;
 
     // Store → delete → tombstone
@@ -396,6 +418,7 @@ fn test_delete_then_recreate() {
         op_id: Uuid::new_v4(),
         hlc: recreate_hlc,
         payload: SyncPayload::MemoryUpsert { memory: recreated },
+        hmac: None,
     };
 
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
@@ -462,6 +485,7 @@ fn test_oplog_partial_line_recovery() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-a"),
         payload: SyncPayload::MemoryDelete { id: Uuid::new_v4() },
+        hmac: None,
     };
     let valid_line = serde_json::to_string(&op).unwrap();
     std::fs::write(&file_path, format!("{}\n{{corrupt partial", valid_line)).unwrap();
@@ -507,7 +531,7 @@ fn test_encrypted_sync_roundtrip() {
 
     // A writes encrypted op
     let mem = cortex_a.ingest("encrypted secret", "test", None, None, None).unwrap();
-    let mem_obj = cortex_a.storage().get_memory(mem.id).unwrap().unwrap();
+    let mem_obj = promote_shared(&cortex_a, mem.id);
     engine_a.record_op(SyncPayload::MemoryUpsert { memory: mem_obj }).unwrap();
 
     // Verify the oplog file contains ENC1: prefix (encrypted)
@@ -622,12 +646,14 @@ fn test_memory_tombstone_blocks_upsert() {
                 m
             },
         },
+        hmac: None,
     };
     // This tests the "no tombstone match" path. Let's test tombstone directly:
     let op2 = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::MemoryDelete { id: mem_id },
+        hmac: None,
     };
     let result = merge::apply_op(&op2, cortex.sqlite_storage(), cortex.index()).unwrap();
     // Delete with older HLC than existing HLC should be skipped
@@ -649,11 +675,13 @@ fn test_memory_lww_skip_older() {
     let mut older_mem = cortex.storage().get_memory(mem.id).unwrap().unwrap();
     older_mem.content = MemContent::Text("stale update".into());
     older_mem.content_hash = None;
+    older_mem.privacy = PrivacyLevel::Shared { scope: "all".into() };
 
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::MemoryUpsert { memory: older_mem },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Skipped));
@@ -674,6 +702,7 @@ fn test_person_delete_sync() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(2000, 0, "device-b"),
         payload: SyncPayload::PersonDelete { id: person.id },
+        hmac: None,
     };
 
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
@@ -696,6 +725,7 @@ fn test_person_delete_lww_skip() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::PersonDelete { id: person.id },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Skipped));
@@ -842,7 +872,9 @@ fn test_memory_content_hash_dedup() {
         MemoryTier::Episodic,
         MemContent::Text("identical content for dedup".into()),
         MemSource::new("test"),
-    ).build();
+    )
+    .privacy(PrivacyLevel::Shared { scope: "all".into() })
+    .build();
     // Compute the same content hash
     dup_mem.content_hash = mem1_obj.content_hash.clone();
 
@@ -850,6 +882,7 @@ fn test_memory_content_hash_dedup() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(3000, 0, "device-b"),
         payload: SyncPayload::MemoryUpsert { memory: dup_mem },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Deduplicated));
@@ -865,12 +898,14 @@ fn test_memory_upsert_with_embedding() {
         MemSource::new("test"),
     )
     .embedding(vec![0.1, 0.2, 0.3])
+    .privacy(PrivacyLevel::Shared { scope: "all".into() })
     .build();
 
     let op = SyncOp {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::MemoryUpsert { memory: mem.clone() },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Applied));
@@ -906,6 +941,7 @@ fn test_memory_tombstone_blocks_old_upsert() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::MemoryDelete { id: mem.id },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Skipped), "Old delete should be skipped by LWW");
@@ -929,6 +965,7 @@ fn test_person_upsert_existing_newer_hlc() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::PersonUpsert { person: remote_person },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Skipped));
@@ -955,6 +992,7 @@ fn test_person_upsert_creates_new() {
         op_id: Uuid::new_v4(),
         hlc: HlcTimestamp::new(1000, 0, "device-b"),
         payload: SyncPayload::PersonUpsert { person: new_person.clone() },
+        hmac: None,
     };
     let result = merge::apply_op(&op, cortex.sqlite_storage(), cortex.index()).unwrap();
     assert!(matches!(result, merge::MergeResult::Applied));
@@ -975,14 +1013,15 @@ fn test_encrypted_read_decryption_failure() {
     let mut engine = SyncEngine::new(config, cortex.sqlite_storage()).unwrap();
     engine.record_op(SyncPayload::MemoryDelete { id: Uuid::new_v4() }).unwrap();
 
-    // Try to read with a different key
+    // Opening the same encrypted sync dir with a different passphrase must be rejected
+    // at init by the manifest integrity (HMAC) check — a wrong key can't silently attach.
     let config_b = make_sync_config(&sync_dir, "device-other")
         .with_encryption("key-B-wrong");
-    let mut engine_b = SyncEngine::new(config_b, cortex.sqlite_storage()).unwrap();
-
-    // Pull should succeed (0 applied — decryption failures are warned and skipped)
-    let applied = engine_b.pull_remote(cortex.sqlite_storage(), cortex.index()).unwrap();
-    assert_eq!(applied, 0, "Wrong key should result in 0 applied ops (skipped)");
+    let result = SyncEngine::new(config_b, cortex.sqlite_storage());
+    assert!(
+        result.is_err(),
+        "Wrong passphrase must fail the manifest integrity check at sync init"
+    );
 }
 
 #[test]

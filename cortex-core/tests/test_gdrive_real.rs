@@ -7,7 +7,6 @@ use cortex_core::sync::{SyncConfig, SyncEngine};
 use cortex_core::sync::oplog::SyncPayload;
 use cortex_core::types::*;
 use cortex_core::Cortex;
-use uuid::Uuid;
 
 fn find_gdrive() -> Option<std::path::PathBuf> {
     provider::detect_all_providers()

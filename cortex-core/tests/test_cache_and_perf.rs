@@ -154,9 +154,8 @@ fn test_retrieval_result_arc_clone() {
     assert_eq!(cloned.score, results[0].score);
 
     // Verify we can access fields through Arc
-    match &cloned.memory.content {
-        MemContent::Text(t) => assert!(!t.is_empty()),
-        _ => {} // other content types are fine
+    if let MemContent::Text(t) = &cloned.memory.content {
+        assert!(!t.is_empty());
     }
 }
 
