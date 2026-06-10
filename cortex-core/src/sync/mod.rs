@@ -258,7 +258,7 @@ impl SyncEngine {
                 // Prevent leaking Private memory deletion via observable HLC timestamps
                 let was_syncable = storage.with_write_conn(|conn| {
                     // Check if memory was synced (had an HLC entry) before deletion
-                    if let Some(_) = state::get_entity_hlc(conn, state::EntityType::Memory, *id)? {
+                    if state::get_entity_hlc(conn, state::EntityType::Memory, *id)?.is_some() {
                         // Memory was previously tracked, check if it was syncable
                         // For deleted memories, we can't check current privacy, so assume Private
                         // was NOT syncable if it's being deleted. Only sync deletes of memories

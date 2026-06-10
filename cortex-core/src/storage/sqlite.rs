@@ -904,12 +904,7 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let person = stmt
-            .query_row(
-                params![id.to_string()],
-                |row| {
-                    parse_person_row(row)
-                },
-            )
+            .query_row(params![id.to_string()], parse_person_row)
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
 

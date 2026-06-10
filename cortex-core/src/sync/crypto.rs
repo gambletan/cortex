@@ -7,7 +7,6 @@ use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{Aes256Gcm, AeadCore, Key, KeyInit};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use pbkdf2::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -136,22 +135,21 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key_bytes)
         .map_err(|e| CortexError::Storage(format!("Key derivation failed: {}", e)))?;
 
-    // Key versioning: currently unused. Will be implemented in iteration 14
-    // when version tracking is added to encrypted payloads (oplog, snapshots).
-    // For now, always use version 0 derivation to maintain compatibility.
+    // Key versioning: read but not yet acted upon. Full key rotation (forward
+    // secrecy) is the Iteration 15 deliverable — see docs/ROADMAP.md. Until then
+    // we always use version-0 derivation to stay backward compatible. Iteration 15
+    // will (1) record the version with each encrypted payload, (2) select the
+    // matching key at decrypt time, and (3) apply version-specific PBKDF2 rounds
+    // on top of Argon2id for versions > 0.
     #[allow(unused_variables)]
     let key_version = manifest.key_version.unwrap_or(0);
-    // TODO (iteration 14): When encrypting, if key_version > 0:
-    //   1. Record version number with encrypted payload
-    //   2. At decrypt time, use recorded version to select correct key
-    //   3. Support multiple versions in derive_key() with version parameter
 
     // Derive HMAC key separately using passphrase + "HMAC" domain separator
     let mut hmac_salt = salt.clone();
     // Append domain separator to salt to ensure HMAC key is independent
     let salt_len = hmac_salt.len();
     for i in 0..3.min(salt_len) {
-        hmac_salt[salt_len - 1 - i] ^= b"HMAC"[i] as u8;
+        hmac_salt[salt_len - 1 - i] ^= b"HMAC"[i];
     }
 
     let mut hmac_key = [0u8; 32];
@@ -159,7 +157,7 @@ pub fn derive_key(passphrase: &str, manifest: &EncryptionManifest) -> Result<Cry
         .hash_password_into(passphrase.as_bytes(), &hmac_salt, &mut hmac_key)
         .map_err(|e| CortexError::Storage(format!("HMAC key derivation failed: {}", e)))?;
 
-    // HMAC key versioning deferred to iteration 14 (see comment above)
+    // HMAC key versioning is part of the Iteration 15 key-rotation work (see comment above)
 
     Ok(CryptoContext { key_bytes, hmac_key })
 }
@@ -248,11 +246,12 @@ pub fn compute_manifest_hmac(manifest_json: &[u8], passphrase: &str) -> Result<(
     OsRng.fill_bytes(&mut salt);
 
     let hmac_value = compute_manifest_hmac_with_salt(manifest_json, passphrase, &salt)?;
-    let salt_b64 = base64::engine::general_purpose::STANDARD.encode(&salt);
+    let salt_b64 = base64::engine::general_purpose::STANDARD.encode(salt);
     Ok((hmac_value, salt_b64))
 }
 
 /// Internal: Verify manifest integrity with explicit salt (for testing)
+#[cfg(test)]
 fn verify_manifest_integrity_with_salt(
     manifest_json: &[u8],
     expected_hmac: &str,

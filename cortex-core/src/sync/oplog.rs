@@ -256,7 +256,7 @@ pub fn read_oplog(
         let result = serde_json::from_str::<SyncOp>(&json_str);
 
         match result {
-            Ok(mut op) => {
+            Ok(op) => {
                 // Verify HMAC if present (backward compatible: old operations lack HMAC field)
                 if let Some(hmac_str) = &op.hmac {
                     if let Some(ctx) = crypto {
