@@ -66,6 +66,7 @@ fn test_channel_boost() {
             social: 0.0,
             channel: 0.7, // heavy channel weight
             fts: 0.0,
+            frecency: 0.0,
         });
 
     let query = RetrievalQuery::new("test", 2)
@@ -116,6 +117,7 @@ fn test_person_boost() {
             social: 0.6, // heavy social weight
             channel: 0.1,
             fts: 0.0,
+            frecency: 0.0,
         });
 
     let query = RetrievalQuery::new("test", 2)
@@ -225,4 +227,57 @@ fn test_results_sorted_by_score() {
     for i in 1..results.len() {
         assert!(results[i - 1].score >= results[i].score);
     }
+}
+
+#[test]
+fn test_frecency_boosts_frequently_recalled_memory() {
+    let (storage, index) = setup();
+    let emb = vec![1.0, 0.0, 0.0];
+
+    // Two memories with identical content and embedding — only recall history differs.
+    let mut ids = Vec::new();
+    for text in ["alpha notes hot", "alpha notes cold"] {
+        let mem = MemObjectBuilder::new(
+            MemoryTier::Episodic,
+            MemContent::Text(text.to_string()),
+            MemSource::new("cli"),
+        )
+        .embedding(emb.clone())
+        .build();
+        storage.store_memory(&mem).unwrap();
+        index.insert(mem.id, emb.clone());
+        ids.push((text, mem.id));
+    }
+
+    // "hot": recalled often and just now. "cold": never recalled, last touched 90 days ago.
+    let now = chrono::Utc::now();
+    let mut hot = storage.get_memory(ids[0].1).unwrap().unwrap();
+    hot.temporal.access_count = 30;
+    hot.temporal.last_accessed = now;
+    storage.update_memory(&hot).unwrap();
+
+    let mut cold = storage.get_memory(ids[1].1).unwrap().unwrap();
+    cold.temporal.access_count = 0;
+    cold.temporal.last_accessed = now - chrono::Duration::days(90);
+    storage.update_memory(&cold).unwrap();
+
+    // Isolate the frecency signal so the ranking change is unambiguous.
+    let engine = RetrievalEngine::new(&storage, &index).with_weights(RetrievalWeights {
+        similarity: 0.0,
+        temporal: 0.0,
+        salience: 0.0,
+        social: 0.0,
+        channel: 0.0,
+        fts: 0.0,
+        frecency: 1.0,
+    });
+    let query = RetrievalQuery::new("alpha notes", 2).with_embedding(vec![1.0, 0.0, 0.0]);
+
+    let results = engine.retrieve(&query).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].memory.id, hot.id,
+        "frequently and recently recalled memory should rank first under frecency"
+    );
+    assert!(results[0].score_breakdown.frecency > results[1].score_breakdown.frecency);
 }

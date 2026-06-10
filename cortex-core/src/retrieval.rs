@@ -71,6 +71,8 @@ pub struct ScoreBreakdown {
     pub social: f32,
     pub channel: f32,
     pub fts: f32,
+    /// Frecency: how often *and* how recently the memory has been recalled.
+    pub frecency: f32,
 }
 
 /// Configurable weights for multi-signal retrieval.
@@ -82,6 +84,7 @@ pub struct RetrievalWeights {
     pub social: f32,
     pub channel: f32,
     pub fts: f32,
+    pub frecency: f32,
 }
 
 impl Default for RetrievalWeights {
@@ -93,8 +96,28 @@ impl Default for RetrievalWeights {
             social: 0.08,
             channel: 0.07,
             fts: 0.15,
+            frecency: 0.10,
         }
     }
+}
+
+/// Frequency saturation scale: access_count at which the frequency term is ~63% of max.
+const FRECENCY_FREQ_SCALE: f32 = 5.0;
+/// Access-recency decay constant in hours (~1 week characteristic time).
+const FRECENCY_RECENCY_TAU: f32 = 168.0;
+
+/// Frecency score in `[0, 1]` blending how *often* (`access_count`) and how *recently*
+/// (`last_accessed`) a memory has been recalled. Mirrors the frecency ranking used by
+/// editors and browsers: memories the user actually returns to rank higher than cold ones,
+/// independent of content similarity. A just-created, never-recalled memory scores ~0.5
+/// (full access-recency, zero frequency), so it is order-neutral across fresh candidates.
+fn compute_frecency(temporal: &TemporalInfo, now: DateTime<Utc>) -> f32 {
+    // Frequency: saturating curve — 0 when never accessed, approaching 1 as count grows.
+    let freq = 1.0 - (-(temporal.access_count as f32) / FRECENCY_FREQ_SCALE).exp();
+    // Recency of access: exponential decay on hours since last recall.
+    let hours_since = (now - temporal.last_accessed).num_hours().max(0) as f32;
+    let recency = (-hours_since / FRECENCY_RECENCY_TAU).exp();
+    0.5 * freq + 0.5 * recency
 }
 
 /// Multi-signal retrieval engine.
@@ -188,6 +211,17 @@ impl<'a> RetrievalEngine<'a> {
         // Adapt weights for temporal queries
         let weights = match temporal_intent {
             TemporalIntent::None => self.weights.clone(),
+            // "First/earliest" queries want the oldest memory, not the most-recalled.
+            // Access-recency frecency would fight that goal, so drop it for these.
+            TemporalIntent::First | TemporalIntent::Earliest => RetrievalWeights {
+                similarity: self.weights.similarity * 0.6,
+                temporal: self.weights.temporal * 2.5,
+                salience: self.weights.salience * 0.8,
+                social: self.weights.social,
+                channel: self.weights.channel,
+                fts: self.weights.fts,
+                frecency: 0.0,
+            },
             _ => RetrievalWeights {
                 similarity: self.weights.similarity * 0.6,
                 temporal: self.weights.temporal * 2.5,
@@ -195,6 +229,7 @@ impl<'a> RetrievalEngine<'a> {
                 social: self.weights.social,
                 channel: self.weights.channel,
                 fts: self.weights.fts,
+                frecency: self.weights.frecency,
             },
         };
 
@@ -208,6 +243,7 @@ impl<'a> RetrievalEngine<'a> {
                 social: weights.social * 3.0,
                 channel: weights.channel,
                 fts: weights.fts,
+                frecency: weights.frecency,
             },
             QueryType::FactQuery => RetrievalWeights {
                 similarity: weights.similarity * 1.3,
@@ -216,6 +252,7 @@ impl<'a> RetrievalEngine<'a> {
                 social: weights.social,
                 channel: weights.channel,
                 fts: weights.fts * 1.2,
+                frecency: weights.frecency,
             },
             QueryType::PreferenceQuery => RetrievalWeights {
                 similarity: weights.similarity,
@@ -224,6 +261,7 @@ impl<'a> RetrievalEngine<'a> {
                 social: weights.social * 0.5,
                 channel: weights.channel,
                 fts: weights.fts,
+                frecency: weights.frecency,
             },
             QueryType::General | QueryType::Temporal => weights,
         };
@@ -251,7 +289,8 @@ impl<'a> RetrievalEngine<'a> {
                     + weights.salience * breakdown.salience
                     + weights.social * breakdown.social
                     + weights.channel * breakdown.channel
-                    + weights.fts * breakdown.fts;
+                    + weights.fts * breakdown.fts
+                    + weights.frecency * breakdown.frecency;
 
                 results.push(RetrievalResult {
                     memory: Arc::clone(mem),
@@ -484,6 +523,9 @@ impl<'a> RetrievalEngine<'a> {
             0.0
         };
 
+        // Frecency: elevate memories the user recalls often and recently.
+        let frecency = compute_frecency(&mem.temporal, query.time_context);
+
         ScoreBreakdown {
             similarity,
             temporal,
@@ -491,6 +533,7 @@ impl<'a> RetrievalEngine<'a> {
             social,
             channel,
             fts,
+            frecency,
         }
     }
 }
@@ -747,6 +790,39 @@ fn detect_temporal_intent(query: &str) -> TemporalIntent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_frecency_frequent_recent_beats_stale() {
+        let now = Utc::now();
+        let mut frequent_recent = TemporalInfo::now();
+        frequent_recent.access_count = 20;
+        frequent_recent.last_accessed = now;
+        let mut stale = TemporalInfo::now();
+        stale.access_count = 0;
+        stale.last_accessed = now - chrono::Duration::days(60);
+        assert!(compute_frecency(&frequent_recent, now) > compute_frecency(&stale, now));
+    }
+
+    #[test]
+    fn test_frecency_bounded_and_fresh_baseline() {
+        let now = Utc::now();
+        // A just-created, never-recalled memory: recency high, frequency zero → ~0.5.
+        let fresh = TemporalInfo::now();
+        let f = compute_frecency(&fresh, now);
+        assert!((0.0..=1.0).contains(&f), "frecency must stay in [0,1], got {f}");
+        assert!((0.45..=0.55).contains(&f), "fresh frecency should be ~0.5, got {f}");
+    }
+
+    #[test]
+    fn test_frecency_more_access_scores_higher() {
+        let now = Utc::now();
+        let mut few = TemporalInfo::now();
+        few.access_count = 1;
+        let mut many = TemporalInfo::now();
+        many.access_count = 50;
+        // Same (now) recency; more accesses must not score lower.
+        assert!(compute_frecency(&many, now) >= compute_frecency(&few, now));
+    }
 
     #[test]
     fn test_temporal_recent() {
