@@ -1113,3 +1113,59 @@ fn test_background_sync_detects_changes() {
     // Stop the watcher
     handle.stop();
 }
+
+#[test]
+fn test_key_rotation_end_to_end() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("cortex-sync");
+
+    let cortex_a = Cortex::in_memory().unwrap();
+    let mut engine_a = SyncEngine::new(
+        make_sync_config(&sync_dir, "device-a").with_encryption("rotate-pass"),
+        cortex_a.sqlite_storage(),
+    )
+    .unwrap();
+
+    // Pre-rotation op (version 0 / ENC1 envelope).
+    let m0 = cortex_a.ingest("before rotation", "test", None, None, None).unwrap();
+    promote_shared(&cortex_a, m0.id);
+    engine_a
+        .record_op(SyncPayload::MemoryUpsert {
+            memory: cortex_a.storage().get_memory(m0.id).unwrap().unwrap(),
+        })
+        .unwrap();
+
+    // Rotate the encryption key.
+    let new_version = engine_a.rotate_key().unwrap();
+    assert_eq!(new_version, 1);
+
+    // Post-rotation op (version 1 / ENC2 envelope).
+    let m1 = cortex_a.ingest("after rotation", "test", None, None, None).unwrap();
+    promote_shared(&cortex_a, m1.id);
+    engine_a
+        .record_op(SyncPayload::MemoryUpsert {
+            memory: cortex_a.storage().get_memory(m1.id).unwrap().unwrap(),
+        })
+        .unwrap();
+
+    // A device with the same passphrase reads both the pre- and post-rotation memories,
+    // even though it derived its own context before ever seeing the rotation.
+    let cortex_b = Cortex::in_memory().unwrap();
+    let mut engine_b = SyncEngine::new(
+        make_sync_config(&sync_dir, "device-b").with_encryption("rotate-pass"),
+        cortex_b.sqlite_storage(),
+    )
+    .unwrap();
+    let applied = engine_b
+        .pull_remote(cortex_b.sqlite_storage(), cortex_b.index())
+        .unwrap();
+    assert!(applied >= 2, "device B should apply both ops across the rotation, got {applied}");
+    assert!(
+        cortex_b.storage().get_memory(m0.id).unwrap().is_some(),
+        "pre-rotation memory should sync"
+    );
+    assert!(
+        cortex_b.storage().get_memory(m1.id).unwrap().is_some(),
+        "post-rotation memory should sync"
+    );
+}

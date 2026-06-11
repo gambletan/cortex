@@ -226,6 +226,54 @@ impl SyncEngine {
         Ok(Self { config, hlc, writer, crypto: crypto_ctx })
     }
 
+    /// Rotate the sync encryption key forward by one version.
+    ///
+    /// Existing oplog/snapshot data stays readable under its original version; new writes use
+    /// the new version's key, which is derived from the passphrase independently of prior
+    /// versions (forward secrecy against AES-key exfiltration). Bumps `key_version` in the
+    /// manifest, recomputes the manifest HMAC, re-derives the crypto context, and rebuilds the
+    /// writer to encrypt under the new version. Returns the new active version. Requires sync
+    /// encryption to be enabled.
+    pub fn rotate_key(&mut self) -> Result<u32, CortexError> {
+        let passphrase = self.config.encryption_passphrase.clone().ok_or_else(|| {
+            CortexError::Storage("Cannot rotate key: sync encryption is not enabled".into())
+        })?;
+        let manifest_path = self.config.sync_dir.join("manifest.json");
+        let my_dir = self.config.my_device_dir();
+
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|e| CortexError::Storage(format!("Failed to read manifest: {}", e)))?;
+        let mut manifest_json: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| CortexError::Serialization(e.to_string()))?;
+        let enc = manifest_json.get("encryption").ok_or_else(|| {
+            CortexError::Storage("Cannot rotate key: manifest has no encryption block".into())
+        })?;
+        let mut manifest = serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
+            .map_err(|e| CortexError::Serialization(e.to_string()))?;
+
+        // Bump the active version and recompute the manifest HMAC over its hmac-free form.
+        let new_version = manifest.key_version.unwrap_or(0) + 1;
+        manifest.key_version = Some(new_version);
+        manifest.hmac = None;
+        manifest.hmac_salt = None;
+        let manifest_bytes = serde_json::to_vec(&manifest)
+            .map_err(|e| CortexError::Serialization(e.to_string()))?;
+        let (hmac_value, hmac_salt) = crypto::compute_manifest_hmac(&manifest_bytes, &passphrase)?;
+        manifest.hmac = Some(hmac_value);
+        manifest.hmac_salt = Some(hmac_salt);
+
+        manifest_json["encryption"] = serde_json::to_value(&manifest)
+            .map_err(|e| CortexError::Serialization(e.to_string()))?;
+        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json).unwrap())
+            .map_err(|e| CortexError::Storage(format!("Failed to write manifest: {}", e)))?;
+
+        // Re-derive at the new version and rebuild the writer so new lines use the new key.
+        let ctx = std::sync::Arc::new(crypto::derive_key(&passphrase, &manifest)?);
+        self.writer = OpLogWriter::new(my_dir, Some(ctx.clone()))?;
+        self.crypto = Some(ctx);
+        Ok(new_version)
+    }
+
     /// Record a local mutation as a SyncOp in the oplog.
     pub fn record_op(&mut self, payload: SyncPayload) -> Result<(), CortexError> {
         let hlc = self.hlc.tick();

@@ -1,9 +1,18 @@
 # Design — Iteration 15: Key Rotation & Forward Secrecy
 
-**Status:** DRAFT for review (no code yet)
+**Status:** IMPLEMENTED (crypto layer + `SyncEngine::rotate_key`) — 2026-06-11
 **Owner:** CTO
 **Date:** 2026-06-11
 **Tracking:** docs/ROADMAP.md → Priority 1
+
+> **Correction applied during implementation.** §4.2 originally proposed deriving
+> `key(n) = PBKDF2(base_key, …)`. That gives **no** forward secrecy: `base_key == key(0)`,
+> so leaking `key(0)` derives every later version. Shipped instead with
+> **`key(n>0) = PBKDF2(passphrase, salt‖LE(n), 100k)`** — independent of `key(0)`. The
+> `CryptoContext` retains the passphrase (zeroized) to derive version keys on demand. Forward
+> secrecy holds against **AES-key (CryptoContext) exfiltration**, explicitly **not** against
+> passphrase compromise (a leaked passphrase derives all versions — that requires a passphrase
+> change, noted as future work).
 
 ## 1. Goal
 
