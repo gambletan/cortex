@@ -26,3 +26,6 @@ bench/*.html
 .idea/
 .vscode/
 *.swp
+
+# Runtime logs (launchd + auto-iterate)
+.logs/
