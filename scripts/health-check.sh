@@ -50,7 +50,17 @@ if [ "$W" -eq 0 ]; then echo "✅ build    : warning-clean"; else echo "⚠️  
 C=$(cargo clippy -p cortex-core --lib 2>&1 | grep -c "^warning")
 if [ "$C" -eq 0 ]; then echo "✅ clippy   : lib clean"; else echo "⚠️  clippy   : $C lib lint(s)"; FAIL=1; fi
 
-# 5. Self-evolution loop health (informational — does not fail the check).
+# 5. HTTP service correctness — boot cortex-http and smoke-test /health + /v1/stats.
+if [ -x "$REPO_DIR/scripts/probe-http.sh" ]; then
+  if HTTP_OUT=$(bash "$REPO_DIR/scripts/probe-http.sh" 2>&1); then
+    echo "$HTTP_OUT" | grep -E "^✅ http"
+  else
+    echo "$HTTP_OUT" | grep -E "http" | head -3 | sed 's/^/   /'
+    FAIL=1
+  fi
+fi
+
+# 6. Self-evolution loop health (informational — does not fail the check).
 STATUS=$(launchctl list 2>/dev/null | awk '/com.cortex.auto-iterate/{print $2}')
 echo "ℹ️  loop     : launchd registered, last-exit=${STATUS:-<not loaded>}"
 LATEST=$(ls -1t "$REPO_DIR"/.logs/iteration-*.log 2>/dev/null | head -1)
