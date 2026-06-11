@@ -1169,3 +1169,45 @@ fn test_key_rotation_end_to_end() {
         "post-rotation memory should sync"
     );
 }
+
+/// An attacker who controls the (plaintext) sync directory must not be able to bypass manifest
+/// integrity by simply stripping the `hmac` field. If stripping were tolerated, the attacker
+/// could roll `key_version` back to a previously-leaked version and force all new writes under a
+/// compromised key — defeating the forward-secrecy guarantee. Loading a manifest that has an
+/// encryption block but no HMAC must be rejected.
+#[test]
+fn test_manifest_without_hmac_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("cortex-sync");
+
+    // Initialize an encrypted sync directory (writes manifest.json with key_version + HMAC).
+    let cortex = Cortex::in_memory().unwrap();
+    {
+        let _engine = SyncEngine::new(
+            make_sync_config(&sync_dir, "device-a").with_encryption("strip-pass"),
+            cortex.sqlite_storage(),
+        )
+        .unwrap();
+    }
+
+    // Attacker tampers with the plaintext manifest: strip the integrity HMAC entirely.
+    let manifest_path = sync_dir.join("manifest.json");
+    let content = std::fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let enc = manifest.get_mut("encryption").unwrap().as_object_mut().unwrap();
+    assert!(enc.contains_key("hmac"), "precondition: manifest should have an HMAC");
+    enc.remove("hmac");
+    enc.remove("hmac_salt");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+    // Re-opening the tampered (HMAC-stripped) manifest must be rejected, not silently accepted.
+    let cortex2 = Cortex::in_memory().unwrap();
+    let result = SyncEngine::new(
+        make_sync_config(&sync_dir, "device-a").with_encryption("strip-pass"),
+        cortex2.sqlite_storage(),
+    );
+    assert!(
+        result.is_err(),
+        "an encryption manifest with its HMAC stripped must be rejected (downgrade/tamper defense)"
+    );
+}

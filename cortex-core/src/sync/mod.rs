@@ -176,22 +176,31 @@ impl SyncEngine {
                 let mut manifest = serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
                     .map_err(|e| CortexError::Serialization(e.to_string()))?;
 
-                // Verify manifest integrity if HMAC is present
-                if let Some(ref stored_hmac) = manifest.hmac.take() {
-                    let stored_salt = manifest.hmac_salt.take();
-                    // Recompute HMAC to verify integrity
-                    let manifest_without_hmac = serde_json::to_vec(&manifest)
-                        .map_err(|e| CortexError::Serialization(e.to_string()))?;
-                    if !crypto::verify_manifest_integrity(
-                        &manifest_without_hmac,
-                        stored_hmac,
-                        passphrase,
-                        stored_salt.as_deref(),
-                    )? {
-                        return Err(CortexError::Storage(
-                            "Manifest integrity check failed: HMAC mismatch. Data may be corrupted or tampered.".into()
-                        ));
-                    }
+                // Manifest integrity is MANDATORY once encryption is enabled. The manifest is
+                // stored in plaintext on (potentially untrusted) cloud storage, so its HMAC is
+                // the only thing binding `salt`, `kdf_params`, and `key_version`. If a missing
+                // HMAC were tolerated, an attacker could simply strip the field to bypass the
+                // integrity check and roll `key_version` back to a previously-compromised
+                // version, forcing new writes under a leaked key — defeating forward secrecy.
+                let stored_hmac = manifest.hmac.take().ok_or_else(|| {
+                    CortexError::Storage(
+                        "Encryption manifest is missing its integrity HMAC — refusing to load. \
+                         This indicates tampering or a downgrade attack on the sync directory.".into()
+                    )
+                })?;
+                let stored_salt = manifest.hmac_salt.take();
+                // Recompute HMAC to verify integrity
+                let manifest_without_hmac = serde_json::to_vec(&manifest)
+                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
+                if !crypto::verify_manifest_integrity(
+                    &manifest_without_hmac,
+                    &stored_hmac,
+                    passphrase,
+                    stored_salt.as_deref(),
+                )? {
+                    return Err(CortexError::Storage(
+                        "Manifest integrity check failed: HMAC mismatch. Data may be corrupted or tampered.".into()
+                    ));
                 }
 
                 manifest
