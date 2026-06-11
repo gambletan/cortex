@@ -14,14 +14,27 @@ This is the prioritized forward plan. The per-iteration security audits
 
 - **Build:** library code is `clippy -D warnings` clean across cortex-core / cortex-http /
   cortex-mcp-server. (Integration-test binaries still have residual lints — see Health track.)
-- **Tests:** 132 unit tests green (`cargo test --lib --workspace`).
+- **Tests / CI: GREEN as of 2026-06-11.** The **full** workspace suite passes
+  (`cargo test --workspace --exclude cortex-python --exclude cortex-wasm`). NOTE: CI had been
+  silently **red for ~4 iterations** — `test_sync.rs` failed to compile (missing `hmac` field),
+  which aborts the whole `cargo test`, and ~11 more integration tests had rotted. `cargo test
+  --lib` masks this; always run the full workspace suite. See memory `cortex-ci-testing`.
 - **Security:** iterations 11–14 shipped — manifest HMAC, OPLOG HMAC + tampering detection,
   timing-attack hardening (privacy padding + constant-time compares), private-delete privacy leak.
+- **Privacy architecture fix (2026-06-11):** the iter-10 `privacy != Private` filter in
+  fact/preference storage queries was relocated to the context-export boundary
+  (`generate_context` + `ContextConfig::for_remote_llm`). Storage now returns the owner's own
+  data faithfully; Private is excluded only when context is bound for a remote LLM.
 - **Surfaces:** core (Rust), HTTP API, MCP server, Python + WASM bindings, Obsidian + OpenClaw
   plugins, npm package. Multi-surface and fairly mature.
 - **Known environment quirks (not bugs):** `cargo build --workspace` fails to link the
   `cortex-python` pyo3 dylib standalone on macOS (needs interpreter symbols); zstd link-time
-  macOS-version warnings are cosmetic. Use `cargo test --lib` as the canonical gate.
+  macOS-version warnings are cosmetic.
+
+### Shipped this cycle
+- ✅ Frecency ranking in `retrieval.rs` (P2) — access frequency + recency boost, tested.
+- ✅ CI restored to green; sync + fact/preference/contradiction integration tests revived.
+- ✅ Privacy enforcement relocated to the context boundary (above).
 
 ---
 
