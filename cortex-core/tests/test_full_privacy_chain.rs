@@ -216,17 +216,19 @@ fn test_wrong_sync_passphrase_skips_ops() {
     ).unwrap();
     engine_a.record_op(SyncPayload::MemoryDelete { id: uuid::Uuid::new_v4() }).unwrap();
 
-    // Device B tries to read with wrong passphrase
+    // Device B tries to attach with the wrong passphrase. The manifest integrity (HMAC)
+    // check must reject it at sync init rather than letting a wrong key read at all.
     let cortex_b = Cortex::in_memory().unwrap();
     let config_b = SyncConfig::new(
         sync_dir.clone(),
         "device-b".into(),
         "Device B".into(),
     ).with_encryption("WRONG-passphrase");
-    let mut engine_b = SyncEngine::new(config_b, cortex_b.sqlite_storage()).unwrap();
+    let result = SyncEngine::new(config_b, cortex_b.sqlite_storage());
 
-    // Pull should succeed but apply 0 ops (decryption failures are skipped)
-    let applied = engine_b.pull_remote(cortex_b.sqlite_storage(), cortex_b.index()).unwrap();
-    assert_eq!(applied, 0, "Wrong sync passphrase should result in 0 applied ops");
-    println!("✅ Wrong sync passphrase: ops gracefully skipped (0 applied)");
+    assert!(
+        result.is_err(),
+        "Wrong sync passphrase must fail the manifest integrity check at init"
+    );
+    println!("✅ Wrong sync passphrase: rejected at init by manifest integrity check");
 }

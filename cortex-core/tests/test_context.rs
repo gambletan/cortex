@@ -103,3 +103,47 @@ fn test_context_truncation() {
     // 50 tokens * 4 chars = 200 chars max
     assert!(ctx.len() < 500); // some margin for truncation mechanics
 }
+
+#[test]
+fn test_context_excludes_private_for_remote_llm() {
+    let (storage, index) = setup();
+
+    // A Private (default) fact and a Shared fact.
+    let private_fact = MemObjectBuilder::new(
+        MemoryTier::Semantic,
+        MemContent::Fact {
+            subject: "User".into(),
+            predicate: "has_secret".into(),
+            object: "private-value".into(),
+        },
+        MemSource::new("system"),
+    )
+    .build();
+    let shared_fact = MemObjectBuilder::new(
+        MemoryTier::Semantic,
+        MemContent::Fact {
+            subject: "User".into(),
+            predicate: "likes".into(),
+            object: "shared-value".into(),
+        },
+        MemSource::new("system"),
+    )
+    .privacy(PrivacyLevel::Shared { scope: "all".into() })
+    .build();
+    storage.store_memory(&private_fact).unwrap();
+    storage.store_memory(&shared_fact).unwrap();
+
+    // Default (local) context includes the owner's Private fact.
+    let local = generate_context(&ContextConfig::new(2000), &storage, &index).unwrap();
+    assert!(local.contains("private-value"), "local context should include Private memories");
+    assert!(local.contains("shared-value"));
+
+    // Remote-LLM context excludes Private but keeps Shared.
+    let remote =
+        generate_context(&ContextConfig::new(2000).for_remote_llm(), &storage, &index).unwrap();
+    assert!(
+        !remote.contains("private-value"),
+        "Private memories must not leave the device in remote-LLM context"
+    );
+    assert!(remote.contains("shared-value"), "Shared memories should still appear");
+}

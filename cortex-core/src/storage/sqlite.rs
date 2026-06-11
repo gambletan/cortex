@@ -1213,7 +1213,6 @@ impl StorageBackend for SqliteStorage {
                  content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
                  AND (fact_subject LIKE ?1 OR fact_object LIKE ?1) \
-                 AND privacy_json != '\"Private\"' \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1248,7 +1247,6 @@ impl StorageBackend for SqliteStorage {
              salience_json, privacy_json, tags_json, metadata_json, links_json, \
              content_hash, namespace \
              FROM memories WHERE tier = 'semantic' AND ({}) \
-             AND privacy_json != '\"Private\"' \
              ORDER BY created_at DESC",
             conditions.join(" OR ")
         );
@@ -1278,7 +1276,6 @@ impl StorageBackend for SqliteStorage {
                  content_hash, namespace \
                  FROM memories WHERE tier = 'semantic' \
                  AND pref_key LIKE ?1 \
-                 AND privacy_json != '\"Private\"' \
                  ORDER BY created_at DESC",
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;

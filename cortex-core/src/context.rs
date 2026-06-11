@@ -18,6 +18,16 @@ pub struct ContextConfig {
     pub channel: Option<String>,
     pub person_id: Option<Uuid>,
     pub namespace: Option<String>,
+    /// Whether to include Private memories in the generated context.
+    ///
+    /// Context generation is the boundary where memory may be handed to an LLM. When the
+    /// agent runs locally (Cortex's default, 100%-local posture) the owner's own Private
+    /// memories belong in their context, so this defaults to `true`. Set it to `false`
+    /// (e.g. via [`ContextConfig::for_remote_llm`]) when the assembled context will be sent
+    /// to a remote/cloud model, so Private memories never leave the device. Privacy is
+    /// enforced here, at the export boundary — not in the storage query layer, which always
+    /// returns the owner's own data faithfully.
+    pub include_private: bool,
 }
 
 impl Default for ContextConfig {
@@ -31,6 +41,7 @@ impl Default for ContextConfig {
             channel: None,
             person_id: None,
             namespace: None,
+            include_private: true,
         }
     }
 }
@@ -60,6 +71,19 @@ impl ContextConfig {
 
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Exclude Private memories from the generated context. Use when the context will be
+    /// sent to a remote/cloud LLM so Private (local-only) memories never leave the device.
+    pub fn for_remote_llm(mut self) -> Self {
+        self.include_private = false;
+        self
+    }
+
+    /// Set whether Private memories are included in the generated context.
+    pub fn with_include_private(mut self, include_private: bool) -> Self {
+        self.include_private = include_private;
         self
     }
 }
@@ -150,6 +174,11 @@ pub fn generate_context(
 
     let mut sections: Vec<ContextSection> = Vec::new();
 
+    // When the context is destined for a remote LLM, Private (local-only) memories are
+    // excluded here, at the export boundary — storage queries themselves return all of
+    // the owner's data.
+    let skip_private = !config.include_private;
+
     // ── User preferences + Semantic facts (single query) ──────────────
     if config.include_preferences {
         // Load semantic memories — filtered by namespace if set
@@ -163,6 +192,9 @@ pub fn generate_context(
         let mut fact_sec = ContextSection::new("\n## Known Facts\n", 25.0);
 
         for mem in &semantic_mems {
+            if skip_private && matches!(mem.privacy, PrivacyLevel::Private) {
+                continue;
+            }
             match &mem.content {
                 MemContent::Preference { key, value, confidence } => {
                     let line = format!("- {} = {} (confidence: {:.0}%)\n", key, value, confidence * 100.0);
@@ -200,6 +232,9 @@ pub fn generate_context(
                     sec.push(0.4, format!("- Tags: {}\n", ctx.person.tags.join(", ")));
                 }
                 for mem in ctx.related_memories.iter().take(3) {
+                    if skip_private && matches!(mem.privacy, PrivacyLevel::Private) {
+                        continue;
+                    }
                     let summary = summarize_content(&mem.content);
                     sec.push(mem.salience.base_score, format!("  - {}\n", summary));
                 }
@@ -228,6 +263,9 @@ pub fn generate_context(
         if !recent.is_empty() {
             let mut sec = ContextSection::ordered("\n## Recent Context\n", 20.0);
             for mem in &recent {
+                if skip_private && matches!(mem.privacy, PrivacyLevel::Private) {
+                    continue;
+                }
                 let summary = summarize_content(&mem.content);
                 let time = mem.temporal.event_time.unwrap_or(mem.temporal.ingestion_time);
                 let line = format!("- [{}] {}\n", time.format("%Y-%m-%d %H:%M"), summary);
