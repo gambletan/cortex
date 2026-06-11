@@ -405,7 +405,8 @@ mod tests {
             MergeResult::Skipped
         ));
 
-        match s.get_memory(id).unwrap().unwrap().content {
+        let stored = s.get_memory(id).unwrap().unwrap();
+        match &stored.content {
             MemContent::Text(t) => assert_eq!(t, "v1"),
             other => panic!("unexpected content: {other:?}"),
         }

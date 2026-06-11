@@ -1465,9 +1465,12 @@ impl StorageBackend for SqliteStorage {
         for row in rows {
             let (id_str, content_json) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
             let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
-            // Extract text from content JSON
-            if let Ok(crate::types::MemContent::Text(text)) = serde_json::from_str::<crate::types::MemContent>(&content_json) {
-                results.push((id, text));
+            // Extract text from content JSON. Bind by ref + clone: MemContent implements
+            // Drop (zeroize-on-drop), so its inner String cannot be moved out.
+            if let Ok(crate::types::MemContent::Text(ref text)) =
+                serde_json::from_str::<crate::types::MemContent>(&content_json)
+            {
+                results.push((id, text.clone()));
             }
         }
         Ok(results)

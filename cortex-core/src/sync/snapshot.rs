@@ -26,7 +26,10 @@ pub fn create_snapshot(
     fs::create_dir_all(snapshots_dir)
         .map_err(|e| CortexError::Storage(format!("Failed to create snapshots dir: {}", e)))?;
 
-    let data = export::export_all(storage)?;
+    // SYNC BOUNDARY: snapshots are cloud-bound, so carry only syncable memories and no
+    // derived entities. Private memories and people/beliefs/patterns never leave the
+    // device — see export::export_for_sync (mirrors the oplog's record_memory_event).
+    let data = export::export_for_sync(storage)?;
     let json = serde_json::to_vec(&data)
         .map_err(|e| CortexError::Serialization(e.to_string()))?;
     let compressed = zstd::encode_all(&json[..], 3)
@@ -145,9 +148,17 @@ mod tests {
     fn test_create_and_restore_snapshot() {
         let cortex = crate::Cortex::in_memory().unwrap();
 
-        // Ingest some data
-        cortex.ingest("I live in Shanghai", "test", None, None, None).unwrap();
-        cortex.ingest("I work at Google", "test", None, None, None).unwrap();
+        // Snapshots carry syncable memories only, so seed Public memories.
+        for text in ["I live in Shanghai", "I work at Google"] {
+            let mem = crate::types::MemObjectBuilder::new(
+                crate::MemoryTier::Episodic,
+                crate::MemContent::Text(text.to_string()),
+                crate::MemSource::new("test"),
+            )
+            .privacy(crate::PrivacyLevel::Public)
+            .build();
+            cortex.storage().store_memory(&mem).unwrap();
+        }
         cortex.add_fact("Alice", "works_at", "Stripe", 0.9, "test", None).unwrap();
         cortex.observe_belief("user_is_dev", true, 0.8).unwrap();
 
@@ -160,7 +171,7 @@ mod tests {
 
         // Verify file is actually compressed (smaller than raw JSON)
         let compressed_size = fs::metadata(&path).unwrap().len();
-        let raw_data = export::export_all(cortex.storage()).unwrap();
+        let raw_data = export::export_for_sync(cortex.storage()).unwrap();
         let raw_size = serde_json::to_vec(&raw_data).unwrap().len() as u64;
         assert!(compressed_size < raw_size, "Compressed should be smaller than raw");
 
@@ -168,7 +179,11 @@ mod tests {
         let cortex2 = crate::Cortex::in_memory().unwrap();
         let (report, _exported_at) = restore_from_snapshot(&path, cortex2.storage(), cortex2.index(), None).unwrap();
         assert!(report.memories > 0);
-        assert!(report.beliefs > 0);
+        // SYNC BOUNDARY: snapshots carry syncable memories only. Derived entities
+        // (beliefs/people/patterns) have no privacy provenance and must not cross the
+        // sync boundary — they are re-derived locally on the receiving device.
+        assert_eq!(report.beliefs, 0, "snapshots must not carry beliefs");
+        assert_eq!(report.people, 0, "snapshots must not carry people");
 
         // Verify data was restored
         let stats = cortex2.stats().unwrap();
@@ -202,7 +217,15 @@ mod tests {
     #[test]
     fn test_encrypted_snapshot_roundtrip_and_not_plaintext() {
         let cortex = crate::Cortex::in_memory().unwrap();
-        cortex.ingest("I live in Shanghai", "test", None, None, None).unwrap();
+        // Public memory so it is carried in the (syncable) snapshot.
+        let mem = crate::types::MemObjectBuilder::new(
+            crate::MemoryTier::Episodic,
+            crate::MemContent::Text("I live in Shanghai".to_string()),
+            crate::MemSource::new("test"),
+        )
+        .privacy(crate::PrivacyLevel::Public)
+        .build();
+        cortex.storage().store_memory(&mem).unwrap();
         cortex.observe_belief("user_is_dev", true, 0.8).unwrap();
 
         let ctx = crypto::derive_key("snapshot-test-pass", &crypto::new_encryption_manifest()).unwrap();

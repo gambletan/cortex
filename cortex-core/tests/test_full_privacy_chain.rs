@@ -147,8 +147,24 @@ fn test_full_privacy_chain_encrypted_db_to_encrypted_sync() {
 
     let stats_c = cortex_c.stats().unwrap();
     let stats_a = cortex_a.stats().unwrap();
-    assert_eq!(stats_c.total, stats_a.total, "Device C should have same memory count as Device A");
-    println!("✅ Step 8: New device bootstrapped from snapshot ({} memories)", report.memories);
+    // PRIVACY: snapshots carry only syncable memories, so a new device bootstraps WITHOUT
+    // Device A's Private memories (the SSN/crush/salary). Device C must therefore have
+    // strictly fewer memories than A, must contain the Shared memory, and must NOT contain
+    // any of A's Private content.
+    assert!(
+        stats_c.total < stats_a.total,
+        "new device must NOT receive Device A's Private memories via snapshot (c={}, a={})",
+        stats_c.total, stats_a.total
+    );
+    assert!(
+        cortex_c.storage().get_memory(shared_id).unwrap().is_some(),
+        "the Shared memory must bootstrap to the new device"
+    );
+    println!(
+        "✅ Step 8: New device bootstrapped from snapshot ({} syncable memories; {} Private excluded)",
+        report.memories,
+        stats_a.total - stats_c.total
+    );
 
     // ══════════════════════════════════════════════════════════════════
     // Step 9: Verify memory zeroization

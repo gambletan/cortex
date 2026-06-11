@@ -212,6 +212,16 @@ impl MemContent {
     }
 }
 
+impl Drop for MemContent {
+    /// Wipe sensitive text from RAM when memory content is dropped, fulfilling the
+    /// SECURITY.md "zeroized on drop" guarantee. Placed on `MemContent` (not `MemObject`)
+    /// so it does not restrict moving non-sensitive fields (e.g. the `Arc` embedding) out
+    /// of a `MemObject`, while still wiping content whenever a memory is dropped.
+    fn drop(&mut self) {
+        self.zeroize_content();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemSource {
     pub channel: String,
@@ -483,4 +493,57 @@ pub enum CortexEvent {
     MemoryArchived { id: Uuid },
     ConsolidationCompleted { report: String },
     DecayCompleted { count: usize },
+}
+
+#[cfg(test)]
+mod zeroize_drop_tests {
+    use super::*;
+
+    /// Vuln fix wiring guarantee: `MemContent` MUST have an explicit `Drop` impl so that
+    /// content is zeroized automatically. The `T: Drop` bound is satisfied ONLY by types
+    /// with an explicit `impl Drop` — so if someone deletes `impl Drop for MemContent`,
+    /// this stops compiling. This is the discriminator the runtime test below cannot be.
+    #[test]
+    fn memcontent_has_explicit_drop_impl_for_zeroize() {
+        #[allow(drop_bounds)]
+        fn requires_explicit_drop<T: Drop>() {}
+        requires_explicit_drop::<MemContent>();
+    }
+
+    /// The wipe that `Drop` runs must clear the actual heap bytes (not merely reset len).
+    /// Observed soundly: `ManuallyDrop` keeps the `String` allocation alive, and
+    /// `String::zeroize` zeroes the buffer in place (keeping the allocation), so reading
+    /// the live buffer afterward is sound — no freed-memory read.
+    #[test]
+    fn zeroize_content_clears_heap_bytes() {
+        use std::mem::ManuallyDrop;
+
+        let canary = "ULTRASECRET_CANARY_7f3a";
+        let mut content = ManuallyDrop::new(MemContent::Text(canary.to_string()));
+
+        let (ptr, len) = match &*content {
+            MemContent::Text(s) => (s.as_ptr(), s.len()),
+            _ => unreachable!(),
+        };
+
+        // Precondition: the live buffer holds the canary.
+        // SAFETY: `content` is alive (ManuallyDrop); the buffer is valid and initialized.
+        let before = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert_eq!(before, canary.as_bytes(), "precondition: canary present");
+
+        // Exercise the exact wipe that `impl Drop for MemContent` runs.
+        content.zeroize_content();
+
+        // Buffer is still allocated (ManuallyDrop) but its bytes must now be zero.
+        // SAFETY: buffer not freed; sound read of live memory.
+        let after = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert!(
+            after.iter().all(|&b| b == 0),
+            "content heap bytes must be zeroized, found: {:?}",
+            after
+        );
+
+        // Cleanup: actually drop (frees the buffer).
+        unsafe { ManuallyDrop::drop(&mut content) };
+    }
 }
