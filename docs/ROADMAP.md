@@ -35,6 +35,11 @@ This is the prioritized forward plan. The per-iteration security audits
 - ✅ Frecency ranking in `retrieval.rs` (P2) — access frequency + recency boost, tested.
 - ✅ CI restored to green; sync + fact/preference/contradiction integration tests revived.
 - ✅ Privacy enforcement relocated to the context boundary (above).
+- ✅ **Iteration 15 — Key Rotation & forward secrecy (P1 flagship).** Versioned `ENC2`
+  envelope (ENC1 = v0, backward compatible), passphrase-derived per-version keys,
+  `SyncEngine::rotate_key()`. See docs/design/key-rotation.md. Follow-ups: passphrase
+  change (vs key-only rotation), optional `compact_to_current_version()`, wire rotation
+  into the HTTP/MCP surface.
 
 ---
 
