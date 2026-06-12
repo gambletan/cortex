@@ -14,7 +14,10 @@ use tracing::{debug, error, info};
 
 use cortex_core::Cortex;
 
+mod capabilities;
 mod tools;
+
+use capabilities::CapabilityPolicy;
 
 // ── JSON-RPC types ──────────────────────────────────────────────────────────
 
@@ -163,6 +166,8 @@ enum SyncAction {
 
 struct McpServer {
     cortex: Arc<Cortex>,
+    /// Capability policy gating which tools this instance lists and executes.
+    policy: CapabilityPolicy,
 }
 
 impl McpServer {
@@ -171,6 +176,7 @@ impl McpServer {
         let cortex = Cortex::open(db_path)?;
         Ok(Self {
             cortex: Arc::new(cortex),
+            policy: CapabilityPolicy::load(db_path),
         })
     }
 
@@ -181,6 +187,7 @@ impl McpServer {
             .with_plugin(Box::new(TagClassifierPlugin::new()));
         Ok(Self {
             cortex: Arc::new(cortex),
+            policy: CapabilityPolicy::load(db_path),
         })
     }
 
@@ -211,15 +218,46 @@ impl McpServer {
             "ping" => Some(JsonRpcResponse::success(id, json!({}))),
 
             // ── Tool discovery ──────────────────────────────────────────
-            "tools/list" => Some(JsonRpcResponse::success(
-                id,
-                json!({ "tools": tools::list_tools_with_plugins(&self.cortex) }),
-            )),
+            // Filtered by the capability policy: ungranted tools are invisible,
+            // not just denied (smaller attack surface and token cost).
+            "tools/list" => {
+                let all = tools::list_tools_with_plugins(&self.cortex);
+                let granted: Vec<Value> = all
+                    .as_array()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter(|t| {
+                                t.get("name")
+                                    .and_then(|n| n.as_str())
+                                    .is_some_and(|n| self.policy.is_allowed(n))
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(JsonRpcResponse::success(id, json!({ "tools": granted })))
+            }
 
             // ── Tool execution ──────────────────────────────────────────
             "tools/call" => {
                 let tool_name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
+
+                if !self.policy.is_allowed(tool_name) {
+                    return Some(JsonRpcResponse::success(
+                        id,
+                        json!({
+                            "content": [{
+                                "type": "text",
+                                "text": format!(
+                                    "Error: tool '{tool_name}' not permitted by capability policy"
+                                )
+                            }],
+                            "isError": true
+                        }),
+                    ));
+                }
 
                 match tools::call_tool(&self.cortex, tool_name, &args) {
                     Ok(result) => Some(JsonRpcResponse::success(
