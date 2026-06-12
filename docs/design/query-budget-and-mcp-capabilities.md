@@ -1,9 +1,23 @@
 # Design — Iteration 16: Bounded Query Budget & MCP Capability Grants
 
-**Status:** DRAFT → implement behind tests
+**Status:** IMPLEMENTED — 2026-06-12
 **Owner:** CTO
 **Date:** 2026-06-12
 **Tracking:** docs/ROADMAP.md → Priority 2 (security-flavored product wins)
+
+> **Corrections applied after adversarial review.**
+> 1. `expand_query` originally ran outside the budget — it now takes the query start
+>    time + duration and checks the deadline before every per-entity storage query, and
+>    the expansion set is capped at `MAX_EXPANSION_TERMS = 64` (bounds the downstream
+>    term-match SQL regardless of store size).
+> 2. `CORTEX_CAPABILITIES_FILE` set to a **missing** file fails **closed** with a
+>    distinct diagnostic (not allow-all): explicitly configuring a policy expresses
+>    intent to restrict, so a missing file must never widen access. Only the *implicit*
+>    no-file case (no env var, no `capabilities.json`) means legacy allow-all.
+> 3. Scope made explicit: the policy gates the MCP JSON-RPC surface only. CLI
+>    subcommands are operator tools (shell access ⇒ filesystem access to the policy
+>    file itself — gating them adds no boundary). Unifying the HTTP surface under the
+>    policy is a tracked roadmap follow-up.
 
 ## 1. Goal
 

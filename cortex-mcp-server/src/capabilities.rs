@@ -8,7 +8,15 @@
 //!
 //! Policy location: `$CORTEX_CAPABILITIES_FILE`, else `capabilities.json` next to
 //! the database file. A malformed policy fails **closed** (zero grants) — never
-//! open.
+//! open. Setting `CORTEX_CAPABILITIES_FILE` to a path that does not exist also
+//! fails closed: explicitly configuring a policy expresses intent to restrict, so
+//! a missing file must never silently widen access back to allow-all.
+//!
+//! Scope: this policy gates the **MCP JSON-RPC surface only**. The CLI subcommands
+//! of this binary are operator tools — anyone who can run them already has
+//! filesystem access to the database and to the policy file itself, so gating them
+//! adds no security boundary. The HTTP surface (cortex-http) is gated separately
+//! (input bounds today; unifying it under this policy is tracked in docs/ROADMAP.md).
 
 use std::collections::HashSet;
 
@@ -117,13 +125,24 @@ impl CapabilityPolicy {
 
     /// Load the policy for a server instance rooted at `db_path`.
     ///
-    /// Resolution order: `$CORTEX_CAPABILITIES_FILE` (must exist if set), else
-    /// `capabilities.json` in the database directory, else legacy allow-all.
-    /// A present-but-unreadable or malformed file fails closed (zero grants).
+    /// Resolution order: `$CORTEX_CAPABILITIES_FILE` (fails closed if set but
+    /// missing), else `capabilities.json` in the database directory, else legacy
+    /// allow-all. An unreadable or malformed file fails closed (zero grants).
     pub fn load(db_path: &str) -> Self {
         let explicit = std::env::var("CORTEX_CAPABILITIES_FILE").ok();
         let path = match explicit {
-            Some(p) => Some(std::path::PathBuf::from(p)),
+            Some(p) => {
+                let p = std::path::PathBuf::from(p);
+                if !p.exists() {
+                    // The operator explicitly asked for a policy: a missing file
+                    // must never widen access. Distinct diagnostic from "malformed".
+                    warn!(policy = %p.display(),
+                          "CORTEX_CAPABILITIES_FILE is set but the file does not exist — \
+                           failing CLOSED (all tools denied)");
+                    return CapabilityPolicy::Grants(GrantSet::empty());
+                }
+                Some(p)
+            }
             None => std::path::Path::new(db_path)
                 .parent()
                 .map(|dir| dir.join("capabilities.json"))

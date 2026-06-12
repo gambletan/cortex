@@ -135,6 +135,10 @@ impl Default for RetrievalWeights {
     }
 }
 
+/// Hard cap on distinct terms gathered during query expansion — bounds the size of
+/// the term-match SQL issued by `get_expansion_candidates` regardless of store size.
+const MAX_EXPANSION_TERMS: usize = 64;
+
 /// Frequency saturation scale: access_count at which the frequency term is ~63% of max.
 const FRECENCY_FREQ_SCALE: f32 = 5.0;
 /// Access-recency decay constant in hours (~1 week characteristic time).
@@ -184,7 +188,8 @@ impl<'a> RetrievalEngine<'a> {
         let temporal_intent = detect_temporal_intent(&query.text);
 
         // Query expansion: find related entities from semantic store
-        let expanded_entities = self.expand_query(&query.text)?;
+        // (budget-bounded internally: per-entity time checks + expansion-set cap)
+        let expanded_entities = self.expand_query(&query.text, started, budget.max_duration)?;
 
         // Gather candidates using HashMap for O(1) dedup instead of O(N) linear scan.
         // Every gathering phase is bounded by the query budget: once the candidate cap
@@ -262,9 +267,13 @@ impl<'a> RetrievalEngine<'a> {
         if within_budget(&candidate_scores) {
             let fts_results = self.storage.fts_search(&query.text, query.limit * 3)?;
             for (id, score) in &fts_results {
-                fts_scores.insert(*id, *score as f32);
                 if candidate_scores.len() < budget.max_candidates {
                     candidate_scores.entry(*id).or_insert(0.2);
+                }
+                // FTS scores are only read for ids in the candidate set; keeping
+                // others would be dead allocation once the cap is hit.
+                if candidate_scores.contains_key(id) {
+                    fts_scores.insert(*id, *score as f32);
                 }
             }
         }
@@ -386,7 +395,16 @@ impl<'a> RetrievalEngine<'a> {
 
     /// Query expansion: extract entities from the query text and look up related
     /// entities from the semantic store using indexed queries per entity.
-    fn expand_query(&self, query_text: &str) -> Result<HashSet<String>, CortexError> {
+    ///
+    /// Bounded on both axes: stops issuing per-entity storage queries once
+    /// `max_duration` (measured from `started`) is spent, and caps the expansion
+    /// set at [`MAX_EXPANSION_TERMS`] so the downstream term-match SQL stays small.
+    fn expand_query(
+        &self,
+        query_text: &str,
+        started: Instant,
+        max_duration: Duration,
+    ) -> Result<HashSet<String>, CortexError> {
         let mut expanded = HashSet::new();
         let query_lower = query_text.to_lowercase();
 
@@ -397,9 +415,15 @@ impl<'a> RetrievalEngine<'a> {
         }
 
         // Use indexed fact queries per entity instead of loading all semantic memories
-        for entity in &query_entities {
+        'entities: for entity in &query_entities {
+            if started.elapsed() >= max_duration || expanded.len() >= MAX_EXPANSION_TERMS {
+                break;
+            }
             let facts = self.storage.query_facts_by_entity(entity)?;
             for mem in &facts {
+                if expanded.len() >= MAX_EXPANSION_TERMS {
+                    break 'entities;
+                }
                 if let MemContent::Fact { subject, predicate, object } = &mem.content {
                     let entity_lower = entity.to_lowercase();
                     if subject.to_lowercase().contains(&entity_lower) {
@@ -414,11 +438,16 @@ impl<'a> RetrievalEngine<'a> {
         }
 
         // Check preferences matching query terms
-        let prefs = self.storage.query_preferences_by_key(&query_lower)?;
-        for mem in &prefs {
-            if let MemContent::Preference { key, value, .. } = &mem.content {
-                expanded.insert(key.clone());
-                expanded.insert(value.clone());
+        if started.elapsed() < max_duration && expanded.len() < MAX_EXPANSION_TERMS {
+            let prefs = self.storage.query_preferences_by_key(&query_lower)?;
+            for mem in &prefs {
+                if expanded.len() >= MAX_EXPANSION_TERMS {
+                    break;
+                }
+                if let MemContent::Preference { key, value, .. } = &mem.content {
+                    expanded.insert(key.clone());
+                    expanded.insert(value.clone());
+                }
             }
         }
 

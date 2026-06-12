@@ -40,6 +40,13 @@ This is the prioritized forward plan. The per-iteration security audits
   `SyncEngine::rotate_key()`. See docs/design/key-rotation.md. Follow-ups: passphrase
   change (vs key-only rotation), optional `compact_to_current_version()`, wire rotation
   into the HTTP/MCP surface.
+- ✅ **Iteration 16 — Bounded query budget + MCP deny-by-default capability grants (P2).**
+  Every retrieval is bounded by `QueryBudget` (candidate cap + wall-clock cap, graceful
+  degradation — never an error, which would itself be a store-size oracle). The MCP
+  surface gates `tools/list` + `tools/call` behind a capability policy
+  (`capabilities.json`: `read`/`write`/`sync`/`plugins`/`all` groups or exact names);
+  no policy = legacy allow-all with warning, malformed/missing-explicit policy fails
+  CLOSED. See docs/design/query-budget-and-mcp-capabilities.md. Follow-ups below.
 
 ---
 
@@ -66,14 +73,17 @@ review before coding.** Land behind tests, never break existing manifests.
 
 These came out of the daily trend-watch scan (`docs/trend-watch/`). Small, local, on-mission.
 
-- **Frecency ranking in `retrieval.rs`** (source: `fff`). Blend recall-frequency + recency into
-  ranking alongside vector score; complements existing `memory_decay`. Cleanest first PR.
-- **Bounded-time query budget** (source: `pydantic/monty`). Cap per-query work/time — both a
-  privacy win (mitigates residual search-timing side-channels) and a DoS guard.
-- **Deny-by-default capability grants on the MCP surface** (source: `monty`). A namespace/agent
-  gets zero read/write until explicitly granted — cleaner than per-query filtering.
-- **Progressive MCP tool disclosure** (source: agent-skills trend). Surface tool groups
-  contextually; narrows attack surface and token cost.
+- ~~**Frecency ranking in `retrieval.rs`**~~ ✅ shipped.
+- ~~**Bounded-time query budget**~~ ✅ shipped (Iteration 16).
+- ~~**Deny-by-default capability grants on the MCP surface**~~ ✅ shipped (Iteration 16) —
+  `tools/list` filtering also delivers the progressive-disclosure win below.
+- **Progressive MCP tool disclosure** (source: agent-skills trend). Partially covered by
+  capability-filtered `tools/list`; contextual tool *groups* remain open.
+- **Unify cortex-http under the capability policy** (from Iteration 16 review). The HTTP
+  surface exposes ingest/search/import with no policy gating — asymmetric with MCP now.
+- **Capability denial as JSON-RPC error code** (from Iteration 16 review, LOW). Denials
+  currently use the MCP `isError` content envelope; a distinct error code would let
+  clients tell "tool failed" from "tool not permitted".
 
 ## Priority 3 — Security backlog (medium)
 
