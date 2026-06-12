@@ -249,6 +249,19 @@ pub fn read_oplog(
                     continue;
                 }
             }
+        } else if crypto.is_some() {
+            // SECURITY: encryption is enabled, but this line is not an encrypted envelope.
+            // The writer always encrypts when a crypto context is present, so a plaintext
+            // line here is never legitimate — it is corruption or an injection attempt by
+            // someone with write access to the (untrusted) cloud sync directory. Accepting
+            // it would bypass BOTH AES-GCM authentication and the operation HMAC (an injected
+            // op simply omits the `hmac` field), so it must be rejected, not parsed.
+            tracing::error!(
+                "Rejecting unencrypted oplog line at offset {} while encryption is enabled — possible injection or downgrade attack",
+                offset
+            );
+            offset += bytes_read as u64;
+            continue;
         } else {
             trimmed.to_string()
         };
@@ -398,6 +411,59 @@ mod tests {
             hlc: HlcTimestamp::new(wall_ms, 0, device_id),
             payload: SyncPayload::MemoryDelete { id: Uuid::new_v4() },
             hmac: None,}
+    }
+
+    /// Fast crypto context for tests (low KDF cost).
+    fn test_crypto() -> crate::sync::crypto::CryptoContext {
+        let mut m = crate::sync::crypto::new_encryption_manifest();
+        m.kdf_params.time_cost = 1;
+        m.kdf_params.mem_cost = 1024;
+        crate::sync::crypto::derive_key("test-pass", &m).unwrap()
+    }
+
+    /// SECURITY: when encryption is enabled, an attacker with write access to the
+    /// (untrusted) cloud sync directory must not be able to inject operations by
+    /// writing an unencrypted, un-HMAC'd plaintext JSON line. Such lines bypass both
+    /// AES-GCM authentication and the operation HMAC, so the reader must reject them.
+    #[test]
+    fn test_plaintext_injection_rejected_when_encryption_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("oplog-2026-01-01-001.jsonl");
+
+        // Attacker forges a plaintext op (no encryption, no HMAC) and drops it into the dir.
+        let forged = make_op("victim-device", 9999);
+        let forged_id = forged.op_id;
+        let line = serde_json::to_string(&forged).unwrap();
+        assert!(!crate::sync::crypto::is_encrypted_line(&line));
+        std::fs::write(&path, format!("{}\n", line)).unwrap();
+
+        // The reader is operating in encryption mode (crypto context present).
+        let ctx = test_crypto();
+        let (ops, _offset) = read_oplog(&path, 0, Some(&ctx)).unwrap();
+
+        assert!(
+            ops.iter().all(|o| o.op_id != forged_id),
+            "forged plaintext op must NOT be accepted when encryption is enabled"
+        );
+        assert!(ops.is_empty(), "no plaintext op may be replayed in encryption mode");
+    }
+
+    /// Legitimately encrypted lines must still be read back correctly in encryption mode.
+    #[test]
+    fn test_encrypted_lines_still_read_in_encryption_mode() {
+        let tmp = TempDir::new().unwrap();
+        let device_dir = tmp.path().join("device-a");
+        let ctx = std::sync::Arc::new(test_crypto());
+
+        let mut writer = OpLogWriter::new(device_dir.clone(), Some(ctx.clone())).unwrap();
+        let op = make_op("device-a", 1000);
+        let op_id = op.op_id;
+        writer.append(op).unwrap();
+
+        let files = list_oplog_files(&device_dir).unwrap();
+        let (ops, _) = read_oplog(&files[0], 0, Some(&ctx)).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_id, op_id);
     }
 
     #[test]
