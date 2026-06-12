@@ -1,4 +1,4 @@
-use cortex_core::retrieval::{RetrievalEngine, RetrievalQuery, RetrievalWeights};
+use cortex_core::retrieval::{QueryBudget, RetrievalEngine, RetrievalQuery, RetrievalWeights};
 use cortex_core::storage::memory_index::MemoryIndex;
 use cortex_core::storage::sqlite::SqliteStorage;
 use cortex_core::storage::traits::StorageBackend;
@@ -280,4 +280,90 @@ fn test_frecency_boosts_frequently_recalled_memory() {
         "frequently and recently recalled memory should rank first under frecency"
     );
     assert!(results[0].score_breakdown.frecency > results[1].score_breakdown.frecency);
+}
+
+// ── Query budget (Iteration 16) ─────────────────────────────────────────────
+
+fn store_n_memories(storage: &SqliteStorage, index: &MemoryIndex, n: usize) {
+    for i in 0..n {
+        let emb = vec![1.0, i as f32 / n as f32, 0.0];
+        let mem = MemObjectBuilder::new(
+            MemoryTier::Episodic,
+            MemContent::Text(format!("budget memory {}", i)),
+            MemSource::new("cli"),
+        )
+        .embedding(emb.clone())
+        .build();
+        storage.store_memory(&mem).unwrap();
+        index.insert(mem.id, emb);
+    }
+}
+
+#[test]
+fn budget_caps_candidate_count_but_still_returns_results() {
+    let (storage, index) = setup();
+    store_n_memories(&storage, &index, 30);
+
+    let engine = RetrievalEngine::new(&storage, &index);
+    let query = RetrievalQuery::new("budget memory", 30)
+        .with_embedding(vec![1.0, 0.5, 0.0])
+        .with_budget(QueryBudget {
+            max_candidates: 5,
+            max_duration: std::time::Duration::from_secs(10),
+        });
+
+    let results = engine.retrieve(&query).unwrap();
+    assert!(!results.is_empty(), "capped query must still return results");
+    assert!(
+        results.len() <= 5,
+        "results cannot exceed the candidate cap, got {}",
+        results.len()
+    );
+}
+
+#[test]
+fn zero_duration_budget_skips_expansion_but_keeps_vector_results() {
+    let (storage, index) = setup();
+    store_n_memories(&storage, &index, 10);
+
+    let engine = RetrievalEngine::new(&storage, &index);
+    let query = RetrievalQuery::new("budget memory", 5)
+        .with_embedding(vec![1.0, 0.5, 0.0])
+        .with_budget(QueryBudget {
+            max_candidates: 10_000,
+            max_duration: std::time::Duration::ZERO,
+        });
+
+    // Expansion phases (recency fallback, entity, temporal, multi-hop, FTS) are
+    // skipped, but vector-index candidates are still scored and returned.
+    let results = engine.retrieve(&query).unwrap();
+    assert!(!results.is_empty());
+}
+
+#[test]
+fn exhausted_budget_degrades_gracefully_never_errors() {
+    let (storage, index) = setup();
+    store_n_memories(&storage, &index, 10);
+
+    let engine = RetrievalEngine::new(&storage, &index);
+    // No embedding + zero time budget: every gathering phase is skipped.
+    let query = RetrievalQuery::new("anything", 5).with_budget(QueryBudget {
+        max_candidates: 10_000,
+        max_duration: std::time::Duration::ZERO,
+    });
+
+    let results = engine.retrieve(&query).unwrap();
+    assert!(results.is_empty(), "no candidates gathered means empty, not an error");
+}
+
+#[test]
+fn default_budget_does_not_change_normal_queries() {
+    let (storage, index) = setup();
+    store_n_memories(&storage, &index, 10);
+
+    let engine = RetrievalEngine::new(&storage, &index);
+    let query = RetrievalQuery::new("budget memory", 3).with_embedding(vec![1.0, 0.5, 0.0]);
+
+    let results = engine.retrieve(&query).unwrap();
+    assert_eq!(results.len(), 3);
 }

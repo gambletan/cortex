@@ -3,11 +3,38 @@ use uuid::Uuid;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::storage::memory_index::MemoryIndex;
 use crate::storage::traits::StorageBackend;
 use crate::types::*;
 use crate::CortexError;
+
+/// Hard bounds on how much work a single retrieval may perform.
+///
+/// Defense-in-depth (see docs/design/query-budget-and-mcp-capabilities.md):
+/// caps per-query candidate gathering so query cost never scales with the
+/// *full* size of the memory store — a DoS guard for the HTTP/MCP surfaces
+/// and a bound on the search-timing side-channel. Exceeding the budget
+/// degrades gracefully: expansion phases stop and the candidates already
+/// gathered are scored and returned. It never produces an error, because an
+/// error channel would itself be an oracle for store size.
+#[derive(Debug, Clone)]
+pub struct QueryBudget {
+    /// Hard cap on distinct candidates gathered across all phases.
+    pub max_candidates: usize,
+    /// Soft wall-clock cap; remaining expansion phases are skipped once exceeded.
+    pub max_duration: Duration,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self {
+            max_candidates: 10_000,
+            max_duration: Duration::from_millis(250),
+        }
+    }
+}
 
 /// Multi-signal retrieval query.
 pub struct RetrievalQuery {
@@ -18,6 +45,7 @@ pub struct RetrievalQuery {
     pub namespace: Option<String>,
     pub time_context: DateTime<Utc>,
     pub limit: usize,
+    pub budget: QueryBudget,
 }
 
 impl RetrievalQuery {
@@ -30,7 +58,13 @@ impl RetrievalQuery {
             namespace: None,
             time_context: Utc::now(),
             limit,
+            budget: QueryBudget::default(),
         }
+    }
+
+    pub fn with_budget(mut self, budget: QueryBudget) -> Self {
+        self.budget = budget;
+        self
     }
 
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
@@ -143,23 +177,36 @@ impl<'a> RetrievalEngine<'a> {
 
     /// Main retrieval: multi-signal ranked search with query expansion and multi-hop.
     pub fn retrieve(&self, query: &RetrievalQuery) -> Result<Vec<RetrievalResult>, CortexError> {
+        let started = Instant::now();
+        let budget = &query.budget;
+
         // Detect if query has temporal intent (adjusts scoring strategy)
         let temporal_intent = detect_temporal_intent(&query.text);
 
         // Query expansion: find related entities from semantic store
         let expanded_entities = self.expand_query(&query.text)?;
 
-        // Gather candidates using HashMap for O(1) dedup instead of O(N) linear scan
+        // Gather candidates using HashMap for O(1) dedup instead of O(N) linear scan.
+        // Every gathering phase is bounded by the query budget: once the candidate cap
+        // or the time cap is hit, remaining expansion phases are skipped and whatever
+        // was gathered proceeds to scoring. Degradation must stay graceful — an error
+        // here would be an oracle for store size (see design doc, Iteration 16).
         let mut candidate_scores: HashMap<Uuid, f32> = HashMap::new();
+        let within_budget = |scores: &HashMap<Uuid, f32>| {
+            scores.len() < budget.max_candidates && started.elapsed() < budget.max_duration
+        };
 
         if let Some(ref embedding) = query.embedding {
             for (id, score) in self.index.search(embedding, query.limit * 5) {
+                if candidate_scores.len() >= budget.max_candidates {
+                    break;
+                }
                 candidate_scores.insert(id, score);
             }
         }
 
         // If no embedding, fall back to recent memories
-        if candidate_scores.is_empty() {
+        if candidate_scores.is_empty() && within_budget(&candidate_scores) {
             let recent = self
                 .storage
                 .list_by_tier(MemoryTier::Episodic, query.limit * 3)?;
@@ -168,39 +215,58 @@ impl<'a> RetrievalEngine<'a> {
                 .list_by_tier(MemoryTier::Semantic, query.limit * 3)?;
 
             for mem in recent.iter().chain(semantic.iter()) {
+                if candidate_scores.len() >= budget.max_candidates {
+                    break;
+                }
                 candidate_scores.entry(mem.id).or_insert(0.5);
             }
         }
 
         // Query expansion: pull in memories matching expanded entities
-        if !expanded_entities.is_empty() {
+        if !expanded_entities.is_empty() && within_budget(&candidate_scores) {
             let expansion_ids = self.get_expansion_candidates(&expanded_entities, query.limit)?;
             for (id, score) in expansion_ids {
+                if candidate_scores.len() >= budget.max_candidates {
+                    break;
+                }
                 candidate_scores.entry(id).or_insert(score);
             }
         }
 
         // For temporal queries, also pull in time-ordered candidates
-        if temporal_intent != TemporalIntent::None {
+        if temporal_intent != TemporalIntent::None && within_budget(&candidate_scores) {
             let time_ordered = self.get_temporal_candidates(&temporal_intent, query.limit * 3)?;
             for mem in time_ordered {
+                if candidate_scores.len() >= budget.max_candidates {
+                    break;
+                }
                 candidate_scores.entry(mem.id).or_insert(0.3);
             }
         }
 
         // Multi-hop expansion: extract entities from top candidates and pull related facts
-        let candidate_ids_vec: Vec<(Uuid, f32)> = candidate_scores.iter().map(|(&id, &s)| (id, s)).collect();
-        let hop_ids = self.multi_hop_expand(&candidate_ids_vec, query.limit)?;
-        for (id, score) in hop_ids {
-            candidate_scores.entry(id).or_insert(score);
+        if within_budget(&candidate_scores) {
+            let candidate_ids_vec: Vec<(Uuid, f32)> =
+                candidate_scores.iter().map(|(&id, &s)| (id, s)).collect();
+            let hop_ids = self.multi_hop_expand(&candidate_ids_vec, query.limit)?;
+            for (id, score) in hop_ids {
+                if candidate_scores.len() >= budget.max_candidates {
+                    break;
+                }
+                candidate_scores.entry(id).or_insert(score);
+            }
         }
 
         // FTS5 full-text search: gather additional candidates via BM25 keyword matching
-        let fts_results = self.storage.fts_search(&query.text, query.limit * 3)?;
         let mut fts_scores: HashMap<Uuid, f32> = HashMap::new();
-        for (id, score) in &fts_results {
-            fts_scores.insert(*id, *score as f32);
-            candidate_scores.entry(*id).or_insert(0.2);
+        if within_budget(&candidate_scores) {
+            let fts_results = self.storage.fts_search(&query.text, query.limit * 3)?;
+            for (id, score) in &fts_results {
+                fts_scores.insert(*id, *score as f32);
+                if candidate_scores.len() < budget.max_candidates {
+                    candidate_scores.entry(*id).or_insert(0.2);
+                }
+            }
         }
 
         // Batch fetch all candidates in a single query
