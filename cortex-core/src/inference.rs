@@ -112,6 +112,7 @@ pub fn extract(text: &str) -> InferredKnowledge {
         // English extraction
         extract_preferences(text, &lower, &mut knowledge);
         extract_facts(text, &lower, &mut knowledge);
+        extract_entity_relations(text, &lower, &mut knowledge);
 
         // Chinese extraction
         extract_chinese_facts(text, &mut knowledge);
@@ -811,6 +812,107 @@ fn first_clause(text: &str) -> &str {
     &text[..end]
 }
 
+/// Curated high-precision relational verbs between two proper-noun entities.
+/// Ordered longest-first so "is hosted in" matches before "in"-like fragments.
+const ENTITY_RELATION_VERBS: &[(&str, &str)] = &[
+    ("is hosted in", "hosted_in"),
+    ("is hosted on", "hosted_on"),
+    ("is located in", "located_in"),
+    ("is part of", "part_of"),
+    ("is powered by", "powered_by"),
+    ("is managed by", "managed_by"),
+    ("is owned by", "owned_by"),
+    ("reports to", "reports_to"),
+    ("depends on", "depends_on"),
+    ("connects to", "connects_to"),
+    ("belongs to", "belongs_to"),
+    ("runs on", "runs_on"),
+    ("hosted in", "hosted_in"),
+    ("powered by", "powered_by"),
+    ("managed by", "managed_by"),
+    ("located in", "located_in"),
+    ("part of", "part_of"),
+    ("manages", "manages"),
+    ("owns", "owns"),
+    ("uses", "uses"),
+];
+
+/// Extract third-party relations of the form `<ProperNoun> <verb> <ProperNoun>`
+/// (e.g. "The Helios project runs on the Aurora database" → Helios —runs_on→ Aurora).
+///
+/// High precision by construction: BOTH sides must be capitalized proper nouns, so
+/// ordinary lowercase prose and the user's first-person statements don't trigger it.
+/// This populates the structured fact graph with typed edges that the retrieval
+/// fact-expansion can traverse — the precise alternative to entity co-occurrence
+/// (see docs/multihop-finding-2026-06-13.md). At most two relations per text.
+fn extract_entity_relations(text: &str, lower: &str, knowledge: &mut InferredKnowledge) {
+    let mut emitted = 0;
+    for (verb, predicate) in ENTITY_RELATION_VERBS {
+        if emitted >= 2 {
+            break;
+        }
+        let needle = format!(" {verb} ");
+        let Some(pos) = lower.find(&needle) else { continue };
+        // Byte indices from `lower` align with `text` for ASCII; bail on any non-boundary.
+        let after_start = pos + needle.len();
+        if !text.is_char_boundary(pos) || !text.is_char_boundary(after_start) {
+            continue;
+        }
+        let subject = last_proper_noun(&text[..pos]);
+        let object = first_proper_noun(&text[after_start..]);
+        if let (Some(s), Some(o)) = (subject, object) {
+            if s != o && s != "User" && o != "User" {
+                knowledge.facts.push(InferredFact {
+                    subject: s,
+                    predicate: (*predicate).to_string(),
+                    object: o,
+                    confidence: 0.7,
+                });
+                emitted += 1;
+            }
+        }
+    }
+}
+
+/// Last maximal run of capitalized words in `s`, ignoring trailing lowercase words
+/// and leading articles. "The Helios project is" → "Helios".
+fn last_proper_noun(s: &str) -> Option<String> {
+    proper_noun_runs(s).into_iter().last()
+}
+
+/// First maximal run of capitalized words in `s`. "the Aurora database" → "Aurora".
+fn first_proper_noun(s: &str) -> Option<String> {
+    proper_noun_runs(s).into_iter().next()
+}
+
+/// All maximal runs of consecutive capitalized tokens (proper-noun phrases),
+/// excluding common sentence-initial / pronoun words.
+fn proper_noun_runs(s: &str) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "The", "A", "An", "This", "That", "These", "Those", "It", "He", "She",
+        "They", "We", "I", "My", "Your", "His", "Her", "Their", "Our", "Its",
+    ];
+    let mut runs: Vec<String> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for raw in s.split_whitespace() {
+        let w = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        let is_cap = w.chars().next().is_some_and(|c| c.is_uppercase());
+        if is_cap && !SKIP.contains(&w) {
+            cur.push(w);
+        } else {
+            if !cur.is_empty() {
+                runs.push(cur.join(" "));
+                cur.clear();
+            }
+            // A skip-word or lowercase token breaks the run.
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur.join(" "));
+    }
+    runs.into_iter().filter(|r| r.len() < 60).collect()
+}
+
 /// Clean whitespace and trailing punctuation from a value.
 fn clean_value(s: &str) -> String {
     s.trim()
@@ -912,6 +1014,37 @@ mod tests {
         assert_eq!(k.preferences.len(), 1);
         assert_eq!(k.preferences[0].value, "rust");
         assert!(k.preferences[0].confidence > 0.8);
+    }
+
+    #[test]
+    fn entity_relation_extraction_builds_typed_edges() {
+        let has = |k: &InferredKnowledge, s: &str, p: &str, o: &str| {
+            k.facts.iter().any(|f| f.subject == s && f.predicate == p && f.object == o)
+        };
+
+        let k = extract("The Helios project runs on the Aurora database.");
+        assert!(has(&k, "Helios", "runs_on", "Aurora"), "facts: {:?}", k.facts);
+
+        let k = extract("The Aurora database is hosted in the Frankfurt datacenter.");
+        assert!(has(&k, "Aurora", "hosted_in", "Frankfurt"), "facts: {:?}", k.facts);
+
+        let k = extract("Marisol manages the Helios project.");
+        assert!(has(&k, "Marisol", "manages", "Helios"), "facts: {:?}", k.facts);
+    }
+
+    #[test]
+    fn entity_relation_extraction_is_high_precision() {
+        // Lowercase prose / no proper-noun pair must NOT produce a relation fact.
+        let k = extract("the team uses the new tool for everything");
+        assert!(
+            !k.facts.iter().any(|f| f.predicate == "uses"),
+            "should not extract from lowercase prose: {:?}",
+            k.facts
+        );
+        // First-person statements stay the user's, not entity relations.
+        let k = extract("I use Notion every day");
+        assert!(!k.facts.iter().any(|f| f.subject == "User" && f.predicate == "uses" && f.object == "Notion")
+            || k.preferences.iter().any(|p| p.value.contains("notion")));
     }
 
     #[test]

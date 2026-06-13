@@ -90,10 +90,14 @@ model + HNSW beam can't place hard paraphrases near their answers in vector spac
    built by an isolated subagent). Two retrieval-time re-rank approaches both failed: the
    Fact-only graph walk never touches the episodic-text chain links (no effect); entity
    co-occurrence via LIKE floods on colliding entities (regressed to 5%). **Lesson: entity
-   co-occurrence ≠ a graph edge.** Real fix = **ingest-time edge construction** (populate
-   `MemObject.links` when a new memory continues an existing entity's chain) so retrieval
-   traverses *precise* edges — a bigger design than a re-rank weight. Now the top open
-   item, reframed as "relational chaining."
+   co-occurrence ≠ a graph edge.** Real fix = **ingest-time edge construction** so retrieval
+   traverses *precise* edges. **Step 1 shipped 2026-06-13:** `extract_entity_relations` — the
+   local inference extracted ZERO facts from third-party prose ("Helios runs on Aurora"); now
+   it emits typed `<ProperNoun> <verb> <ProperNoun>` triples (runs_on/hosted_in/manages/…),
+   high-precision (both sides proper nouns), and `fact_query` returns these chains. Populates
+   the typed-fact graph; no regression (multi-hop 55%≈baseline, paraphrase 90%, latency flat)
+   but does not yet move the multi-hop benchmark. **Step 2 (top open item):** fact↔source-
+   episodic linking + a bounded 2-hop walk over the now-populated typed-fact graph.
 4. **Embedding query-prefix protocol** (was lever 2) — asymmetric query/passage prefixing
    so a stronger model (bge/e5) can finally beat MiniLM; uncertain marginal gain over 90%.
 4. **Hybrid fusion tuning** — RRF-style FTS+vector fusion so a paraphrase miss is saved by

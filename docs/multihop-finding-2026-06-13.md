@@ -60,6 +60,30 @@ regressed real recall, so it was reverted.
 - Sharpened roadmap item: "relational chaining" needs ingest-time edge construction, not
   a retrieval re-rank tweak.
 
+## Follow-up shipped — ingest-time entity-relation extraction (root-cause building block)
+
+A probe revealed the upstream blocker: the local inference extracted **zero** facts from
+third-party relational prose ("The Helios project runs on the Aurora database" →
+`total_extracted: 0`) — every fact pattern was first-person ("I live in…"). So the fact
+graph was empty for these chains, which is *why* the fact-walk re-ranking (attempt #1) had
+nothing to traverse.
+
+Fixed: `extract_entity_relations` now extracts `<ProperNoun> <verb> <ProperNoun>` triples
+for a curated set of relational verbs (runs_on, hosted_in, manages, depends_on, part_of,
+located_in, …). High precision by construction — **both** sides must be proper nouns, so
+lowercase prose and first-person statements don't trigger it.
+
+End-to-end verified: ingesting the chain prose now makes `fact_query("Helios")` return
+`Helios —runs_on→ Aurora` and `fact_query("Aurora")` return `Aurora —hosted_in→ Frankfurt`.
+
+**Honest scope:** this populates the typed-fact graph (independently valuable for
+`fact_query`, contradiction detection, the knowledge graph) but does **not** by itself move
+the multi-hop *benchmark* — that scores episodic-text memories, while the extracted facts
+are separate memory objects, and the live fact-expansion still only walks ~1 hop. Measured:
+multi-hop 55% ≈ baseline (no regression), paraphrase 90% unchanged, latency unchanged. The
+remaining multi-hop work is **fact↔source-episodic linking + a bounded 2-hop walk over the
+now-populated typed-fact graph** — precise edges, no co-occurrence flooding.
+
 ## Net for the session
 
 A verified negative result that prevents a real regression, a permanent benchmark, and a
