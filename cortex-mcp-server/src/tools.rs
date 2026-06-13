@@ -1315,6 +1315,11 @@ fn tool_sync_enable(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String
     // Do an initial pull
     let pulled = cortex.sync_pull().unwrap_or(0);
 
+    // Keep pulling automatically (poll + fs-watcher) for the life of this server.
+    if let Err(e) = cortex.start_background_sync() {
+        tracing::warn!(error = %e, "background sync did not start — pulls are manual");
+    }
+
     Ok(json!({
         "status": "enabled",
         "provider": detected.provider.as_str(),

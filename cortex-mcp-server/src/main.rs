@@ -748,9 +748,17 @@ fn run_mcp_server(cli_db_path: Option<&str>) {
         }
     };
 
-    // Resume cloud sync from persisted settings (no-op if never enabled).
+    // Resume cloud sync from persisted settings (no-op if never enabled), then
+    // start background sync (poll + fs-watcher) so remote changes from other
+    // devices arrive without manual sync_pull calls.
     match server.cortex.resume_sync() {
-        Ok(true) => info!("cloud sync active (resumed from persisted settings)"),
+        Ok(true) => {
+            info!("cloud sync active (resumed from persisted settings)");
+            match server.cortex.start_background_sync() {
+                Ok(()) => info!("background sync started"),
+                Err(e) => error!(error = %e, "failed to start background sync"),
+            }
+        }
         Ok(false) => {}
         Err(e) => error!(error = %e, "failed to resume sync — continuing without sync"),
     }
