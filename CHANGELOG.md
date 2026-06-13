@@ -1,5 +1,31 @@
 # Changelog
 
+## v2.2.0 — Security hardening, privacy opt-in, retrieval quality
+
+### Security & crypto
+- Versioned **key rotation** with forward secrecy (`ENC2` envelopes, per-version passphrase-derived keys)
+- **HMAC integrity** on the sync manifest and on every operation; plaintext lines in an encrypted oplog are rejected (injection defense); a manifest without integrity refuses to load (no key-rollback)
+- Encrypted **snapshots** (not just the oplog); corrupt/tampered memory & people rows fail gracefully instead of panicking
+- Timing-attack hardening on retrieval (bounded work, constant-time compares)
+
+### Privacy
+- **Per-memory privacy opt-in**: Private by default; mark a memory `shared` to sync it; demote it and it's **retracted from other devices** (local copy kept)
+- **Persistent sync**: settings survive restarts; passphrase in the OS keychain (never on disk) or `CORTEX_SYNC_PASSPHRASE`; server resumes sync + background pull automatically
+- **Deny-by-default MCP capability policy** (`capabilities.json`); ungranted tools are invisible and uncallable; malformed policy fails closed
+- **Honest offline mode**: `CORTEX_NO_EMBEDDINGS=1` (or `--no-default-features`) for a zero-network build; one-time notice before the embedding model is ever fetched; CI proves the no-default-features binary is network-free
+
+### Retrieval quality
+- **Paraphrase recall 40% → ~90% at 5K memories** by widening the HNSW search beam (`ef_search`); query latency unchanged (`docs/scale-test-2026-06-13.md`, `bench/recall_scale.py`)
+- **Bounded query budget** (candidate + wall-clock caps) — DoS guard + timing-channel bound, graceful degradation
+- Frecency ranking; employment-change contradiction detection from natural language
+- **No silent recall failures**: dimension-mismatched embeddings rejected loudly; `memory_stats` exposes embedding/recall health; `memory_context` `min_confidence` floor keeps low-confidence/superseded facts out of the LLM context
+- Opt-in semantic near-duplicate dedup (reinforce-not-lose)
+
+### Tooling & docs
+- 30 MCP tools (added `memory_set_privacy`); `RUST_LOG` is now honored (was overridden)
+- WASM build; new guides: memory tiers, memory-backends comparison
+- One-command device setup (`scripts/setup-device-sync.sh`) incl. Claude Code auto-recall hook
+
 ## v2.0.0 — Background Sync, Web Dashboard, Homebrew
 
 ### Background Sync
