@@ -63,6 +63,28 @@ to ≥400 once the store passes ~1K). Query-time-only cost.
 A **2.1× recall gain at zero latency cost and no model swap** — the cheapest lever
 landed the biggest single jump. Reproducible: `python3 bench/recall_scale.py`.
 
+## Lever #2 tested — naive embedding-model swap does NOT help (negative result)
+
+Hypothesis: a stronger small model (bge-small-en-v1.5, same 384-dim) would beat
+all-MiniLM-L6-v2. Tested behind `CORTEX_EMBED_MODEL` on the same benchmark:
+
+| Model | recall@1 | recall@5 | recall@10 |
+|---|---|---|---|
+| all-MiniLM-L6-v2 (current) | **80%** | **90%** | **90%** |
+| bge-small-en-v1.5 (naive swap) | 65% | 85% | 85% |
+
+bge was **worse**. Reason: bge/e5 retrieval models need an asymmetric **query
+instruction prefix** ("Represent this sentence for searching relevant passages:");
+fastembed's plain `embed()` doesn't add it, and all-MiniLM is already strong on
+short-text *symmetric* similarity, which is exactly this workload. The change was
+reverted — shipping an unused model switch would also create a vector-space-mismatch
+footgun (old MiniLM index vs new bge queries = garbage similarity).
+
+**Takeaway:** the real lever-2 work is the query-prefix / asymmetric-embedding
+protocol, not a model name swap — and its marginal gain over MiniLM's 90% is uncertain.
+Lower priority than lever #3 (graph-edge re-ranking), which targets the *different*
+failure mode (multi-hop / relational) that embeddings can't fix.
+
 ## Remaining levers (Iteration 18 continued, ranked by expected impact)
 
 1. **Stronger embedding model** — biggest lever. Pluggable embedder + a better default

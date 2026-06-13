@@ -79,9 +79,14 @@ model + HNSW beam can't place hard paraphrases near their answers in vector spac
    Widened the beam (ef_search 200, ≥400 past ~1K; ef_construction 40→100). **Paraphrase
    recall@10 40% → 85–90%, zero latency cost, no model swap.** The cheapest lever, biggest
    jump. See docs/scale-test-2026-06-13.md; `bench/recall_scale.py`.
-2. **Stronger embedding model** — pluggable embedder + better default (bge-small /
-   gte-small / e5-small); should close most of the remaining ~10–15% paraphrase gap.
-3. **Graph-edge re-ranking** — traverse relationship/link edges to rescue multi-hop.
+2. ⚠️ **Stronger embedding model — tested, naive swap does NOT help** (2026-06-13).
+   bge-small-en-v1.5 scored *worse* than all-MiniLM (recall@10 85% vs 90%) because
+   bge/e5 need an asymmetric query-instruction prefix that fastembed's plain `embed()`
+   omits, and MiniLM is already strong on this short-text symmetric workload. Reverted
+   (also avoids a vector-space-mismatch footgun on existing indexes). Real work = the
+   query-prefix protocol, uncertain marginal gain over 90% — deprioritized below #3.
+3. **Graph-edge re-ranking** (now the top open lever) — traverse relationship/link edges
+   to rescue multi-hop, the failure mode embeddings structurally can't fix.
 4. **Hybrid fusion tuning** — RRF-style FTS+vector fusion so a paraphrase miss is saved by
    any shared token (lexical is already 100%).
 5. **Recall eval harness in CI** — `bench/recall_scale.py` + a LoCoMo subset as a gate.
