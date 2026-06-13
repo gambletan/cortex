@@ -679,6 +679,29 @@ impl Cortex {
             }
         }
 
+        // Near-duplicate (semantic) dedup: a chatty agent re-saving the same thing in
+        // slightly different words would otherwise accumulate near-identical memories that
+        // crowd retrieval. If the new memory is ~identical (cosine ≥ threshold) to an
+        // existing one, REINFORCE the existing memory (bump its recall recency/count) and
+        // drop the near-copy, rather than silently losing the signal. Requires an
+        // embedding; with CORTEX_NO_EMBEDDINGS this is skipped (exact-dedup still applies).
+        if self.dedup_config.near_dedup {
+            if let Some(ref emb) = embedding {
+                if let Some((existing_id, sim)) = self.index.search(emb, 1).first().copied() {
+                    if sim >= self.dedup_config.near_dedup_threshold {
+                        if let Ok(Some(mut existing)) = self.storage.get_memory(existing_id) {
+                            existing.temporal.access_count += 1;
+                            existing.temporal.last_accessed = chrono::Utc::now();
+                            let _ = self.storage.update_memory(&existing);
+                        }
+                        self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(existing = %existing_id, sim, "Near-duplicate reinforced existing memory");
+                        return Ok(mem);
+                    }
+                }
+            }
+        }
+
         self.storage.store_memory(&mem)?;
         if let Some(emb) = embedding {
             self.index.insert(mem.id, emb);

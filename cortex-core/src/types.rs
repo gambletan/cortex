@@ -459,6 +459,12 @@ impl Default for DeduplicationConfig {
     fn default() -> Self {
         Self {
             exact_dedup: true,
+            // OFF by default — deliberately. Near-dedup reinforces an existing memory and
+            // drops the new one when cosine ≥ threshold; for SHORT memories that differ in
+            // one decisive token ("task 1" vs "task 2", "meet Monday" vs "meet Tuesday")
+            // even 0.95 can merge genuinely-distinct memories, and silently losing a
+            // distinct memory is worse than keeping a near-duplicate. Opt in
+            // (`with_dedup_config`) for chatty agents that re-save the same thing verbatim.
             near_dedup: false,
             near_dedup_threshold: 0.95,
         }

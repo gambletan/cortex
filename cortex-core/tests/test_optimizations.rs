@@ -122,6 +122,33 @@ fn test_archival_and_restore() {
 }
 
 #[test]
+fn test_near_dedup_opt_in_reinforces_and_distinct_kept() {
+    // Near-dedup is opt-in; uses explicit embeddings so the test is deterministic and
+    // never touches the network/embedder.
+    let cortex = Cortex::in_memory().unwrap().with_dedup_config(DeduplicationConfig {
+        exact_dedup: true,
+        near_dedup: true,
+        near_dedup_threshold: 0.95,
+    });
+
+    cortex
+        .ingest("I prefer dark mode in my editor", "test", None, None, Some(vec![1.0, 0.0, 0.0]))
+        .unwrap();
+    // Near-identical embedding (cosine 1.0 ≥ 0.95) → reinforced, not stored as a copy.
+    cortex
+        .ingest("dark mode is my editor preference", "test", None, None, Some(vec![1.0, 0.0, 0.0]))
+        .unwrap();
+    // Distinct embedding (orthogonal) → kept as a separate memory.
+    cortex
+        .ingest("I live in Shanghai", "test", None, None, Some(vec![0.0, 1.0, 0.0]))
+        .unwrap();
+
+    let stats = cortex.stats().unwrap();
+    assert_eq!(stats.episodic, 2, "near-dup merged, distinct kept: {stats:?}");
+    assert!(cortex.metrics().dedup_hits >= 1, "near-dup should count a dedup hit");
+}
+
+#[test]
 fn test_metrics_tracking() {
     let cortex = Cortex::in_memory().unwrap();
 
