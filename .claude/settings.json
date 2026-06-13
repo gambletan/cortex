@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/skeptic-suggest.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
