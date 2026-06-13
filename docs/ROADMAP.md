@@ -85,8 +85,17 @@ model + HNSW beam can't place hard paraphrases near their answers in vector spac
    omits, and MiniLM is already strong on this short-text symmetric workload. Reverted
    (also avoids a vector-space-mismatch footgun on existing indexes). Real work = the
    query-prefix protocol, uncertain marginal gain over 90% — deprioritized below #3.
-3. **Graph-edge re-ranking** (now the top open lever) — traverse relationship/link edges
-   to rescue multi-hop, the failure mode embeddings structurally can't fix.
+3. ⚠️ **Graph-edge re-ranking — attempted 2026-06-13, reframed** (docs/multihop-finding-2026-06-13.md).
+   Multi-hop baseline: hop-recall@10 56%, chain-completable@10 36% (bench/recall_multihop.py,
+   built by an isolated subagent). Two retrieval-time re-rank approaches both failed: the
+   Fact-only graph walk never touches the episodic-text chain links (no effect); entity
+   co-occurrence via LIKE floods on colliding entities (regressed to 5%). **Lesson: entity
+   co-occurrence ≠ a graph edge.** Real fix = **ingest-time edge construction** (populate
+   `MemObject.links` when a new memory continues an existing entity's chain) so retrieval
+   traverses *precise* edges — a bigger design than a re-rank weight. Now the top open
+   item, reframed as "relational chaining."
+4. **Embedding query-prefix protocol** (was lever 2) — asymmetric query/passage prefixing
+   so a stronger model (bge/e5) can finally beat MiniLM; uncertain marginal gain over 90%.
 4. **Hybrid fusion tuning** — RRF-style FTS+vector fusion so a paraphrase miss is saved by
    any shared token (lexical is already 100%).
 5. **Recall eval harness in CI** — `bench/recall_scale.py` + a LoCoMo subset as a gate.
