@@ -74,14 +74,17 @@ ranking is fine (recalled needles all land at rank 0), candidate-pool size is no
 model + HNSW beam can't place hard paraphrases near their answers in vector space at scale.
 
 **Workstreams (re-ordered by the scale-test diagnosis):**
-1. **Stronger embedding model** (Iteration 18, biggest lever) — pluggable embedder + better
-   default (bge-small / gte-small / e5-small); measure on the paraphrase set + LoCoMo.
-2. **HNSW ef_search** — `search_inner_readonly` uses `Search::default()`; raise/expose the
-   beam (cheap; the depth probe implicates the beam, not the take-limit).
+1. ✅ **HNSW ef_search beam** (Iteration 18, shipped 2026-06-13) — the build never set
+   `ef_search` (stuck at crate default 100) and capped `ef_construction` at 24 sub-10K.
+   Widened the beam (ef_search 200, ≥400 past ~1K; ef_construction 40→100). **Paraphrase
+   recall@10 40% → 85–90%, zero latency cost, no model swap.** The cheapest lever, biggest
+   jump. See docs/scale-test-2026-06-13.md; `bench/recall_scale.py`.
+2. **Stronger embedding model** — pluggable embedder + better default (bge-small /
+   gte-small / e5-small); should close most of the remaining ~10–15% paraphrase gap.
 3. **Graph-edge re-ranking** — traverse relationship/link edges to rescue multi-hop.
 4. **Hybrid fusion tuning** — RRF-style FTS+vector fusion so a paraphrase miss is saved by
    any shared token (lexical is already 100%).
-5. **Recall eval harness in CI** — the paraphrase set + a LoCoMo subset as a regression gate.
+5. **Recall eval harness in CI** — `bench/recall_scale.py` + a LoCoMo subset as a gate.
 
 **Target: paraphrase recall@10 ≥ 75% at 5K (from ~40%), LoCoMo overall ≥ 80%, multi-hop ≥ 70%.**
 Acceptance tests for each workstream are written by a context-isolated subagent per the

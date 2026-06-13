@@ -40,7 +40,30 @@ usage people refer to things with consistent vocabulary far more often than in f
 paraphrase. The 40% is the genuinely-hard tail (zero lexical overlap), which is also where
 LoCoMo multi-hop lives.
 
-## Levers (Iteration 18 — retrieval quality, ranked by expected impact)
+## FIX SHIPPED same day — HNSW beam widening (Iteration 18, lever #2)
+
+Root cause found in code: `memory_index.rs` built the HNSW with
+`Builder::default().ef_construction(ef)` and **never set `ef_search`**, so the
+search beam stayed at the instant-distance default of **100**, and the adaptive
+`ef_construction` was capped at **24** for sub-10K stores. A beam of 100 over 5K
+points simply never explores far enough to reach a hard paraphrase's true neighbor —
+which is exactly why raising the client-side `limit` did nothing (the beam, not the
+take-count, was the cap).
+
+Fix: `ef_construction` default 40→100, new `ef_search` config (default 200, widened
+to ≥400 once the store passes ~1K). Query-time-only cost.
+
+| | Before (beam 100) | After (beam ≥400) |
+|---|---|---|
+| Paraphrase recall@1 | ~40% | **85%** |
+| Paraphrase recall@10 | ~40% | **85–90%** |
+| Warm search latency p95 | ~7ms | **~7ms (unchanged)** |
+| Lexical recall | 100% | 100% |
+
+A **2.1× recall gain at zero latency cost and no model swap** — the cheapest lever
+landed the biggest single jump. Reproducible: `python3 bench/recall_scale.py`.
+
+## Remaining levers (Iteration 18 continued, ranked by expected impact)
 
 1. **Stronger embedding model** — biggest lever. Pluggable embedder + a better default
    (e.g. bge-small / gte-small / e5-small) measured on a fixed paraphrase set + LoCoMo.

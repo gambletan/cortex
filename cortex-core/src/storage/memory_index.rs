@@ -47,8 +47,15 @@ pub struct IndexConfig {
     pub pending_ratio: f32,
     /// Rebuild HNSW when removals exceed this fraction of stable size.
     pub removal_ratio: f32,
-    /// HNSW ef_construction parameter (higher = better recall, slower build).
+    /// HNSW ef_construction parameter (higher = better graph recall, slower build).
     pub ef_construction: usize,
+    /// HNSW ef_search beam width (higher = better candidate recall at query time,
+    /// slightly slower search). This is the dominant lever for paraphrase recall at
+    /// scale — the scale test (docs/scale-test-2026-06-13.md) traced the recall gap to
+    /// a too-narrow beam. Set on the Builder at (re)build time; the instant-distance
+    /// crate default is only 100, which starves recall once the store passes a few
+    /// thousand memories.
+    pub ef_search: usize,
     /// Minimum seconds between HNSW rebuilds (debounce). Default: 5.
     pub rebuild_cooldown_secs: u64,
 }
@@ -59,7 +66,8 @@ impl Default for IndexConfig {
             min_size: HNSW_MIN_SIZE,
             pending_ratio: HNSW_PENDING_RATIO,
             removal_ratio: HNSW_REMOVAL_RATIO,
-            ef_construction: 40,
+            ef_construction: 100,
+            ef_search: 200,
             rebuild_cooldown_secs: 5,
         }
     }
@@ -278,16 +286,23 @@ fn flush_and_rebuild(inner: &mut IndexInner) {
 
     let total = inner.stable.len();
 
-    // Adaptive ef_construction: lower for small collections (faster build)
-    let ef = if total < 10_000 {
-        inner.config.ef_construction.min(24)
+    // Adaptive ef_construction: a lighter graph is fine for tiny collections (faster
+    // build, recall is trivial there), but do NOT starve mid-size stores — the scale
+    // test showed recall collapses on paraphrases well before 10K. Scale the beam up
+    // with the collection so candidate recall holds as the store grows.
+    let (ef_construction, ef_search) = if total < 1_000 {
+        (inner.config.ef_construction.min(48), inner.config.ef_search)
     } else {
-        inner.config.ef_construction
+        // Past ~1K, widen the search beam so the true neighbor is actually explored.
+        (inner.config.ef_construction, inner.config.ef_search.max(400))
     };
 
     let points: Vec<Point> = inner.stable.values().map(|e| Point::new(e.embedding.clone())).collect();
     let ids: Vec<Uuid> = inner.stable.keys().copied().collect();
-    let hnsw = Builder::default().ef_construction(ef).build(points, ids);
+    let hnsw = Builder::default()
+        .ef_construction(ef_construction)
+        .ef_search(ef_search)
+        .build(points, ids);
     inner.hnsw = Some(hnsw);
     inner.removals_since_build = 0;
     inner.size_at_build = inner.stable.len();
