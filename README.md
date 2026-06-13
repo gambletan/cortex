@@ -9,7 +9,9 @@
 
 [中文](README_CN.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
 
-### Private. Free. Local. — Memory engine for personal AI agents.
+### Memory for AI agents that never leaves your device.
+
+_Private. Free. Local. — a memory engine for personal AI agents._
 
 **Your AI's memory lives on your device — your data never leaves, never costs, never spies.** Pure Rust. 3.8MB binary. No third-party servers in the data path, zero telemetry, zero cost. Syncs through your own cloud storage. (On-device semantic search downloads a ~30MB model once on first use, then runs fully offline — or go 100% offline with `CORTEX_NO_EMBEDDINGS=1`. See [Security & Privacy](#security--privacy).)
 
