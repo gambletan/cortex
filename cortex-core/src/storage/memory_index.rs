@@ -88,6 +88,11 @@ struct IndexInner {
     config: IndexConfig,
     /// Last HNSW rebuild timestamp for debouncing
     last_rebuild: Instant,
+    /// Embedding dimension this index holds, set by the first vector inserted. All
+    /// later inserts/queries must match it — mixing embedding spaces (e.g. 384-dim
+    /// MiniLM vectors with 1536-dim OpenAI vectors) silently destroys recall, so a
+    /// mismatch is rejected loudly rather than scored as zero similarity.
+    dimension: Option<usize>,
 }
 
 struct NormalizedEntry {
@@ -117,17 +122,43 @@ impl MemoryIndex {
                 size_at_build: 0,
                 config,
                 last_rebuild: Instant::now(),
+                dimension: None,
             }),
         }
     }
 
     /// Insert a new embedding. Goes into the pending buffer (cheap, no rebuild).
     pub fn insert(&self, id: Uuid, embedding: Vec<f32>) {
+        if embedding.is_empty() {
+            return;
+        }
         let norm = l2_norm(&embedding);
         let mut inner = self.inner.write();
+        match inner.dimension {
+            None => inner.dimension = Some(embedding.len()),
+            Some(dim) if dim != embedding.len() => {
+                // Reject the poisoned vector instead of storing one that can only ever
+                // score 0 similarity against everything else. Loud, never silent.
+                eprintln!(
+                    "cortex: rejected an embedding of dimension {} for memory {} — this \
+                     index holds {}-dim vectors. Mixing embedding models destroys recall; \
+                     re-embed the store with one model, or open a separate index.",
+                    embedding.len(),
+                    id,
+                    dim
+                );
+                return;
+            }
+            Some(_) => {}
+        }
         // Remove from stable if updating an existing entry
         inner.stable.remove(&id);
         inner.pending.insert(id, NormalizedEntry { embedding, norm });
+    }
+
+    /// Embedding dimension this index holds (None until the first insert).
+    pub fn dimension(&self) -> Option<usize> {
+        self.inner.read().dimension
     }
 
     /// Insert from an Arc<Vec<f32>> — avoids cloning when caller already has Arc.
@@ -173,6 +204,22 @@ impl MemoryIndex {
 
             if total == 0 {
                 return Vec::new();
+            }
+
+            // Cross-dimension query can't be compared to the stored space — every
+            // cosine would be 0. Return empty (caller falls back to keyword/FTS) and
+            // say so loudly, instead of silently ranking garbage.
+            if let Some(dim) = inner.dimension {
+                if !query.is_empty() && query.len() != dim {
+                    eprintln!(
+                        "cortex: query embedding has dimension {} but the index holds \
+                         {}-dim vectors — skipping vector search (keyword/FTS only). \
+                         Use the same embedding model for queries and storage.",
+                        query.len(),
+                        dim
+                    );
+                    return Vec::new();
+                }
             }
 
             // Small collection: brute-force everything (read-only)
@@ -418,6 +465,24 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_mismatched_dimension_insert_and_query() {
+        let idx = MemoryIndex::new();
+        let a = Uuid::new_v4();
+        idx.insert(a, vec![1.0, 0.0, 0.0]);
+        assert_eq!(idx.dimension(), Some(3));
+
+        // Wrong-dimension insert is rejected (not stored as a 0-similarity poison).
+        let b = Uuid::new_v4();
+        idx.insert(b, vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(idx.len(), 1, "mismatched-dim vector must not be stored");
+
+        // Wrong-dimension query returns empty (caller falls back to FTS), not garbage.
+        assert!(idx.search(&[1.0, 0.0, 0.0, 0.0], 5).is_empty());
+        // Matching-dimension query still works.
+        assert_eq!(idx.search(&[1.0, 0.0, 0.0], 5).len(), 1);
+    }
 
     #[test]
     fn test_cosine_identical() {

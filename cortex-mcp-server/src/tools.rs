@@ -976,6 +976,7 @@ fn tool_relationship_extract(cortex: &Arc<Cortex>, args: &Value) -> Result<Strin
 fn tool_memory_stats(cortex: &Arc<Cortex>) -> Result<String, String> {
     let stats = cortex.stats().map_err(|e| e.to_string())?;
     let metrics = cortex.metrics();
+    let (semantic_active, embedding_dim) = cortex.embedding_status();
 
     // Health score (inspired by openclaw-auto-dream)
     // Five dimensions, each 0.0–1.0:
@@ -1007,6 +1008,13 @@ fn tool_memory_stats(cortex: &Arc<Cortex>) -> Result<String, String> {
         "beliefs": stats.beliefs,
         "index_size": stats.index_size,
         "total": stats.total,
+        "embeddings": {
+            // Lets a client/agent detect degraded recall instead of hitting it silently.
+            "semantic_search_active": semantic_active,
+            "embedding_dim": embedding_dim,
+            "embedded_memories": stats.index_size,
+            "recall_mode": if semantic_active { "semantic+keyword" } else { "keyword-only (no active embeddings)" },
+        },
         "metrics": {
             "ingests": metrics.ingests,
             "batch_ingests": metrics.batch_ingests,

@@ -1219,6 +1219,21 @@ impl Cortex {
     }
 
     /// Get memory statistics (counts per tier).
+    /// Embedding/recall health so callers can SEE when semantic search is degraded
+    /// rather than discovering weak recall silently. Returns
+    /// `(semantic_active, embedding_dimension)`:
+    /// - `semantic_active`: the embedder is compiled in, not disabled by
+    ///   `CORTEX_NO_EMBEDDINGS`, and the vector index is populated. When false,
+    ///   retrieval runs on keyword/FTS + recency only (lower recall).
+    /// - `embedding_dimension`: the vector space the index holds, if any.
+    pub fn embedding_status(&self) -> (bool, Option<usize>) {
+        let dim = self.index.dimension();
+        let disabled = std::env::var("CORTEX_NO_EMBEDDINGS").is_ok_and(|v| !v.is_empty());
+        let compiled = cfg!(feature = "embeddings");
+        let active = compiled && !disabled && dim.is_some();
+        (active, dim)
+    }
+
     pub fn stats(&self) -> Result<MemoryStats, CortexError> {
         let episodic = self.storage.count_by_tier(MemoryTier::Episodic)?;
         let semantic = self.storage.count_by_tier(MemoryTier::Semantic)?;
