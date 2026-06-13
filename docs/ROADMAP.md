@@ -40,6 +40,16 @@ This is the prioritized forward plan. The per-iteration security audits
   `SyncEngine::rotate_key()`. See docs/design/key-rotation.md. Follow-ups: passphrase
   change (vs key-only rotation), optional `compact_to_current_version()`, wire rotation
   into the HTTP/MCP surface.
+- ✅ **Iteration 17 — Per-memory privacy opt-in + persistent sync (2026-06-13).** Dogfooding
+  iCloud sync surfaced two gaps: (a) everything defaults to `Private` and never syncs, but no
+  surface could mark a memory `Shared` — sync synced nothing; (b) sync config lived only in
+  process memory — any restart silently disabled sync. Shipped: `ingest_with_options` +
+  `set_memory_privacy` in core (demote-to-Private records a sync **delete**, retracting the
+  memory from other devices), MCP `privacy`/`scope` args + new `memory_set_privacy` tool
+  (write group, 30 tools now), CLI `ingest --privacy`, `sync_settings` table (passphrase
+  NEVER stored) + macOS-keychain/env passphrase resolution + `Cortex::resume_sync()` on
+  server start and sync-relevant CLI paths. Follow-ups: batch per-item privacy, HTTP surface,
+  `sync disable` command.
 - ✅ **Iteration 16 — Bounded query budget + MCP deny-by-default capability grants (P2).**
   Every retrieval is bounded by `QueryBudget` (candidate cap + wall-clock cap, graceful
   degradation — never an error, which would itself be a store-size oracle). The MCP

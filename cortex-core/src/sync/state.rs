@@ -71,9 +71,83 @@ pub fn init_sync_tables(conn: &Connection) -> Result<(), CortexError> {
             deleted_hlc TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY (entity_type, entity_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            config_json TEXT NOT NULL,
+            encryption INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
         );",
     )
     .map_err(|e| CortexError::Storage(format!("Failed to init sync tables: {}", e)))
+}
+
+// ── Persistent sync settings ─────────────────────────────────────────────────
+//
+// The non-secret part of `SyncConfig` (sync dir, device identity, intervals) is
+// persisted so sync survives process restarts. The passphrase is NEVER stored
+// here — `SyncConfig.encryption_passphrase` is `#[serde(skip_serializing)]`, and
+// the `encryption` column only records *that* encryption is on, so resume knows
+// it must obtain a passphrase (env var or OS keychain) before enabling.
+
+/// Persist the sync configuration (without any secret material).
+pub fn save_sync_settings(
+    conn: &Connection,
+    config: &crate::sync::SyncConfig,
+) -> Result<(), CortexError> {
+    let json = serde_json::to_string(config)
+        .map_err(|e| CortexError::Serialization(e.to_string()))?;
+    debug_assert!(
+        !json.contains("encryption_passphrase"),
+        "passphrase must never serialize into sync_settings"
+    );
+    conn.execute(
+        "INSERT INTO sync_settings (id, config_json, encryption, updated_at)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET
+             config_json = excluded.config_json,
+             encryption = excluded.encryption,
+             updated_at = excluded.updated_at",
+        params![
+            json,
+            config.encryption_passphrase.is_some() as i64,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Load the persisted sync configuration, if any.
+/// Returns the config (passphrase always `None`) and whether encryption was enabled.
+pub fn load_sync_settings(
+    conn: &Connection,
+) -> Result<Option<(crate::sync::SyncConfig, bool)>, CortexError> {
+    let row = conn
+        .query_row(
+            "SELECT config_json, encryption FROM sync_settings WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+    match row {
+        Some((json, enc)) => {
+            let config: crate::sync::SyncConfig = serde_json::from_str(&json)
+                .map_err(|e| CortexError::Serialization(e.to_string()))?;
+            Ok(Some((config, enc != 0)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Remove persisted sync settings (used when sync is torn down).
+#[allow(dead_code)]
+pub fn clear_sync_settings(conn: &Connection) -> Result<(), CortexError> {
+    conn.execute("DELETE FROM sync_settings WHERE id = 1", [])
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(())
 }
 
 // ── Device identity ──────────────────────────────────────────────────────────

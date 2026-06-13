@@ -40,6 +40,7 @@ const READ_TOOLS: &[&str] = &[
 /// Mutating tools: ingest, edit, lifecycle, identity merges.
 const WRITE_TOOLS: &[&str] = &[
     "memory_ingest",
+    "memory_set_privacy",
     "memory_ingest_batch",
     "fact_add",
     "preference_set",
@@ -272,9 +273,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_groups_cover_all_29_dispatch_tools() {
+    fn builtin_groups_cover_all_30_dispatch_tools() {
         // Keep the group tables in lock-step with the dispatch match in tools.rs.
-        assert_eq!(READ_TOOLS.len() + WRITE_TOOLS.len() + SYNC_TOOLS.len(), 29);
+        assert_eq!(READ_TOOLS.len() + WRITE_TOOLS.len() + SYNC_TOOLS.len(), 30);
         for t in READ_TOOLS {
             assert!(!WRITE_TOOLS.contains(t) && !SYNC_TOOLS.contains(t));
         }

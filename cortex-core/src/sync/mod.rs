@@ -9,6 +9,7 @@ pub mod hlc;
 pub mod merge;
 pub mod oplog;
 pub mod provider;
+pub mod secret;
 pub mod snapshot;
 pub mod state;
 pub mod watcher;

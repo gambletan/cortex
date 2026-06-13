@@ -234,9 +234,61 @@ impl Cortex {
 
     /// Enable cloud sync. Creates sync folder structure and subscribes to events.
     pub fn enable_sync(&self, config: crate::sync::SyncConfig) -> Result<(), CortexError> {
+        // Persist the non-secret config so sync survives restarts; stash the
+        // passphrase in the OS keychain (best-effort, macOS) so resume_sync can
+        // re-derive keys without ever writing the secret to disk.
+        self.storage.with_write_conn(|conn| {
+            crate::sync::state::save_sync_settings(conn, &config)
+        })?;
+        if let Some(ref passphrase) = config.encryption_passphrase {
+            if crate::sync::secret::store_passphrase(&config.device_id, passphrase) {
+                tracing::info!("sync passphrase stored in OS keychain");
+            } else {
+                tracing::warn!(
+                    "could not store sync passphrase in OS keychain — set CORTEX_SYNC_PASSPHRASE \
+                     for sync to resume across restarts"
+                );
+            }
+        }
         let engine = crate::sync::SyncEngine::new(config, &self.storage)?;
         *self.sync_engine.lock() = Some(engine);
         Ok(())
+    }
+
+    /// Resume sync from persisted settings, if sync was previously enabled.
+    ///
+    /// Returns `Ok(true)` if sync is now active. If the persisted config used
+    /// encryption and no passphrase can be found (env `CORTEX_SYNC_PASSPHRASE`
+    /// or OS keychain), sync stays off and `Ok(false)` is returned — never an
+    /// error, so a missing keychain entry can't brick startup.
+    pub fn resume_sync(&self) -> Result<bool, CortexError> {
+        if self.sync_engine.lock().is_some() {
+            return Ok(true);
+        }
+        let settings = self.storage.with_write_conn(|conn| {
+            crate::sync::state::load_sync_settings(conn)
+        })?;
+        let Some((mut config, encryption)) = settings else {
+            return Ok(false);
+        };
+        if encryption {
+            match crate::sync::secret::load_passphrase(&config.device_id) {
+                Some(passphrase) => {
+                    config = config.with_encryption(passphrase);
+                }
+                None => {
+                    tracing::warn!(
+                        "sync is configured with encryption but no passphrase is available \
+                         (CORTEX_SYNC_PASSPHRASE or OS keychain) — sync stays disabled"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        let engine = crate::sync::SyncEngine::new(config, &self.storage)?;
+        *self.sync_engine.lock() = Some(engine);
+        tracing::info!("sync resumed from persisted settings");
+        Ok(true)
     }
 
     /// Pull remote sync changes from other devices.
@@ -245,7 +297,15 @@ impl Cortex {
         let mut guard = self.sync_engine.lock();
         let engine = guard.as_mut()
             .ok_or_else(|| CortexError::InvalidInput("Sync not enabled".into()))?;
-        engine.pull_remote(&self.storage, &self.index)
+        let applied = engine.pull_remote(&self.storage, &self.index)?;
+        drop(guard);
+        if applied > 0 {
+            // Remote ops changed local state behind the retrieval cache's back —
+            // without this bump, a long-running process keeps serving stale results
+            // (including memories another device just retracted via privacy demotion).
+            self.bump_write_generation();
+        }
+        Ok(applied)
     }
 
     /// Get sync status. Returns None if sync is not enabled.
@@ -507,6 +567,25 @@ impl Cortex {
         embedding: Option<Vec<f32>>,
         namespace: Option<&str>,
     ) -> Result<MemObject, CortexError> {
+        self.ingest_with_options(text, channel, user_id, salience_hint, embedding, namespace, None)
+    }
+
+    /// Ingest a new memory with full options, including an explicit privacy level.
+    ///
+    /// `privacy` defaults to [`PrivacyLevel::Private`] (never leaves this device).
+    /// Pass `Shared`/`Public` to opt the memory into cloud sync and remote-LLM
+    /// context — the opt-in is per-memory and explicit, never ambient.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_with_options(
+        &self,
+        text: &str,
+        channel: &str,
+        user_id: Option<&str>,
+        salience_hint: Option<f32>,
+        embedding: Option<Vec<f32>>,
+        namespace: Option<&str>,
+        privacy: Option<crate::types::PrivacyLevel>,
+    ) -> Result<MemObject, CortexError> {
         let mut source = MemSource::new(channel);
         let embedding = self.auto_embed(text, embedding);
 
@@ -541,6 +620,9 @@ impl Cortex {
         }
         if let Some(ns) = namespace {
             builder = builder.namespace(ns.to_string());
+        }
+        if let Some(p) = privacy {
+            builder = builder.privacy(p);
         }
 
         let mut mem = builder.build();
@@ -1163,6 +1245,49 @@ impl Cortex {
         }
         self.bump_write_generation();
         Ok(())
+    }
+
+    /// Change the privacy level of an existing memory.
+    ///
+    /// This is the per-memory opt-in/opt-out lever for cloud sync:
+    /// - Promoting to `Shared`/`Public` records a sync upsert, so the memory
+    ///   (encrypted) starts propagating to other devices.
+    /// - Demoting a previously-syncable memory back to `Private` records a sync
+    ///   **delete**, retracting it from other devices — the local copy is kept.
+    pub fn set_memory_privacy(
+        &self,
+        id: Uuid,
+        privacy: crate::types::PrivacyLevel,
+    ) -> Result<MemObject, CortexError> {
+        let mut mem = self
+            .storage
+            .get_memory(id)?
+            .ok_or_else(|| CortexError::NotFound(format!("memory {id}")))?;
+        let was_syncable = mem.privacy.is_syncable();
+        mem.privacy = privacy;
+        self.storage.update_memory(&mem)?;
+
+        let event = CortexEvent::MemoryUpdated { id };
+        self.event_bus.emit(&event);
+        if mem.privacy.is_syncable() {
+            // Now syncable: record_memory_event re-checks privacy and records an upsert.
+            self.sync_record_event(&event);
+        } else if was_syncable {
+            // Was on the wire, now Private: retract from remote devices. A plain
+            // MemoryUpdated event would be dropped by the Private filter, and the
+            // MemoryDeleted path refuses to sync deletes of existing Private
+            // memories — so issue the retraction explicitly.
+            let mut guard = self.sync_engine.lock();
+            if let Some(ref mut engine) = *guard {
+                if let Err(e) =
+                    engine.record_op(crate::sync::oplog::SyncPayload::MemoryDelete { id })
+                {
+                    tracing::warn!(error = %e, "failed to record privacy retraction");
+                }
+            }
+        }
+        self.bump_write_generation();
+        Ok(mem)
     }
 
     /// Archive old, low-salience memories automatically.

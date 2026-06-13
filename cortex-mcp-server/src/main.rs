@@ -107,6 +107,9 @@ enum Command {
         /// Source channel (default: cli)
         #[arg(short, long, default_value = "cli")]
         channel: String,
+        /// Privacy level: private (never leaves this device), shared, public
+        #[arg(short, long, default_value = "private")]
+        privacy: String,
     },
     /// Search memories
     Search {
@@ -341,21 +344,35 @@ fn main() {
     }
 
     match cli.command {
-        Some(Command::Ingest { text, channel }) => {
+        Some(Command::Ingest { text, channel, privacy }) => {
             let db_path = resolve_db_path(cli.db_path.as_deref());
             ensure_db_dir(&db_path);
+            let privacy_level = match privacy.to_lowercase().as_str() {
+                "private" => cortex_core::types::PrivacyLevel::Private,
+                "shared" => cortex_core::types::PrivacyLevel::Shared { scope: "all".into() },
+                "public" => cortex_core::types::PrivacyLevel::Public,
+                other => {
+                    eprintln!("Invalid privacy '{other}': use private, shared, or public");
+                    std::process::exit(1);
+                }
+            };
             let cortex = Cortex::open(&db_path).unwrap_or_else(|e| {
                 eprintln!("Error opening database: {e}");
                 std::process::exit(1);
             });
-            let mem = cortex.ingest(&text, &channel, None, None, None).unwrap_or_else(|e| {
-                eprintln!("Error ingesting memory: {e}");
-                std::process::exit(1);
-            });
+            // Resume sync so Shared ingests are recorded to the oplog.
+            let _ = cortex.resume_sync();
+            let mem = cortex
+                .ingest_with_options(&text, &channel, None, None, None, None, Some(privacy_level))
+                .unwrap_or_else(|e| {
+                    eprintln!("Error ingesting memory: {e}");
+                    std::process::exit(1);
+                });
             println!("✅ Memory stored");
             println!("   ID:      {}", mem.id);
             println!("   Tier:    {}", mem.tier.as_str());
             println!("   Channel: {}", channel);
+            println!("   Privacy: {}", privacy.to_lowercase());
             if let cortex_core::types::MemContent::Text(ref t) = mem.content {
                 let preview = if t.len() > 80 { format!("{}...", &t[..80]) } else { t.clone() };
                 println!("   Text:    {}", preview);
@@ -406,6 +423,8 @@ fn main() {
                 eprintln!("Error opening database: {e}");
                 std::process::exit(1);
             });
+            // Resume sync from persisted settings so status/pull work across restarts.
+            let _ = cortex.resume_sync();
 
             match action {
                 Some(SyncAction::Enable { provider, passphrase, name }) => {
@@ -728,6 +747,13 @@ fn run_mcp_server(cli_db_path: Option<&str>) {
             std::process::exit(1);
         }
     };
+
+    // Resume cloud sync from persisted settings (no-op if never enabled).
+    match server.cortex.resume_sync() {
+        Ok(true) => info!("cloud sync active (resumed from persisted settings)"),
+        Ok(false) => {}
+        Err(e) => error!(error = %e, "failed to resume sync — continuing without sync"),
+    }
 
     let stdin = io::stdin();
     let stdout = io::stdout();

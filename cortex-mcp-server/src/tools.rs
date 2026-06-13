@@ -1,5 +1,6 @@
 //! MCP tool definitions and execution for Cortex memory engine.
 
+use cortex_core::types::PrivacyLevel;
 use cortex_core::Cortex;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -62,9 +63,41 @@ fn list_tools_builtin() -> Value {
                     "namespace": {
                         "type": "string",
                         "description": "Namespace for isolation (optional, e.g. 'user_123')"
+                    },
+                    "privacy": {
+                        "type": "string",
+                        "enum": ["private", "shared", "public"],
+                        "description": "Privacy level (optional, default 'private'). 'private' never leaves this device; 'shared'/'public' opt the memory into encrypted cloud sync and remote-LLM context."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Sharing scope when privacy='shared' (optional, default 'all')"
                     }
                 },
                 "required": ["text", "channel"]
+            }
+        },
+        {
+            "name": "memory_set_privacy",
+            "description": "Change the privacy level of an existing memory. Promoting to 'shared'/'public' opts it into encrypted cloud sync; demoting to 'private' retracts it from other devices (local copy is kept).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory UUID"
+                    },
+                    "privacy": {
+                        "type": "string",
+                        "enum": ["private", "shared", "public"],
+                        "description": "New privacy level"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Sharing scope when privacy='shared' (optional, default 'all')"
+                    }
+                },
+                "required": ["id", "privacy"]
             }
         },
         {
@@ -520,6 +553,7 @@ fn list_tools_builtin() -> Value {
 pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "memory_ingest" => tool_memory_ingest(cortex, args),
+        "memory_set_privacy" => tool_memory_set_privacy(cortex, args),
         "memory_search" => tool_memory_search(cortex, args),
         "memory_context" => tool_memory_context(cortex, args),
         "memory_consolidate" => tool_memory_consolidate(cortex),
@@ -585,6 +619,33 @@ fn get_embedding(args: &Value) -> Option<Vec<f32>> {
         .map(|arr| arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
 }
 
+/// Parse the optional `privacy` argument: "private" (default), "shared", "public".
+/// `scope` refines Shared (default "all"). Unknown values are an error — privacy
+/// must never be silently coerced.
+fn parse_privacy(args: &Value) -> Result<Option<PrivacyLevel>, String> {
+    let Some(p) = get_str(args, "privacy") else {
+        return Ok(None);
+    };
+    match p.to_lowercase().as_str() {
+        "private" => Ok(Some(PrivacyLevel::Private)),
+        "shared" => Ok(Some(PrivacyLevel::Shared {
+            scope: get_str(args, "scope").unwrap_or("all").to_string(),
+        })),
+        "public" => Ok(Some(PrivacyLevel::Public)),
+        other => Err(format!(
+            "invalid privacy '{other}': use 'private', 'shared', or 'public'"
+        )),
+    }
+}
+
+fn privacy_label(p: &PrivacyLevel) -> &'static str {
+    match p {
+        PrivacyLevel::Private => "private",
+        PrivacyLevel::Shared { .. } => "shared",
+        PrivacyLevel::Public => "public",
+    }
+}
+
 fn tool_memory_ingest(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
     let text = get_str(args, "text").ok_or("missing 'text'")?;
     if text.len() > MAX_INGEST_TEXT_BYTES {
@@ -595,16 +656,33 @@ fn tool_memory_ingest(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Stri
     let salience = args.get("salience").and_then(|v| v.as_f64()).map(|v| v as f32);
     let embedding = get_embedding(args);
     let namespace = get_str(args, "namespace");
+    let privacy = parse_privacy(args)?;
 
     let mem = cortex
-        .ingest_with_namespace(text, channel, user_id, salience, embedding, namespace)
+        .ingest_with_options(text, channel, user_id, salience, embedding, namespace, privacy)
         .map_err(|e| e.to_string())?;
 
     Ok(json!({
         "id": mem.id.to_string(),
         "tier": mem.tier.as_str(),
+        "privacy": privacy_label(&mem.privacy),
         "created_at": mem.temporal.ingestion_time.to_rfc3339(),
         "status": "stored"
+    })
+    .to_string())
+}
+
+fn tool_memory_set_privacy(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String> {
+    let id_str = get_str(args, "id").ok_or("missing 'id'")?;
+    let id = uuid::Uuid::parse_str(id_str).map_err(|e| format!("invalid id: {e}"))?;
+    let privacy = parse_privacy(args)?.ok_or("missing 'privacy'")?;
+
+    let mem = cortex.set_memory_privacy(id, privacy).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "id": mem.id.to_string(),
+        "privacy": privacy_label(&mem.privacy),
+        "syncable": mem.privacy.is_syncable(),
+        "status": "updated"
     })
     .to_string())
 }
