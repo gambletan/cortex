@@ -228,12 +228,11 @@ Imagine your AI assistant across a week of real conversations:
 
 ```
 # Day 1 — You chat on Telegram
-You: "Meeting with Sarah from Stripe went well. She's interested in our API."
+You: "Sarah works at Stripe. She's interested in our API."
 
   Cortex auto-extracts:
   ├── episodic memory stored (156µs)
-  ├── fact: Sarah → works_at → Stripe (confidence: 0.85)
-  ├── fact: Sarah → interested_in → our API
+  ├── fact: Sarah → works_at → Stripe (confidence: 0.70)
   └── person resolved: sarah_telegram
 
 # Day 2 — Sarah emails you
@@ -257,13 +256,17 @@ You: "What's the status with Stripe?"
   Your AI responds with full context — no "sorry, I don't remember" 🎯
 
 # Day 5 — New information arrives
-You: "Turns out Sarah moved to Anthropic last month."
+You: "Sarah now works at Anthropic."
 
   Cortex:
   ├── contradiction detected: Sarah works_at Stripe vs Sarah works_at Anthropic
-  ├── old fact confidence decayed: Stripe (0.85 → 0.15)
-  ├── new fact stored: Sarah → works_at → Anthropic (0.90)
-  └── belief updated via Bayesian inference — self-correcting, no manual cleanup
+  ├── old fact superseded + decayed: Stripe (salience ×0.3, kept as history)
+  ├── new fact stored: Sarah → works_at → Anthropic
+  └── current employer now ranks first; self-correcting, no manual cleanup
+
+  (Third-party relations are extracted from natural-language verbs —
+   "works at / works for / joined / now works at", "runs on", "hosted in",
+   "manages", "part of", … — between two proper-noun entities.)
 
 # Day 7 — Consolidation runs
   Cortex auto-consolidation:
@@ -436,7 +439,7 @@ Options:
 ```bash
 # Store a memory
 cortex-mcp-server ~/.cortex/memory.db ingest "Met with Alice about Q3 roadmap"
-cortex-mcp-server ~/.cortex/memory.db ingest -c telegram "Sarah moved to Anthropic"
+cortex-mcp-server ~/.cortex/memory.db ingest -c telegram "Sarah now works at Anthropic"
 
 # Search
 cortex-mcp-server ~/.cortex/memory.db search "Alice"

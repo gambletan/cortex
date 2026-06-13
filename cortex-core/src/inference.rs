@@ -815,6 +815,15 @@ fn first_clause(text: &str) -> &str {
 /// Curated high-precision relational verbs between two proper-noun entities.
 /// Ordered longest-first so "is hosted in" matches before "in"-like fragments.
 const ENTITY_RELATION_VERBS: &[(&str, &str)] = &[
+    // Employment — all normalized to `works_at` so a job change (same person, new
+    // employer) is detected as a contradiction that supersedes the old employer.
+    // Longest phrases first so "now works at" wins over "works at".
+    ("now works at", "works_at"),
+    ("now works for", "works_at"),
+    ("currently works at", "works_at"),
+    ("works at", "works_at"),
+    ("works for", "works_at"),
+    ("joined", "works_at"),
     ("is hosted in", "hosted_in"),
     ("is hosted on", "hosted_on"),
     ("is located in", "located_in"),
@@ -862,13 +871,20 @@ fn extract_entity_relations(text: &str, lower: &str, knowledge: &mut InferredKno
         let object = first_proper_noun(&text[after_start..]);
         if let (Some(s), Some(o)) = (subject, object) {
             if s != o && s != "User" && o != "User" {
-                knowledge.facts.push(InferredFact {
-                    subject: s,
-                    predicate: (*predicate).to_string(),
-                    object: o,
-                    confidence: 0.7,
+                // Overlapping verbs ("now works at" ⊃ "works at") can match the same
+                // span — dedup on the resulting triple so we don't emit it twice.
+                let dup = knowledge.facts.iter().any(|f| {
+                    f.subject == s && f.predicate == *predicate && f.object == o
                 });
-                emitted += 1;
+                if !dup {
+                    knowledge.facts.push(InferredFact {
+                        subject: s,
+                        predicate: (*predicate).to_string(),
+                        object: o,
+                        confidence: 0.7,
+                    });
+                    emitted += 1;
+                }
             }
         }
     }
