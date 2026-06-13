@@ -11,7 +11,7 @@
 
 ### Private. Free. Local. — Memory engine for personal AI agents.
 
-**Your AI's memory lives on your device — never leaves, never costs, never spies.** Pure Rust. 3.8MB. No third-party servers. Zero telemetry. Zero cost. Syncs through your own cloud storage.
+**Your AI's memory lives on your device — your data never leaves, never costs, never spies.** Pure Rust. 3.8MB binary. No third-party servers in the data path, zero telemetry, zero cost. Syncs through your own cloud storage. (On-device semantic search downloads a ~30MB model once on first use, then runs fully offline — or go 100% offline with `CORTEX_NO_EMBEDDINGS=1`. See [Security & Privacy](#security--privacy).)
 
 > **Philosophy:** Your memories are yours — not a cloud provider's training data, not a startup's monetization asset, not a government's surveillance target. Cortex runs 100% on your hardware, stores everything in your own database, and syncs only through your own cloud storage (iCloud, Google Drive, OneDrive, Dropbox). No middleman ever sees your data. No API key required. No account to create. Just plug it into your AI agent and it remembers — privately, permanently, and at sub-millisecond speed.
 
@@ -38,7 +38,7 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 | **Import/Export** | Full JSON backup & restore | API only | No export |
 | **Self-hosted** | Native binary, Docker, MCP | Cloud only | Cloud only |
 | **Binary size** | 3.8 MB | npm package | N/A |
-| **Dependencies** | 0 runtime deps | Node.js + cloud | N/A |
+| **Dependencies** | 0 runtime services (single binary) | Node.js + cloud | N/A |
 | **Open source** | MIT | Partial | No |
 | **Encryption** | AES-256-GCM encrypted sync (opt-in) | No | No |
 | **Key rotation** | Versioned envelopes, forward secrecy | No | No |
@@ -198,7 +198,8 @@ println!("Applied {} remote changes", applied);
 | **Query budget** | Every retrieval is bounded (candidate cap + wall-clock cap) — query cost never scales with total store size; DoS guard and timing-side-channel bound in one |
 | **Secret handling** | Sync passphrase is never written to disk by Cortex — macOS login Keychain or env var only; missing passphrase fails safe (sync off, never plaintext) |
 | **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
-| **Zero telemetry** | No analytics, no phone-home — **enforced in CI**: the build fails if any network or telemetry crate enters `cortex-core`'s default dependency tree (`scripts/check-no-network-egress.sh`). The default build pulls zero HTTP-client/telemetry crates. |
+| **Zero telemetry** | No analytics, no phone-home, no user data ever leaves the device — **enforced in CI** (`scripts/check-no-network-egress.sh`): the build fails if any network/telemetry crate enters `cortex-core`'s default tree, and the check also proves the `--no-default-features` binary is completely zero-network. |
+| **Embedding model fetch (one-time)** | The default `cortex-mcp-server` enables on-device semantic search, which **downloads a ~30 MB model (all-MiniLM-L6-v2) from the Hugging Face CDN on first ingest**, then runs fully offline and sends none of your data. For a 100%-offline setup: run with `CORTEX_NO_EMBEDDINGS=1` (keyword/FTS recall, zero network) or build `--no-default-features`. A one-time stderr notice is printed before any download — nothing is ever fetched silently. |
 | **No accounts** | No API key, no registration, no cloud dependency |
 
 See [SECURITY.md](SECURITY.md) for the full threat model.

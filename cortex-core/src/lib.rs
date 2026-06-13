@@ -519,11 +519,28 @@ impl Cortex {
         if embedding.is_some() {
             return embedding;
         }
+        // Offline escape hatch: a genuinely zero-network path for privacy-strict users.
+        // With CORTEX_NO_EMBEDDINGS set, the local embedding model is never initialized
+        // or downloaded; retrieval falls back to keyword/FTS + recency (lower semantic
+        // recall, zero egress). Equivalent to a `--no-default-features` build at runtime.
+        if std::env::var("CORTEX_NO_EMBEDDINGS").is_ok_and(|v| !v.is_empty()) {
+            return None;
+        }
         #[cfg(feature = "embeddings")]
         {
             let mut guard = self.embedder.lock();
             // None = not yet initialized, Some(None) = init failed, Some(Some(e)) = ready
             if guard.is_none() {
+                // One-time transparency notice: the first ingest may download the model.
+                // Printed to stderr unconditionally (not gated by RUST_LOG) because a
+                // privacy-first tool must never fetch from the network silently.
+                eprintln!(
+                    "cortex: loading the local embedding model (all-MiniLM-L6-v2). The \
+                     first time ever, this downloads ~30MB from the Hugging Face CDN and \
+                     caches it; afterwards it loads from disk. It runs on-device and sends \
+                     none of your data. To stay 100% offline, set CORTEX_NO_EMBEDDINGS=1 \
+                     (keyword-only recall) or build with --no-default-features."
+                );
                 tracing::info!("Initializing local embedding model (first use)...");
                 match crate::embedder::Embedder::new() {
                     Ok(e) => *guard = Some(Some(e)),

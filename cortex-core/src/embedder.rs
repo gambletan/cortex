@@ -1,5 +1,8 @@
-//! Local embedding engine using fastembed (gte-small, 384 dimensions).
-//! Gated behind the `embeddings` cargo feature.
+//! Local embedding engine using fastembed (all-MiniLM-L6-v2, 384 dimensions).
+//! Gated behind the `embeddings` cargo feature. On first use the model (~30MB) is
+//! downloaded from the Hugging Face CDN and cached locally; it then runs fully offline
+//! and transmits none of the user's data. Set `CORTEX_NO_EMBEDDINGS=1` for a zero-network
+//! path (see `Cortex::auto_embed`).
 
 #[cfg(feature = "embeddings")]
 mod inner {
