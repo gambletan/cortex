@@ -85,6 +85,21 @@ fn different_people_employment_do_not_falsely_contradict() {
 }
 
 #[test]
+fn speculative_relationships_stay_out_of_injected_context() {
+    // "X works with Y" is a single-sentence guess; on tech prose it's noise. It may be
+    // stored/queryable, but must NOT be injected into the LLM's Known Facts context.
+    let cortex = Cortex::in_memory().unwrap();
+    cortex
+        .ingest("React works with TypeScript", "test", None, None, None)
+        .unwrap();
+    let ctx = cortex.get_context(2000, None, None).unwrap();
+    assert!(
+        !ctx.contains("colleague_of"),
+        "speculative relationship leaked into injected context:\n{ctx}"
+    );
+}
+
+#[test]
 fn tech_prose_does_not_create_false_facts() {
     // Regression guard for the cortex-user-skeptic HIGH finding: ordinary tech prose
     // must not pollute the fact store with entity-relation false positives.

@@ -133,6 +133,12 @@ pub struct MetricsSnapshot {
 /// Default interval: auto-run consolidation every N ingests.
 const DEFAULT_AUTO_CONSOLIDATION_INTERVAL: u64 = 100;
 
+/// Upper bound on the confidence assigned to auto-extracted relationship facts. Kept
+/// strictly below the default context-injection floor (`ContextConfig::min_fact_confidence`
+/// = 0.3) so single-sentence relationship guesses stay queryable but never auto-inject
+/// into the LLM's "Known Facts".
+const SPECULATIVE_RELATION_MAX_CONFIDENCE: f32 = 0.29;
+
 /// Main Cortex instance — the entry point for all memory operations.
 pub struct Cortex {
     storage: SqliteStorage,
@@ -751,14 +757,22 @@ impl Cortex {
         }
 
         // ── Auto-extract relationships (bidirectional) ─────────────────
+        // These come from single-sentence proper-noun-pair patterns ("X works with Y"),
+        // which can't tell a person relationship ("Alice works with Bob") from tech prose
+        // ("React works with TypeScript"). Store them at a SPECULATIVE confidence (below
+        // the context-injection floor) so they remain queryable and feed the people graph,
+        // but are NOT presented to the LLM as authoritative "Known Facts" — that
+        // auto-injection of tech-prose guesses was the cortex-user-skeptic #1 walk-away.
+        // Explicit fact_add and corroborated facts keep their full confidence and do show.
         let relationships = relationship::extract_relationships(text);
         let bidirectional = relationship::with_inverses(&relationships);
         for rel in &bidirectional {
+            let speculative = (rel.confidence * 0.3).min(SPECULATIVE_RELATION_MAX_CONFIDENCE);
             let _ = semantic.add_fact(
                 &rel.person_a,
                 &rel.relation,
                 &rel.person_b,
-                rel.confidence,
+                speculative,
                 MemSource::new(channel),
                 None,
             );
