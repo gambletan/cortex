@@ -41,13 +41,15 @@ Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-
 | **Dependencies** | 0 runtime deps | Node.js + cloud | N/A |
 | **Open source** | MIT | Partial | No |
 | **Encryption** | AES-256-GCM encrypted sync (opt-in) | No | No |
-| **Privacy levels** | Private (default, never syncs) / Shared / Public | No | No |
+| **Key rotation** | Versioned envelopes, forward secrecy | No | No |
+| **Privacy levels** | Private (default, never syncs) / Shared / Public — per-memory opt-in, demote retracts from other devices | No | No |
+| **Tool authorization** | Deny-by-default capability policy on the MCP surface | No | No |
 | **Zero telemetry** | No analytics, no phone-home, verifiable | Unknown | No |
 | **Cost** | Free forever, unlimited | $99+/mo (Pro) | $20/mo (Plus) |
 | **Chinese NLP** | Native (inference, retrieval, relationships) | No | Limited |
 | **Namespace isolation** | Per-user/context memory separation | No | No |
 | **Plugin system** | Compile-time hooks for ingest/retrieve/consolidation | No | No |
-| **MCP tools** | 29 tools for Claude/LLM integration | 3rd party | N/A |
+| **MCP tools** | 30 tools for Claude/LLM integration | 3rd party | N/A |
 
 ### Performance Benchmarks
 
@@ -160,19 +162,26 @@ Device A (Mac)              Your Cloud Storage              Device B (iPhone)
 - **Changelog-based**: Each device writes append-only operation logs to its own subfolder
 - **No conflicts**: Devices never write to the same file. Merge uses Last-Writer-Wins with Hybrid Logical Clocks
 - **Encrypted**: AES-256-GCM encryption (opt-in). Even if your cloud account is compromised, memories stay private
-- **Privacy-aware**: Private memories (the default) never leave your device. Only Shared/Public memories sync
+- **Tamper-evident**: the sync manifest and every operation carry an HMAC; tampered or plaintext-injected oplog lines are rejected, and a manifest without integrity protection refuses to load (no key-rollback path)
+- **Key rotation & forward secrecy**: rotate to a new key version (`ENC2` envelopes) without re-encrypting history; old versions stay readable, new writes are unreadable to a leaked old key
+- **Privacy-aware, per-memory opt-in**: Private memories (the default) never leave your device. Mark a memory `shared` to sync it; demote it back to `private` and a retraction **deletes it from your other devices** (local copy kept)
+- **Survives restarts**: sync settings persist in the database (passphrase never touches disk — macOS login Keychain or `CORTEX_SYNC_PASSPHRASE`); the server resumes sync and starts background pull (30s poll + fs watcher) automatically
 
 Supported providers: **iCloud Drive**, **Google Drive**, **OneDrive**, **Dropbox** (auto-detected).
 
 ```rust
 use cortex_core::sync::SyncConfig;
+use cortex_core::types::PrivacyLevel;
 
-// Enable sync with encryption
+// Enable sync with encryption (settings persist; passphrase goes to the OS keychain)
 let config = SyncConfig::new(sync_dir, device_id, device_name)
     .with_encryption("my-strong-passphrase");
 cortex.enable_sync(config)?;
 
-// Pull changes from other devices
+// Opt a memory into sync — everything is Private unless you say otherwise
+cortex.set_memory_privacy(mem_id, PrivacyLevel::Shared { scope: "all".into() })?;
+
+// Pull changes from other devices (also happens automatically in the background)
 let applied = cortex.sync_pull()?;
 println!("Applied {} remote changes", applied);
 ```
@@ -182,7 +191,12 @@ println!("Applied {} remote changes", applied);
 | Feature | Detail |
 |---------|--------|
 | **Encryption** | AES-256-GCM with Argon2id key derivation (per-line random nonce) |
-| **Privacy levels** | Private (default, never syncs), Shared, Public |
+| **Key rotation** | Versioned `ENC2` envelopes with per-version passphrase-derived keys — forward secrecy against AES-key exfiltration, no full re-encryption needed |
+| **Integrity** | HMAC on the sync manifest and on every sync operation; plaintext lines in an encrypted oplog are rejected outright (injection defense) |
+| **Privacy levels** | Private (default, never syncs), Shared, Public — set at ingest (`privacy` arg / `--privacy`) or later (`memory_set_privacy`); demoting to Private retracts the memory from other devices |
+| **Capability policy** | Deny-by-default tool authorization on the MCP surface: a `capabilities.json` grants tool groups (`read`/`write`/`sync`/`plugins`) or exact tools; ungranted tools are invisible *and* uncallable; malformed policy fails closed |
+| **Query budget** | Every retrieval is bounded (candidate cap + wall-clock cap) — query cost never scales with total store size; DoS guard and timing-side-channel bound in one |
+| **Secret handling** | Sync passphrase is never written to disk by Cortex — macOS login Keychain or env var only; missing passphrase fails safe (sync off, never plaintext) |
 | **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
 | **Zero telemetry** | No analytics, no phone-home — **enforced in CI**: the build fails if any network or telemetry crate enters `cortex-core`'s default dependency tree (`scripts/check-no-network-egress.sh`). The default build pulls zero HTTP-client/telemetry crates. |
 | **No accounts** | No API key, no registration, no cloud dependency |
@@ -365,13 +379,13 @@ async with MultiServerMCPClient({
     }
 }) as client:
     agent = create_react_agent(model, client.get_tools())
-    # Agent now has all 29 Cortex memory tools
+    # Agent now has all 30 Cortex memory tools
     result = await agent.ainvoke({
         "messages": [{"role": "user", "content": "What do you remember about Alice?"}]
     })
 ```
 
-Your LangGraph agent gets instant access to memory_search, memory_ingest, fact_add, belief_observe, person_resolve, and 24 more tools — all running locally.
+Your LangGraph agent gets instant access to memory_search, memory_ingest, fact_add, belief_observe, person_resolve, and 25 more tools — all running locally.
 
 ## Integration with DeerFlow (ByteDance)
 
@@ -386,7 +400,7 @@ mcp_servers:
       - ~/.cortex/deerflow.db
 ```
 
-All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 29 memory tools — cross-session memory, fact storage, people graph, and belief tracking across all channels.
+All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 30 memory tools — cross-session memory, fact storage, people graph, and belief tracking across all channels.
 
 ## CLI
 
@@ -562,20 +576,29 @@ Output:
   Passphrase: a1b2c3...  ← save this for your other devices
 ```
 
-**On your second device**, install Cortex the same way, then:
+**On your second device** — one script does everything (build/install, wait for iCloud, join, restore):
+```bash
+git clone https://github.com/gambletan/cortex && cortex/scripts/setup-device-sync.sh
+# Prompts for your passphrase (hidden input; or set CORTEX_SYNC_PASSPHRASE)
+# → full restore on join, passphrase saved to that device's login Keychain
+```
+
+Or conversationally:
 ```
 You: "Enable sync with passphrase a1b2c3..."
 
 Claude calls sync_enable(passphrase: "a1b2c3...") →
   connects to the same iCloud sync folder → pulls all memories.
 
-Now both devices share the same memory. Preferences, facts,
-beliefs, people graph — all synced in real-time.
+Now both devices share the same memory — and keep sharing it
+automatically (background sync: 30s poll + filesystem watcher).
 ```
 
 **What syncs and what doesn't:**
-- Private memories (default) **never leave your device** — only Shared/Public memories sync
-- All sync data is **AES-256-GCM encrypted** — even if your cloud account is compromised, memories stay private
+- Private memories (default) **never leave your device**. Opt in per memory: `memory_ingest` with `privacy: "shared"`, `cortex-mcp-server ingest --privacy shared`, or `memory_set_privacy` on an existing memory
+- Demote a shared memory back to `private` and it is **retracted (deleted) from your other devices** — the local copy stays
+- All sync data is **AES-256-GCM encrypted** with HMAC integrity — even if your cloud account is compromised, memories stay private and tampering is detected
+- Sync survives restarts: settings persist, the passphrase lives in the OS keychain, the server resumes automatically
 - No server, no API, no account — just your own cloud folder
 
 **CLI alternative:**
@@ -587,7 +610,7 @@ cortex-mcp-server sync enable
 # Device B
 cortex-mcp-server sync enable --passphrase "your-passphrase-from-device-A"
 
-# Manual pull
+# Manual pull (background sync also pulls automatically)
 cortex-mcp-server sync pull
 ```
 
@@ -657,11 +680,17 @@ Two Cortex MCP servers: `cortex-project` (project DB) and `cortex-global` (globa
 
 This gives you two independent Cortex instances per project — complete isolation with shared user knowledge.
 
-### 29 Tools
+### 30 Tools
+
+> Tool access is governed by an optional **deny-by-default capability policy**: drop a
+> `capabilities.json` next to your database (`{"version":1,"grants":["read","write"]}`)
+> and only granted tool groups (`read` / `write` / `sync` / `plugins` / `all`) or exact
+> tool names are listed and callable. No policy file = everything enabled (legacy).
 
 | Tool | Purpose |
 |------|---------|
-| `memory_ingest` | Store a memory (text, channel, person context) |
+| `memory_ingest` | Store a memory (text, channel, person context, optional `privacy`) |
+| `memory_set_privacy` | Change a memory's privacy level — promote to `shared` to sync it, demote to `private` to retract it from other devices |
 | `memory_search` | Semantic search across all memory tiers |
 | `memory_context` | Generate LLM-ready context summary (token-budgeted) |
 | `memory_consolidate` | Run decay + promotion + sweep cycle |
@@ -831,7 +860,8 @@ curl -X POST http://localhost:3315/v1/import \
 - **v1.7** ✅ — **Cloud sync** (changelog-based, HLC ordering, LWW merge), **AES-256-GCM encryption** (Argon2id KDF), **privacy enforcement** (Private/Shared/Public), **zeroize** (memory wiping), SECURITY.md, 27 MCP tools, 400+ tests
 - **v2.0** ✅ — Background sync (filesystem watcher + polling), Web Dashboard, Homebrew tap, integration docs (CrewAI/AutoGen/LangGraph/DeerFlow), `/v1/memories/recent` API, 12 rounds Codex review fixes, 489 tests
 - **v2.1** ✅ — WASM build (124KB, runs entirely in the browser, GitHub Pages demo)
-- **v2.2** — Mobile targets (iOS/Android), multi-modal memory
+- **v2.2** ✅ — **Security hardening series** (self-evolution iterations 11–17): manifest + per-operation HMAC, plaintext-injection rejection, timing-attack hardening, **key rotation with forward secrecy** (`ENC2`), **bounded query budget**, **deny-by-default MCP capability policy**, **per-memory privacy opt-in with cross-device retraction**, **persistent sync (Keychain) + auto background sync**, frecency ranking, one-shot device setup script, 30 MCP tools, 500+ tests
+- **v2.3** — Mobile targets (iOS/Android), multi-modal memory
 
 ---
 
