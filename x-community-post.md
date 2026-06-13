@@ -21,8 +21,9 @@ Cortex is a **pure Rust MCP server** (3.8MB binary, zero runtime deps) that runs
 - **Bayesian beliefs** that self-correct with new evidence
 - **People graph** with cross-platform identity resolution
 - **Sub-millisecond everything** — 156µs ingest, 568µs search (528x faster than Mem0)
-- **25 MCP tools** — plug into Claude Code, Claude Desktop, or any MCP client
-- **AES-256-GCM encrypted sync** through your own cloud storage (iCloud/GDrive/OneDrive/Dropbox)
+- **30 MCP tools** — plug into Claude Code, Claude Desktop, or any MCP client
+- **AES-256-GCM encrypted sync** through your own cloud storage (iCloud/GDrive/OneDrive/Dropbox) — with key rotation, HMAC tamper detection, and per-memory privacy: everything is private-by-default and never leaves your device; mark one memory "shared" and it syncs; demote it back and it's *deleted off your other devices*
+- **Deny-by-default tool authorization** — an agent gets zero memory access until you grant read/write/sync
 - **Zero telemetry, zero cost, forever**
 
 ## Real-World Example: Claude Code + Cortex
@@ -31,7 +32,9 @@ I use Cortex with Claude Code for my X-Auto project (automated social media + SE
 
 **Before Cortex:** Every session I had to re-explain that the project uses Gemini as its LLM provider, that we push directly to main, that tests must pass before commits, and dozens of project-specific details.
 
-**After Cortex:** Claude Code remembers all of this across sessions. It knows my code style preferences, which modules I've been working on, what decisions we made last week and why. The `memory_context` tool gives it a token-budgeted summary of everything relevant to the current task.
+**After Cortex:** Claude Code remembers all of this across sessions. It knows my code style preferences, which modules I've been working on, what decisions we made last week and why. A SessionStart hook auto-injects a memory digest into every new session — zero manual effort — and the capture protocol writes durable facts back before sessions end.
+
+The dogfooding paid off in an unexpected way: black-box testing the sync path found a real privacy bug (a long-running process kept serving search results for a memory another device had just retracted — stale cache after sync pull). The same week, the implementer-written tests all passed. Lesson learned: acceptance tests now come from a context-isolated agent that never sees the implementation.
 
 ## Benchmark Results
 
@@ -39,7 +42,7 @@ We tested against the LoCoMo benchmark (ACL 2024) — 1540 QA pairs across long-
 
 | System | Overall |
 |--------|---------|
-| Cortex v1.7 | **73.7%** |
+| Cortex | **73.7%** |
 | Mem0-Graph | 68.4% |
 | Mem0 | 66.9% |
 | OpenAI Memory | 52.9% |
@@ -56,19 +59,17 @@ curl -fsSL https://raw.githubusercontent.com/gambletan/cortex/main/install.sh | 
 npx cortex-mcp
 ```
 
-Add to your Claude Code MCP config:
-```json
-{
-  "mcpServers": {
-    "cortex": {
-      "command": "cortex-mcp-server",
-      "args": ["--db-path", "~/.cortex/memory.db"]
-    }
-  }
-}
+Register with Claude Code:
+```bash
+claude mcp add cortex-memory --scope user -- ~/.local/bin/cortex-mcp-server ~/.cortex/memory.db
 ```
 
-That's it. Claude Code now has persistent memory.
+Or run the one-shot script — it installs the binary, joins encrypted cloud sync, sets up the auto-recall hook, and registers the MCP server:
+```bash
+git clone https://github.com/gambletan/cortex && cortex/scripts/setup-device-sync.sh
+```
+
+That's it. Claude Code now has persistent memory — on every device you own.
 
 ## Open Source, MIT Licensed
 
