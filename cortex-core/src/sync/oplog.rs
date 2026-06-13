@@ -448,6 +448,90 @@ mod tests {
         assert!(ops.is_empty(), "no plaintext op may be replayed in encryption mode");
     }
 
+    /// Build a syncable (Public) memory op carrying several `metadata` keys.
+    fn make_memory_op_with_metadata(device_id: &str, wall_ms: u64) -> SyncOp {
+        let mut metadata = std::collections::HashMap::new();
+        for k in ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"] {
+            metadata.insert(k.to_string(), serde_json::json!(format!("val-{k}")));
+        }
+        let mem = MemObject {
+            id: Uuid::new_v4(),
+            tier: MemoryTier::Episodic,
+            content: MemContent::Text("hello".into()),
+            embedding: None,
+            temporal: TemporalInfo::now(),
+            source: MemSource::new("test"),
+            salience: Salience::default(),
+            privacy: PrivacyLevel::Public,
+            links: Vec::new(),
+            tags: Vec::new(),
+            metadata,
+            content_hash: None,
+            namespace: None,
+        };
+        SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(wall_ms, 0, device_id),
+            payload: SyncPayload::MemoryUpsert { memory: mem },
+            hmac: None,
+        }
+    }
+
+    /// SECURITY / INTEGRITY: the operation HMAC is computed over the JSON serialization
+    /// of the op without its `hmac` field. That serialization MUST be deterministic, or a
+    /// legitimate op gets a different byte string on the reading device than on the writer,
+    /// the HMAC fails to verify, and the op is silently dropped as "tampering". `metadata`
+    /// is a HashMap, whose serde_json key order is randomized per process — so without a
+    /// canonical (sorted-key) serialization, every metadata-bearing memory fails to sync.
+    #[test]
+    fn test_hmac_payload_serialization_is_deterministic() {
+        let op = make_memory_op_with_metadata("device-a", 1000);
+        let json = serde_json::to_string(&op).unwrap();
+        // Re-parse the SAME JSON many times; each parse rebuilds the HashMap with a fresh
+        // (randomized) iteration order. The HMAC input must be identical every time.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let parsed: SyncOp = serde_json::from_str(&json).unwrap();
+            let without = SyncOpWithoutHmac {
+                op_id: parsed.op_id,
+                hlc: parsed.hlc,
+                payload: parsed.payload,
+            };
+            seen.insert(serde_json::to_string(&without).unwrap());
+        }
+        assert_eq!(
+            seen.len(),
+            1,
+            "HMAC payload serialization must be deterministic across parses (got {} variants)",
+            seen.len()
+        );
+    }
+
+    /// End-to-end: a memory carrying `metadata`, written under encryption and read back,
+    /// must survive HMAC verification every time — not be dropped as forged.
+    #[test]
+    fn test_metadata_bearing_op_survives_hmac_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let device_dir = tmp.path().join("device-a");
+        let ctx = std::sync::Arc::new(test_crypto());
+
+        let op = make_memory_op_with_metadata("device-a", 1000);
+        let op_id = op.op_id;
+        {
+            let mut writer = OpLogWriter::new(device_dir.clone(), Some(ctx.clone())).unwrap();
+            writer.append(op).unwrap();
+        }
+
+        let files = list_oplog_files(&device_dir).unwrap();
+        // Read repeatedly: each read re-parses and re-serializes for HMAC verification with a
+        // fresh HashMap order. A non-deterministic payload would drop the op on most reads.
+        for i in 0..20 {
+            let (ops, _) = read_oplog(&files[0], 0, Some(&ctx)).unwrap();
+            assert_eq!(ops.len(), 1, "metadata-bearing op dropped on read #{i}");
+            assert_eq!(ops[0].op_id, op_id);
+        }
+    }
+
     /// Legitimately encrypted lines must still be read back correctly in encryption mode.
     #[test]
     fn test_encrypted_lines_still_read_in_encryption_mode() {

@@ -16,6 +16,7 @@ pub struct Person {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub interaction_count: u32,
+    #[serde(serialize_with = "crate::types::ordered_map")]
     pub communication_style: HashMap<String, String>,
     pub tags: Vec<String>,
     pub notes: Vec<String>,

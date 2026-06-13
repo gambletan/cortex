@@ -50,6 +50,7 @@ pub struct MemObject {
     pub privacy: PrivacyLevel,
     pub links: Vec<MemLink>,
     pub tags: Vec<String>,
+    #[serde(serialize_with = "ordered_map")]
     pub metadata: HashMap<String, serde_json::Value>,
     /// SHA-256 hash of content for deduplication.
     #[serde(default)]
@@ -402,6 +403,25 @@ impl MemObjectBuilder {
             namespace: self.namespace,
         }
     }
+}
+
+/// Serde helper: serialize a `HashMap` with keys in sorted order.
+///
+/// `HashMap` iteration order is randomized per process, so its serde_json output is
+/// non-deterministic. Anything that hashes or signs a serialized object containing one
+/// (e.g. the sync oplog's per-operation HMAC) would then compute a different digest on
+/// every device, silently rejecting legitimate data as tampered. Emitting keys in sorted
+/// order makes serialization canonical. Empty maps serialize identically to the default,
+/// so this is backward-compatible with already-persisted data.
+pub(crate) fn ordered_map<S, K, V>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    K: serde::Serialize + Ord,
+    V: serde::Serialize,
+{
+    use serde::Serialize;
+    let ordered: std::collections::BTreeMap<_, _> = map.iter().collect();
+    ordered.serialize(serializer)
 }
 
 /// Serde helper: serialize Arc<Vec<f32>> as Option<Vec<f32>>.
