@@ -151,6 +151,7 @@ let report = cortex.run_consolidation()?;
 
 ## See also
 
+- [vs-other-memory.md](vs-other-memory.md) — migration surface vs mem0 / Zep / LangMem / a text file
 - [integrations.md](integrations.md) — framework integration (Python SDK, MCP, HTTP)
 - [README.md](../../README.md) — feature comparison and benchmark tables
 - [QUICK_START_PROMPT.md](../../QUICK_START_PROMPT.md) — copy-paste prompt for Claude Code
