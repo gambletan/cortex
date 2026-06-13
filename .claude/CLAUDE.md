@@ -53,13 +53,20 @@ cortex/
 
 ## Testing Standards
 
-All changes must pass:
+All changes must pass the **full workspace suite** (`--lib` alone silently skips
+integration tests and has masked a red CI before):
 ```bash
-cargo test --lib                    # Unit tests (125+ tests)
-cargo test --lib sync::*            # Sync tests specifically
+cargo test --workspace --exclude cortex-python --exclude cortex-wasm
 ```
 
 No test regressions allowed. If a test fails due to your change, fix it before committing.
+
+**Test isolation (mandatory for iterations):** acceptance/black-box tests are written by a
+**context-isolated subagent** that sees only the design doc, tool schemas, and public docs —
+never the implementation diff or the implementer's unit tests. The implementer writes unit
+tests; the isolated agent writes acceptance tests; adversarial review is a third independent
+context. Rationale: the implementer's tests inherit the implementation's assumptions
+(运动员不能当裁判) — Iteration 17's stale-cache privacy bug was found exactly this way.
 
 ## Commit Message Format
 
