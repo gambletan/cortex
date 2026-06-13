@@ -67,17 +67,25 @@ green). The real gap to "most useful" is **what gets recalled once the store gro
 thousands of memories**. LoCoMo: 73.7% overall vs Backboard's 90%; multi-hop is the
 weakest category (59.5%). Recall quality is now the bottleneck, not infrastructure.
 
-**Workstreams (in order):**
-1. **Graph-edge re-ranking** (Iteration 18) — traverse relationship/link edges as a
-   recall signal alongside cosine similarity; directly targets the multi-hop gap.
-2. **Embedding upgrade path** — pluggable embedder with a better default model;
-   measure on LoCoMo before/after.
-3. **Entity disambiguation** — same-name people/things confuse fact expansion at scale.
-4. **Recall eval harness in CI** — LoCoMo subset as a regression gate so retrieval
-   quality can never silently rot (same lesson as the sync tests).
+**Measured 2026-06-13 (see docs/scale-test-2026-06-13.md).** At ~5K memories: **lexical
+recall 100%, paraphrase (zero-overlap) recall ~40%.** Controlled probes pinpoint the cause:
+ranking is fine (recalled needles all land at rank 0), candidate-pool size is not it
+(limit 10→100 adds zero hits) — the bottleneck is **candidate recall**: the embedding
+model + HNSW beam can't place hard paraphrases near their answers in vector space at scale.
 
-**Target: LoCoMo overall ≥ 80%, multi-hop ≥ 70%.** Acceptance tests for each workstream
-are written by a context-isolated subagent per the testing protocol in .claude/CLAUDE.md.
+**Workstreams (re-ordered by the scale-test diagnosis):**
+1. **Stronger embedding model** (Iteration 18, biggest lever) — pluggable embedder + better
+   default (bge-small / gte-small / e5-small); measure on the paraphrase set + LoCoMo.
+2. **HNSW ef_search** — `search_inner_readonly` uses `Search::default()`; raise/expose the
+   beam (cheap; the depth probe implicates the beam, not the take-limit).
+3. **Graph-edge re-ranking** — traverse relationship/link edges to rescue multi-hop.
+4. **Hybrid fusion tuning** — RRF-style FTS+vector fusion so a paraphrase miss is saved by
+   any shared token (lexical is already 100%).
+5. **Recall eval harness in CI** — the paraphrase set + a LoCoMo subset as a regression gate.
+
+**Target: paraphrase recall@10 ≥ 75% at 5K (from ~40%), LoCoMo overall ≥ 80%, multi-hop ≥ 70%.**
+Acceptance tests for each workstream are written by a context-isolated subagent per the
+testing protocol in .claude/CLAUDE.md.
 
 ## Priority 1b (shipped) — Iteration 15: Key Rotation / Forward Secrecy  🔐
 
