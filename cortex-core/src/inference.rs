@@ -814,36 +814,25 @@ fn first_clause(text: &str) -> &str {
 
 /// Curated high-precision relational verbs between two proper-noun entities.
 /// Ordered longest-first so "is hosted in" matches before "in"-like fragments.
+// Deliberately narrow: ONLY employment, all normalized to `works_at` so a job change
+// (same person, new employer) supersedes the old employer in the contradiction path.
+// Longest phrases first so "now works at" wins over "works at".
+//
+// The generic technical-relation verbs (runs on / hosted in / part of / manages / uses /
+// …) were removed 2026-06-13: they were added to feed multi-hop retrieval, which they did
+// NOT measurably improve (docs/multihop-finding-2026-06-13.md), and they produced
+// false-positive "facts" from ordinary tech prose ("Python runs on Linux",
+// "Docker is part of the stack") that then polluted the LLM context. A
+// proper-noun-pair pattern cannot tell a personal fact from general-knowledge prose, so we
+// keep only the employment verbs, where both sides being proper nouns (Person + Org) is a
+// strong enough signal in practice.
 const ENTITY_RELATION_VERBS: &[(&str, &str)] = &[
-    // Employment — all normalized to `works_at` so a job change (same person, new
-    // employer) is detected as a contradiction that supersedes the old employer.
-    // Longest phrases first so "now works at" wins over "works at".
     ("now works at", "works_at"),
     ("now works for", "works_at"),
     ("currently works at", "works_at"),
     ("works at", "works_at"),
     ("works for", "works_at"),
     ("joined", "works_at"),
-    ("is hosted in", "hosted_in"),
-    ("is hosted on", "hosted_on"),
-    ("is located in", "located_in"),
-    ("is part of", "part_of"),
-    ("is powered by", "powered_by"),
-    ("is managed by", "managed_by"),
-    ("is owned by", "owned_by"),
-    ("reports to", "reports_to"),
-    ("depends on", "depends_on"),
-    ("connects to", "connects_to"),
-    ("belongs to", "belongs_to"),
-    ("runs on", "runs_on"),
-    ("hosted in", "hosted_in"),
-    ("powered by", "powered_by"),
-    ("managed by", "managed_by"),
-    ("located in", "located_in"),
-    ("part of", "part_of"),
-    ("manages", "manages"),
-    ("owns", "owns"),
-    ("uses", "uses"),
 ];
 
 /// Extract third-party relations of the form `<ProperNoun> <verb> <ProperNoun>`
@@ -1033,34 +1022,46 @@ mod tests {
     }
 
     #[test]
-    fn entity_relation_extraction_builds_typed_edges() {
+    fn entity_relation_extraction_builds_employment_edges() {
         let has = |k: &InferredKnowledge, s: &str, p: &str, o: &str| {
             k.facts.iter().any(|f| f.subject == s && f.predicate == p && f.object == o)
         };
 
-        let k = extract("The Helios project runs on the Aurora database.");
-        assert!(has(&k, "Helios", "runs_on", "Aurora"), "facts: {:?}", k.facts);
+        let k = extract("Sarah works at Stripe.");
+        assert!(has(&k, "Sarah", "works_at", "Stripe"), "facts: {:?}", k.facts);
 
-        let k = extract("The Aurora database is hosted in the Frankfurt datacenter.");
-        assert!(has(&k, "Aurora", "hosted_in", "Frankfurt"), "facts: {:?}", k.facts);
+        let k = extract("Sarah now works at Anthropic.");
+        assert!(has(&k, "Sarah", "works_at", "Anthropic"), "facts: {:?}", k.facts);
+        // Overlapping "now works at" ⊃ "works at" must not double-emit.
+        assert_eq!(
+            k.facts.iter().filter(|f| f.predicate == "works_at").count(),
+            1,
+            "duplicate works_at emitted: {:?}",
+            k.facts
+        );
 
-        let k = extract("Marisol manages the Helios project.");
-        assert!(has(&k, "Marisol", "manages", "Helios"), "facts: {:?}", k.facts);
+        let k = extract("Bob joined Google.");
+        assert!(has(&k, "Bob", "works_at", "Google"), "facts: {:?}", k.facts);
     }
 
     #[test]
-    fn entity_relation_extraction_is_high_precision() {
-        // Lowercase prose / no proper-noun pair must NOT produce a relation fact.
-        let k = extract("the team uses the new tool for everything");
-        assert!(
-            !k.facts.iter().any(|f| f.predicate == "uses"),
-            "should not extract from lowercase prose: {:?}",
-            k.facts
-        );
-        // First-person statements stay the user's, not entity relations.
-        let k = extract("I use Notion every day");
-        assert!(!k.facts.iter().any(|f| f.subject == "User" && f.predicate == "uses" && f.object == "Notion")
-            || k.preferences.iter().any(|p| p.value.contains("notion")));
+    fn entity_relation_extraction_does_not_mine_tech_prose() {
+        // The narrowed extractor must NOT turn general-knowledge tech prose into facts —
+        // this was the regression that polluted the LLM context (Iteration 20 fix).
+        for prose in [
+            "The Helios project runs on the Aurora database.",
+            "Python runs on Linux and macOS.",
+            "Docker is part of our deployment stack.",
+            "React works with TypeScript nicely.",
+            "the team uses the new tool for everything",
+        ] {
+            let k = extract(prose);
+            assert!(
+                k.facts.is_empty(),
+                "tech/general prose should yield no entity-relation facts: {prose:?} -> {:?}",
+                k.facts
+            );
+        }
     }
 
     #[test]

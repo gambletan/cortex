@@ -75,25 +75,37 @@ fn job_change_supersedes_old_employer() {
 }
 
 #[test]
-fn distinct_predicates_do_not_falsely_contradict() {
+fn different_people_employment_do_not_falsely_contradict() {
     let cortex = Cortex::in_memory().unwrap();
-    // "works at" (employment) and "is located in" (location) are different predicates
-    // about the same subject — not a contradiction.
-    cortex
-        .ingest("Helios runs on Aurora", "test", None, None, None)
-        .unwrap();
-    cortex
-        .ingest("Helios is part of Northwind", "test", None, None, None)
-        .unwrap();
-    let facts = cortex.query_facts("Helios").unwrap();
-    // Both relations coexist (runs_on + part_of); neither was wrongly superseded.
-    let preds: Vec<String> = facts
-        .into_iter()
-        .filter_map(|m| match m.content {
-            MemContent::Fact { ref predicate, .. } => Some(predicate.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(preds.iter().any(|p| p == "runs_on"), "runs_on lost: {preds:?}");
-    assert!(preds.iter().any(|p| p == "part_of"), "part_of lost: {preds:?}");
+    cortex.ingest("Sarah works at Stripe", "test", None, None, None).unwrap();
+    cortex.ingest("Bob works at Google", "test", None, None, None).unwrap();
+    // Different subjects → no contradiction; each keeps their employer.
+    assert!(employer(&cortex, "Sarah").iter().any(|o| o == "Stripe"));
+    assert!(employer(&cortex, "Bob").iter().any(|o| o == "Google"));
+}
+
+#[test]
+fn tech_prose_does_not_create_false_facts() {
+    // Regression guard for the cortex-user-skeptic HIGH finding: ordinary tech prose
+    // must not pollute the fact store with entity-relation false positives.
+    let cortex = Cortex::in_memory().unwrap();
+    for prose in [
+        "Python runs on Linux",
+        "The Helios project runs on the Aurora database",
+        "Docker is part of our stack",
+    ] {
+        cortex.ingest(prose, "test", None, None, None).unwrap();
+    }
+    for entity in ["Python", "Helios", "Aurora", "Docker"] {
+        let facts = cortex.query_facts(entity).unwrap();
+        let rel_facts: Vec<_> = facts
+            .iter()
+            .filter(|m| matches!(&m.content, MemContent::Fact { .. }))
+            .collect();
+        assert!(
+            rel_facts.is_empty(),
+            "{entity}: tech prose created false facts: {:?}",
+            rel_facts.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
 }

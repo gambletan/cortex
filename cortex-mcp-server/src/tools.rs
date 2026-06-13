@@ -156,6 +156,10 @@ fn list_tools_builtin() -> Value {
                     "namespace": {
                         "type": "string",
                         "description": "Filter by namespace for isolation (optional)"
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Exclude facts/preferences below this confidence (0.0-1.0, default 0.3) — keeps low-confidence or superseded facts out of the injected context"
                     }
                 }
             }
@@ -755,9 +759,14 @@ fn tool_memory_context(cortex: &Arc<Cortex>, args: &Value) -> Result<String, Str
     let person_id = get_str(args, "person_id")
         .and_then(|s| Uuid::parse_str(s).ok());
     let namespace = get_str(args, "namespace");
+    // Optional floor (0.0–1.0): exclude low-confidence / superseded facts from context.
+    let min_confidence = args
+        .get("min_confidence")
+        .and_then(|v| v.as_f64())
+        .map(|v| (v as f32).clamp(0.0, 1.0));
 
     let context = cortex
-        .get_context_with_namespace(max_tokens, channel, person_id, namespace)
+        .get_context_filtered(max_tokens, channel, person_id, namespace, min_confidence)
         .map_err(|e| e.to_string())?;
 
     Ok(context)

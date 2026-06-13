@@ -1039,6 +1039,21 @@ impl Cortex {
         person_id: Option<Uuid>,
         namespace: Option<&str>,
     ) -> Result<String, CortexError> {
+        self.get_context_filtered(max_tokens, channel, person_id, namespace, None)
+    }
+
+    /// Like [`get_context_with_namespace`], but with an optional minimum fact-confidence
+    /// floor: facts/preferences below `min_fact_confidence` are kept out of the injected
+    /// context (default 0.3 when `None`). Lets a caller exclude low-confidence or
+    /// superseded-and-decayed facts from what the LLM sees.
+    pub fn get_context_filtered(
+        &self,
+        max_tokens: usize,
+        channel: Option<&str>,
+        person_id: Option<Uuid>,
+        namespace: Option<&str>,
+        min_fact_confidence: Option<f32>,
+    ) -> Result<String, CortexError> {
         self.ensure_index_loaded()?;
         let mut config = ContextConfig::new(max_tokens);
         if let Some(ch) = channel {
@@ -1049,6 +1064,9 @@ impl Cortex {
         }
         if let Some(ns) = namespace {
             config = config.with_namespace(ns);
+        }
+        if let Some(mc) = min_fact_confidence {
+            config = config.with_min_fact_confidence(mc);
         }
         generate_context(&config, &self.storage, &self.index)
     }

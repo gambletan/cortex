@@ -727,11 +727,14 @@ fn main() {
 }
 
 fn run_mcp_server(cli_db_path: Option<&str>) {
+    // Honor RUST_LOG when set (so users can silence logs, e.g. RUST_LOG=off in CI/
+    // pipelines); default to info only when it is unset. The previous code appended a
+    // hardcoded `cortex_mcp_server=info` directive that, being more specific, overrode
+    // RUST_LOG entirely — INFO/WARN leaked no matter what the user set.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("cortex_mcp_server=info"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("cortex_mcp_server=info".parse().unwrap()),
-        )
+        .with_env_filter(env_filter)
         .with_writer(io::stderr)
         .init();
 

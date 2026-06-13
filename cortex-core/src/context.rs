@@ -28,6 +28,12 @@ pub struct ContextConfig {
     /// enforced here, at the export boundary — not in the storage query layer, which always
     /// returns the owner's own data faithfully.
     pub include_private: bool,
+    /// Minimum confidence (fact salience base score, `0.0–1.0`) for a fact/preference to be
+    /// injected into the generated context. Facts below this floor are still stored and
+    /// queryable, but kept OUT of the authoritative "Known Facts" the LLM sees — so a
+    /// superseded employer decayed to 0.21 by a job change, or a low-confidence guess,
+    /// does not get presented to the model as current truth. Default `0.3`.
+    pub min_fact_confidence: f32,
 }
 
 impl Default for ContextConfig {
@@ -42,6 +48,7 @@ impl Default for ContextConfig {
             person_id: None,
             namespace: None,
             include_private: true,
+            min_fact_confidence: 0.3,
         }
     }
 }
@@ -84,6 +91,12 @@ impl ContextConfig {
     /// Set whether Private memories are included in the generated context.
     pub fn with_include_private(mut self, include_private: bool) -> Self {
         self.include_private = include_private;
+        self
+    }
+
+    /// Set the minimum fact/preference confidence injected into the context.
+    pub fn with_min_fact_confidence(mut self, min: f32) -> Self {
+        self.min_fact_confidence = min.clamp(0.0, 1.0);
         self
     }
 }
@@ -197,10 +210,18 @@ pub fn generate_context(
             }
             match &mem.content {
                 MemContent::Preference { key, value, confidence } => {
+                    // Confidence floor: keep low-confidence/decayed entries out of the
+                    // authoritative context the LLM sees (still stored + queryable).
+                    if *confidence < config.min_fact_confidence {
+                        continue;
+                    }
                     let line = format!("- {} = {} (confidence: {:.0}%)\n", key, value, confidence * 100.0);
                     pref_sec.push(mem.salience.base_score, line);
                 }
                 MemContent::Fact { subject, predicate, object } => {
+                    if mem.salience.base_score < config.min_fact_confidence {
+                        continue;
+                    }
                     let line = format!("- {} {} {} (confidence: {:.0}%)\n",
                         subject, predicate, object, mem.salience.base_score * 100.0);
                     fact_sec.push(mem.salience.base_score, line);
