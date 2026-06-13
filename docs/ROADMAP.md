@@ -60,7 +60,26 @@ This is the prioritized forward plan. The per-iteration security audits
 
 ---
 
-## Priority 1 — Iteration 15: Key Rotation / Forward Secrecy  🔐 FLAGSHIP
+## Priority 1 — Retrieval Quality  🎯 NEW FLAGSHIP (from 2026-06-13)
+
+**Why now:** storage, sync, and security are mature (iterations 11–17 + dogfooding all
+green). The real gap to "most useful" is **what gets recalled once the store grows to
+thousands of memories**. LoCoMo: 73.7% overall vs Backboard's 90%; multi-hop is the
+weakest category (59.5%). Recall quality is now the bottleneck, not infrastructure.
+
+**Workstreams (in order):**
+1. **Graph-edge re-ranking** (Iteration 18) — traverse relationship/link edges as a
+   recall signal alongside cosine similarity; directly targets the multi-hop gap.
+2. **Embedding upgrade path** — pluggable embedder with a better default model;
+   measure on LoCoMo before/after.
+3. **Entity disambiguation** — same-name people/things confuse fact expansion at scale.
+4. **Recall eval harness in CI** — LoCoMo subset as a regression gate so retrieval
+   quality can never silently rot (same lesson as the sync tests).
+
+**Target: LoCoMo overall ≥ 80%, multi-hop ≥ 70%.** Acceptance tests for each workstream
+are written by a context-isolated subagent per the testing protocol in .claude/CLAUDE.md.
+
+## Priority 1b (shipped) — Iteration 15: Key Rotation / Forward Secrecy  🔐
 
 **Why now:** the single deferred HIGH issue. The `key_version` field already exists in
 `EncryptionManifest` and is read in `sync/crypto.rs::derive_key`, but it is a no-op today — there
