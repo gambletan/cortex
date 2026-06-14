@@ -16,16 +16,15 @@ jobs:
       # Don't let one target cancel the others mid-build.
       fail-fast: false
       matrix:
-        # Targets that build cleanly today. aarch64-linux (cross) and windows-msvc are
-        # omitted — those users install from the sdist, which always ships. Add them back
-        # once their native-dep cross-builds are sorted (tracked in docs/ROADMAP.md).
+        # Targets that build cleanly AND have available runners today. Omitted: aarch64-linux
+        # & windows-msvc (native-dep cross-builds), and macos-13/x86_64 (the Intel-mac runner
+        # is retired and queues forever, blocking the whole release). All omitted platforms
+        # install from the sdist, which always ships. Tracked in docs/ROADMAP.md.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
