@@ -15,11 +15,28 @@ _Private. Free. Local. — a memory engine for personal AI agents._
 
 **Your AI's memory lives on your device — your data never leaves, never costs, never spies.** Pure Rust. 3.8MB binary. No third-party servers in the data path, zero telemetry, zero cost. Syncs through your own cloud storage. (On-device semantic search downloads a ~30MB model once on first use, then runs fully offline — or go 100% offline with `CORTEX_NO_EMBEDDINGS=1`. See [Security & Privacy](#security--privacy).)
 
-> **Philosophy:** Your memories are yours — not a cloud provider's training data, not a startup's monetization asset, not a government's surveillance target. Cortex runs 100% on your hardware, stores everything in your own database, and syncs only through your own cloud storage (iCloud, Google Drive, OneDrive, Dropbox). No middleman ever sees your data. No API key required. No account to create. Just plug it into your AI agent and it remembers — privately, permanently, and at sub-millisecond speed.
+**What you get**
 
-LLMs start blank every session. Your assistant forgets your name, your preferences, the conversation you had yesterday, the decision you made last week. Current "memory" solutions are flat text files, keyword grep, or cloud APIs that add 200-500ms latency, charge you for the privilege, and send your personal data to someone else's server.
+- 🔒 **Private by default** — memories live in a local SQLite file, never leave your device, zero telemetry (CI-enforced).
+- 🧠 **Real memory, not a text file** — 4 tiers, multi-signal retrieval, self-correcting Bayesian beliefs, a cross-channel people graph.
+- ⚡ **Sub-millisecond** — 156µs ingest, 568µs search. ~528× faster than cloud memory APIs, with no network round-trip.
+- 🔌 **Drop-in for any agent** — one MCP server gives Claude Code / Claude Desktop (or any MCP client) persistent cross-session memory.
+- ☁️ **Yours across devices** — optional end-to-end-encrypted sync through *your own* iCloud / Drive / Dropbox. No server of ours, ever.
 
-Cortex fixes this. It gives your AI a structured, queryable, self-evolving long-term memory that persists across sessions, channels, and contexts — with Bayesian beliefs that self-correct, a people graph that resolves identities across platforms, and sub-millisecond performance on everything. All running locally, all yours.
+**See it remember across sessions — ~30 seconds:**
+
+```bash
+brew install gambletan/tap/cortex-mcp-server          # or: cargo build --release -p cortex-mcp-server
+claude mcp add cortex-memory -- cortex-mcp-server ~/.cortex/memory.db
+```
+
+Tell Claude *"remember I deploy on Fly.io and always run tests before pushing."* Open a **brand-new** session and ask *"how do I deploy this project?"* — it answers from memory, 100% on your machine.
+
+> ⭐ If that's useful, **[give it a star](https://github.com/gambletan/cortex/stargazers)** — it helps others find a memory engine that respects their privacy.
+
+---
+
+LLMs start blank every session — they forget your name, your preferences, yesterday's conversation, last week's decision. The usual fixes are flat text files (no ranking, no decay), keyword grep, or cloud APIs that add 200–500ms, charge you, and ship your personal data to someone else's server. Cortex gives your AI structured, self-evolving long-term memory that persists across sessions and channels — **all local, all yours.** Your memories are not a cloud provider's training data, a startup's monetization asset, or a surveillance target.
 
 ### Cortex vs Mem0 vs OpenAI Memory
 
