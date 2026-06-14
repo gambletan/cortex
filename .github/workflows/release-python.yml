@@ -13,18 +13,19 @@ jobs:
     name: Build wheels (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # Don't let one target cancel the others mid-build.
+      fail-fast: false
       matrix:
+        # Targets that build cleanly today. aarch64-linux (cross) and windows-msvc are
+        # omitted — those users install from the sdist, which always ships. Add them back
+        # once their native-dep cross-builds are sorted (tracked in docs/ROADMAP.md).
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: macos-13
             target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
