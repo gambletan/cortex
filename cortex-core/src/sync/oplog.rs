@@ -448,6 +448,61 @@ mod tests {
         assert!(ops.is_empty(), "no plaintext op may be replayed in encryption mode");
     }
 
+    /// SECURITY/INTEGRITY: a memory carrying multiple metadata entries must survive the
+    /// write→encrypt→read→HMAC-verify round-trip. The operation HMAC is computed on write by
+    /// serializing the op, and re-verified on read by RE-serializing the parsed op. If any
+    /// map field (e.g. `MemObject.metadata`) serializes in a nondeterministic order, the
+    /// recomputed HMAC won't match and the legitimate op is silently dropped — and 5 such
+    /// consecutive drops hard-abort the entire sync (CORRUPTION_THRESHOLD). With ≥2 keys the
+    /// odds of write-order == read-order by chance are ~1/n!, so this reliably catches the bug.
+    #[test]
+    fn test_op_with_many_metadata_keys_survives_hmac_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let device_dir = tmp.path().join("device-a");
+        let ctx = std::sync::Arc::new(test_crypto());
+
+        // Build a memory with many metadata keys, then sync it under encryption.
+        let mut metadata = std::collections::BTreeMap::new();
+        for i in 0..16 {
+            metadata.insert(format!("key_{:02}", i), serde_json::json!({ "v": i, "nested": i * 2 }));
+        }
+        let mem = MemObject {
+            id: Uuid::new_v4(),
+            tier: MemoryTier::Episodic,
+            content: MemContent::Text("memory with rich metadata".into()),
+            embedding: None,
+            temporal: TemporalInfo::now(),
+            source: MemSource::new("test"),
+            salience: Salience::default(),
+            privacy: PrivacyLevel::Private,
+            links: Vec::new(),
+            tags: Vec::new(),
+            metadata,
+            content_hash: None,
+            namespace: None,
+        };
+        let op = SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(1000, 0, "device-a"),
+            payload: SyncPayload::MemoryUpsert { memory: mem },
+            hmac: None,
+        };
+        let op_id = op.op_id;
+
+        let mut writer = OpLogWriter::new(device_dir.clone(), Some(ctx.clone())).unwrap();
+        writer.append(op).unwrap();
+
+        let files = list_oplog_files(&device_dir).unwrap();
+        let (ops, _) = read_oplog(&files[0], 0, Some(&ctx)).unwrap();
+
+        assert_eq!(
+            ops.len(),
+            1,
+            "op with multiple metadata keys was dropped — HMAC serialization is nondeterministic"
+        );
+        assert_eq!(ops[0].op_id, op_id);
+    }
+
     /// Legitimately encrypted lines must still be read back correctly in encryption mode.
     #[test]
     fn test_encrypted_lines_still_read_in_encryption_mode() {
@@ -530,7 +585,7 @@ mod tests {
             privacy: PrivacyLevel::Private,
             links: Vec::new(),
             tags: Vec::new(),
-            metadata: std::collections::HashMap::new(),
+            metadata: std::collections::BTreeMap::new(),
             content_hash: None,
             namespace: None,
         };

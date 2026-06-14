@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -50,7 +50,10 @@ pub struct MemObject {
     pub privacy: PrivacyLevel,
     pub links: Vec<MemLink>,
     pub tags: Vec<String>,
-    pub metadata: HashMap<String, serde_json::Value>,
+    /// `BTreeMap` (not `HashMap`) so serialization is key-order-deterministic — the sync
+    /// oplog HMAC re-serializes this map on read to verify integrity, and a nondeterministic
+    /// order would make legitimate multi-key memories fail verification (and halt sync).
+    pub metadata: BTreeMap<String, serde_json::Value>,
     /// SHA-256 hash of content for deduplication.
     #[serde(default)]
     pub content_hash: Option<String>,
@@ -313,7 +316,7 @@ pub struct MemObjectBuilder {
     salience: Salience,
     privacy: PrivacyLevel,
     tags: Vec<String>,
-    metadata: HashMap<String, serde_json::Value>,
+    metadata: BTreeMap<String, serde_json::Value>,
     event_time: Option<DateTime<Utc>>,
     durability: MemoryDurability,
     namespace: Option<String>,
@@ -329,7 +332,7 @@ impl MemObjectBuilder {
             salience: Salience::default(),
             privacy: PrivacyLevel::default(),
             tags: Vec::new(),
-            metadata: HashMap::new(),
+            metadata: BTreeMap::new(),
             event_time: None,
             durability: MemoryDurability::default(),
             namespace: None,

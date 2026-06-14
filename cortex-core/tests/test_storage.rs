@@ -493,7 +493,7 @@ fn test_people_crud() {
         first_seen: Utc::now(),
         last_seen: Utc::now(),
         interaction_count: 1,
-        communication_style: std::collections::HashMap::new(),
+        communication_style: std::collections::BTreeMap::new(),
         tags: vec!["team".into()],
         notes: vec![],
     };

@@ -422,7 +422,7 @@ mod tests {
             first_seen: chrono::DateTime::from_timestamp_millis(first_ms).unwrap(),
             last_seen: chrono::DateTime::from_timestamp_millis(last_ms).unwrap(),
             interaction_count: count,
-            communication_style: std::collections::HashMap::new(),
+            communication_style: std::collections::BTreeMap::new(),
             tags: Vec::new(),
             notes: Vec::new(),
         };

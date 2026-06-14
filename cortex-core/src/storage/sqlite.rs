@@ -222,8 +222,8 @@ impl SqliteStorage {
         } else {
             Self::json_col(8, &tags_json)?
         };
-        let metadata: std::collections::HashMap<String, serde_json::Value> = if metadata_json == "{}" {
-            std::collections::HashMap::new()
+        let metadata: std::collections::BTreeMap<String, serde_json::Value> = if metadata_json == "{}" {
+            std::collections::BTreeMap::new()
         } else {
             Self::json_col(9, &metadata_json)?
         };
@@ -281,7 +281,7 @@ fn serialize_tags(tags: &[String]) -> String {
 
 /// Serialize metadata, returning fast-path constant for empty.
 #[inline]
-fn serialize_metadata(metadata: &std::collections::HashMap<String, serde_json::Value>) -> String {
+fn serialize_metadata(metadata: &std::collections::BTreeMap<String, serde_json::Value>) -> String {
     if metadata.is_empty() {
         DEFAULT_METADATA_JSON.to_string()
     } else {

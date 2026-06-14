@@ -983,7 +983,7 @@ fn test_person_upsert_creates_new() {
         first_seen: chrono::Utc::now(),
         last_seen: chrono::Utc::now(),
         interaction_count: 3,
-        communication_style: std::collections::HashMap::new(),
+        communication_style: std::collections::BTreeMap::new(),
         tags: vec![],
         notes: vec![],
     };

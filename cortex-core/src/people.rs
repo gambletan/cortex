@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 use crate::storage::traits::StorageBackend;
@@ -16,7 +16,10 @@ pub struct Person {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub interaction_count: u32,
-    pub communication_style: HashMap<String, String>,
+    /// `BTreeMap` for deterministic serialization — this rides in the sync oplog whose
+    /// per-op HMAC re-serializes the struct on read; a nondeterministic map order would
+    /// fail integrity verification for any person with ≥2 communication-style entries.
+    pub communication_style: BTreeMap<String, String>,
     pub tags: Vec<String>,
     pub notes: Vec<String>,
 }
@@ -80,7 +83,7 @@ impl<'a> PeopleGraph<'a> {
             first_seen: now,
             last_seen: now,
             interaction_count: 0,
-            communication_style: HashMap::new(),
+            communication_style: BTreeMap::new(),
             tags: Vec::new(),
             notes: Vec::new(),
         };
