@@ -1,8 +1,8 @@
 {
   "name": "@cortex-ai-memory/cortex-memory",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "type": "module",
-  "description": "Cortex persistent memory engine for OpenClaw — 4-tier architecture with Bayesian beliefs and people graph",
+  "description": "Cortex persistent memory engine for OpenClaw \u2014 4-tier architecture with Bayesian beliefs and people graph",
   "license": "MIT",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
