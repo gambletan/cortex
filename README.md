@@ -295,6 +295,21 @@ cargo build --release -p cortex-mcp-server
 cp target/release/cortex-mcp-server ~/.local/bin/
 ```
 
+### Official packages (avoid look-alikes)
+
+Cortex is published under the **`cortex-ai-memory`** name. Several similarly-named
+packages on npm/PyPI are **not affiliated** with this project — use exactly these:
+
+| Ecosystem | Official package | Use for |
+|---|---|---|
+| Binary / MCP server | GitHub Releases, or `brew install gambletan/tap/cortex-mcp-server` | the memory engine (primary) |
+| PyPI | **`cortex-ai-memory`** | Python bindings |
+| npm | **`@cortex-ai-memory/cortex-memory`** (scoped) | OpenClaw memory plugin |
+
+> ⚠️ **Not us:** npm `cortex-mcp`, npm `cortex-ai-memory` (unscoped), PyPI `cortex-memory`.
+> The source of truth is always this repo — `github.com/gambletan/cortex`. When in doubt,
+> the binary from Releases is the canonical install.
+
 ## Quick Start
 
 ```rust
