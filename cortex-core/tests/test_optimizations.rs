@@ -12,6 +12,7 @@ fn test_batch_ingest_basic() {
         .map(|i| BatchIngestItem {
             text: format!("batch memory {}", i),
             channel: "test".into(),
+            privacy: None,
             user_id: None,
             salience_hint: Some(0.6),
             embedding: None,
@@ -37,6 +38,7 @@ fn test_batch_ingest_dedup() {
         BatchIngestItem {
             text: "I love rust".into(),
             channel: "test".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,
@@ -45,6 +47,7 @@ fn test_batch_ingest_dedup() {
         BatchIngestItem {
             text: "I love rust".into(), // exact duplicate within batch
             channel: "test".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,
@@ -60,6 +63,7 @@ fn test_batch_ingest_dedup() {
     let items2 = vec![BatchIngestItem {
         text: "I love rust".into(), // dupe from first batch
         channel: "test".into(),
+        privacy: None,
         user_id: None,
         salience_hint: None,
         embedding: None,
@@ -149,6 +153,43 @@ fn test_near_dedup_opt_in_reinforces_and_distinct_kept() {
 }
 
 #[test]
+fn batch_ingest_honors_privacy_field() {
+    // Parity with single ingest: a batch item marked shared must be syncable; default stays Private.
+    let cortex = Cortex::in_memory().unwrap();
+    let items = vec![
+        BatchIngestItem {
+            text: "shared batch mem".into(),
+            channel: "test".into(),
+            privacy: Some(PrivacyLevel::Shared { scope: "all".into() }),
+            user_id: None,
+            salience_hint: None,
+            embedding: None,
+            namespace: None,
+        },
+        BatchIngestItem {
+            text: "private batch mem".into(),
+            channel: "test".into(),
+            privacy: None,
+            user_id: None,
+            salience_hint: None,
+            embedding: None,
+            namespace: None,
+        },
+    ];
+    cortex.ingest_batch(items).unwrap();
+    let mems = cortex.storage().list_by_tier(MemoryTier::Episodic, 100).unwrap();
+    let is = |needle: &str| {
+        mems.iter()
+            .find(|m| matches!(&m.content, MemContent::Text(t) if t == needle))
+            .unwrap_or_else(|| panic!("missing {needle}"))
+            .privacy
+            .is_syncable()
+    };
+    assert!(is("shared batch mem"), "batch privacy=shared must be syncable");
+    assert!(!is("private batch mem"), "batch default must stay Private (not synced)");
+}
+
+#[test]
 fn test_metrics_tracking() {
     let cortex = Cortex::in_memory().unwrap();
 
@@ -188,6 +229,7 @@ fn test_namespace_isolation() {
         BatchIngestItem {
             text: "ns-a memory".into(),
             channel: "test".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,
@@ -196,6 +238,7 @@ fn test_namespace_isolation() {
         BatchIngestItem {
             text: "ns-b memory".into(),
             channel: "test".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,

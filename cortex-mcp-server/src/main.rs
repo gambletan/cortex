@@ -4,6 +4,10 @@
 //! Tools: memory_ingest, memory_search, memory_context, belief_observe, belief_list,
 //!        person_resolve, fact_add, preference_set
 
+// The built-in tool schema is one large `serde_json::json!([...])` literal; with 30 tools
+// it expands past the default macro recursion limit (128). Raise it for this crate.
+#![recursion_limit = "512"]
+
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 

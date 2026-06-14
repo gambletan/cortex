@@ -50,6 +50,7 @@ fn test_retrieval_cache_invalidated_on_batch_ingest() {
     let items = vec![BatchIngestItem {
         text: "batch cache test".into(),
         channel: "cli".into(),
+        privacy: None,
         user_id: None,
         salience_hint: None,
         embedding: None,
@@ -170,6 +171,7 @@ fn test_retrieve_with_namespace_filtering() {
         BatchIngestItem {
             text: "team alpha work".into(),
             channel: "cli".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,
@@ -178,6 +180,7 @@ fn test_retrieve_with_namespace_filtering() {
         BatchIngestItem {
             text: "team beta work".into(),
             channel: "cli".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,
@@ -210,6 +213,7 @@ fn test_retrieve_without_namespace_returns_all() {
         BatchIngestItem {
             text: "namespaced content".into(),
             channel: "cli".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,
@@ -218,6 +222,7 @@ fn test_retrieve_without_namespace_returns_all() {
         BatchIngestItem {
             text: "global content".into(),
             channel: "cli".into(),
+            privacy: None,
             user_id: None,
             salience_hint: None,
             embedding: None,

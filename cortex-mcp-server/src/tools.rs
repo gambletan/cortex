@@ -430,7 +430,8 @@ fn list_tools_builtin() -> Value {
                                 "channel": { "type": "string", "description": "Source channel" },
                                 "user_id": { "type": "string", "description": "User ID (optional)" },
                                 "salience": { "type": "number", "description": "Importance 0-1 (optional)" },
-                                "namespace": { "type": "string", "description": "Namespace for isolation (optional)" }
+                                "namespace": { "type": "string", "description": "Namespace for isolation (optional)" },
+                                "privacy": { "type": "string", "enum": ["private", "shared", "public"], "description": "Privacy level (optional, default 'private'). Use 'shared'/'public' to sync." }
                             },
                             "required": ["text", "channel"]
                         }
@@ -1158,6 +1159,7 @@ fn tool_memory_ingest_batch(cortex: &Arc<Cortex>, args: &Value) -> Result<String
             salience_hint: item.get("salience").and_then(|v| v.as_f64()).map(|v| v as f32),
             embedding: None,
             namespace: item.get("namespace").and_then(|v| v.as_str()).map(String::from),
+            privacy: parse_privacy(item).ok().flatten(),
         }
     }).collect();
 

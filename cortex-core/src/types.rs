@@ -481,6 +481,7 @@ impl Default for DeduplicationConfig {
 }
 
 /// Item for batch ingest.
+#[derive(Default)]
 pub struct BatchIngestItem {
     pub text: String,
     pub channel: String,
@@ -488,6 +489,9 @@ pub struct BatchIngestItem {
     pub salience_hint: Option<f32>,
     pub embedding: Option<Vec<f32>>,
     pub namespace: Option<String>,
+    /// Privacy level (default Private). Parity with single ingest — without this a batch
+    /// could only ever create Private memories, so batch-ingested data could never sync.
+    pub privacy: Option<PrivacyLevel>,
 }
 
 /// Result of a batch ingest operation.

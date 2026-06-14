@@ -278,6 +278,7 @@ fn test_metrics_comprehensive() {
     let items = vec![BatchIngestItem {
         text: "batch metric".into(),
         channel: "cli".into(),
+        privacy: None,
         user_id: None,
         salience_hint: None,
         embedding: None,
@@ -402,6 +403,7 @@ fn test_batch_ingest_with_user_id() {
         BatchIngestItem {
             text: "from user".into(),
             channel: "slack".into(),
+            privacy: None,
             user_id: Some("U001".into()),
             salience_hint: Some(0.7),
             embedding: None,

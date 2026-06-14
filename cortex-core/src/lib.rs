@@ -887,6 +887,9 @@ impl Cortex {
             if let Some(ref ns) = item.namespace {
                 builder = builder.namespace(ns.clone());
             }
+            if let Some(ref p) = item.privacy {
+                builder = builder.privacy(p.clone());
+            }
             if let Some(ref emb) = embedding {
                 builder = builder.embedding(emb.clone());
             }
