@@ -8,6 +8,11 @@ name = "cortex_ai_memory"
 crate-type = ["cdylib"]
 
 [dependencies]
-cortex-core = { path = "../cortex-core" }
+# default-features = false drops `encrypted-db` (bundled SQLCipher + vendored OpenSSL),
+# which cannot build OpenSSL-from-source inside the manylinux wheel container. The Python
+# wheel therefore uses plain SQLite at rest; the AES-256-GCM *sync* encryption lives in
+# cortex-core proper and is unaffected. (Opt back in with a feature if a wheel ever needs
+# SQLCipher and the build env supports it.)
+cortex-core = { path = "../cortex-core", default-features = false }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 uuid = { version = "1", features = ["v4"] }
