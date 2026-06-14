@@ -129,6 +129,15 @@ pub struct Salience {
 
 impl Salience {
     pub fn new(base_score: f32) -> Self {
+        // Sanitize at the boundary: a non-finite or out-of-range score (e.g. from a
+        // caller's salience/confidence arithmetic) must never enter ranking or storage —
+        // NaN poisons sort comparisons and JSON round-trips. NaN -> 0.5 (no signal);
+        // ±Inf and out-of-range clamp to [0,1].
+        let base_score = if base_score.is_nan() {
+            0.5
+        } else {
+            base_score.clamp(0.0, 1.0)
+        };
         Self {
             base_score,
             emotional_weight: 1.0,
@@ -551,5 +560,22 @@ mod zeroize_drop_tests {
 
         // Cleanup: actually drop (frees the buffer).
         unsafe { ManuallyDrop::drop(&mut content) };
+    }
+}
+
+#[cfg(test)]
+mod salience_sanitize_tests {
+    use super::Salience;
+
+    #[test]
+    fn non_finite_and_out_of_range_scores_are_sanitized() {
+        // NaN/Inf must never reach ranking or JSON round-trips.
+        assert_eq!(Salience::new(f32::NAN).base_score, 0.5);
+        assert_eq!(Salience::new(f32::INFINITY).base_score, 1.0);
+        assert_eq!(Salience::new(f32::NEG_INFINITY).base_score, 0.0);
+        assert_eq!(Salience::new(2.5).base_score, 1.0);
+        assert_eq!(Salience::new(-1.0).base_score, 0.0);
+        // Valid scores pass through unchanged.
+        assert_eq!(Salience::new(0.73).base_score, 0.73);
     }
 }

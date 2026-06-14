@@ -133,6 +133,15 @@ pub struct MetricsSnapshot {
 /// Default interval: auto-run consolidation every N ingests.
 const DEFAULT_AUTO_CONSOLIDATION_INTERVAL: u64 = 100;
 
+/// Log (never silently swallow) a failed derived write during ingest. The primary memory
+/// is already stored by the time these run; a dropped fact/preference/belief used to vanish
+/// with no trace and the ingest still reported success. At minimum it must be observable.
+fn warn_on_write_err<T>(kind: &str, r: Result<T, CortexError>) {
+    if let Err(e) = r {
+        tracing::warn!(error = %e, kind, "derived write failed during ingest (memory stored, this side-effect was not)");
+    }
+}
+
 /// Upper bound on the confidence assigned to auto-extracted relationship facts. Kept
 /// strictly below the default context-injection floor (`ContextConfig::min_fact_confidence`
 /// = 0.3) so single-sentence relationship guesses stay queryable but never auto-inject
@@ -764,19 +773,19 @@ impl Cortex {
                         );
                     }
                 } else {
-                    let _ = semantic.add_fact(
+                    warn_on_write_err("fact", semantic.add_fact(
                         &fact.subject, &fact.predicate, &fact.object,
                         fact.confidence,
                         MemSource::new(channel),
                         None,
-                    );
+                    ));
                 }
             }
         }
 
         // ── Auto-extract preferences ─────────────────────────────────────
         for pref in &inferred.preferences {
-            let _ = semantic.add_preference(&pref.key, &pref.value, pref.confidence);
+            warn_on_write_err("preference", semantic.add_preference(&pref.key, &pref.value, pref.confidence));
         }
 
         // ── Auto-extract relationships (bidirectional) ─────────────────
@@ -791,14 +800,14 @@ impl Cortex {
         let bidirectional = relationship::with_inverses(&relationships);
         for rel in &bidirectional {
             let speculative = (rel.confidence * 0.3).min(SPECULATIVE_RELATION_MAX_CONFIDENCE);
-            let _ = semantic.add_fact(
+            warn_on_write_err("relationship", semantic.add_fact(
                 &rel.person_a,
                 &rel.relation,
                 &rel.person_b,
                 speculative,
                 MemSource::new(channel),
                 None,
-            );
+            ));
             tracing::info!(
                 a = %rel.person_a,
                 relation = %rel.relation,
@@ -942,15 +951,15 @@ impl Cortex {
             let semantic = SemanticStore::new(&self.storage, &self.index);
             for (channel, inferred) in &batch_inferred {
                 for fact in &inferred.facts {
-                    let _ = semantic.add_fact(
+                    warn_on_write_err("fact", semantic.add_fact(
                         &fact.subject, &fact.predicate, &fact.object,
                         fact.confidence,
                         MemSource::new(channel.as_str()),
                         None,
-                    );
+                    ));
                 }
                 for pref in &inferred.preferences {
-                    let _ = semantic.add_preference(&pref.key, &pref.value, pref.confidence);
+                    warn_on_write_err("preference", semantic.add_preference(&pref.key, &pref.value, pref.confidence));
                 }
             }
         }
@@ -1487,13 +1496,13 @@ impl Cortex {
         for action in actions {
             match action {
                 PluginAction::AddFact { subject, predicate, object, confidence } => {
-                    let _ = semantic.add_fact(
+                    warn_on_write_err("fact", semantic.add_fact(
                         subject, predicate, object, *confidence,
                         MemSource::new("plugin"), None,
-                    );
+                    ));
                 }
                 PluginAction::AddPreference { key, value, confidence } => {
-                    let _ = semantic.add_preference(key, value, *confidence);
+                    warn_on_write_err("preference", semantic.add_preference(key, value, *confidence));
                 }
                 PluginAction::ObserveBelief { key, supports, strength } => {
                     let belief_engine = BeliefEngine::new(&self.storage);
@@ -1502,7 +1511,7 @@ impl Cortex {
                     } else {
                         crate::belief::Evidence::Contradicts(*strength)
                     };
-                    let _ = belief_engine.observe(key, evidence);
+                    warn_on_write_err("belief", belief_engine.observe(key, evidence));
                 }
                 _ => {}
             }

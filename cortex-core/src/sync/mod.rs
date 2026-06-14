@@ -461,10 +461,14 @@ impl SyncEngine {
             }
         }
 
-        // Periodic tombstone GC
-        let _ = storage.with_write_conn(|conn| {
+        // Periodic tombstone GC — don't fail the pull if it errors, but never swallow it
+        // silently: a recurring failure would otherwise let tombstones grow unbounded with
+        // zero observability.
+        if let Err(e) = storage.with_write_conn(|conn| {
             state::gc_tombstones(conn, self.config.tombstone_ttl_days)
-        });
+        }) {
+            tracing::warn!(error = %e, "tombstone GC failed");
+        }
 
         Ok(total_applied)
     }

@@ -199,8 +199,19 @@ impl SqliteStorage {
         let content_hash: Option<String> = row.get(11).ok().unwrap_or(None);
         let namespace: Option<String> = row.get(12).ok().unwrap_or(None);
 
-        let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
-        let tier = MemoryTier::parse(&tier_str).unwrap_or(MemoryTier::Episodic);
+        // A corrupt id/tier must surface as an error, never be silently replaced with a
+        // fresh random UUID (orphan object — updates/deletes become no-ops) or coerced to
+        // Episodic (wrong lifecycle/decay). Loud beats silently-wrong for a memory engine.
+        let id = Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        let tier = MemoryTier::parse(&tier_str).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                format!("invalid memory tier: {tier_str:?}").into(),
+            )
+        })?;
         let content: MemContent = Self::json_col(2, &content_json)?;
         // Treat a malformed/empty decoded blob as "no embedding" rather than storing a
         // degenerate (empty or wrong-dimension) vector that would poison vector search.
@@ -1464,7 +1475,15 @@ impl StorageBackend for SqliteStorage {
         let mut results = Vec::new();
         for row in rows {
             let (id_str, content_json) = row.map_err(|e| CortexError::Storage(e.to_string()))?;
-            let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4());
+            // Skip (don't fabricate) a row with a corrupt id, and don't fail the whole
+            // search for one bad row — just leave it out and note it.
+            let id = match Uuid::parse_str(&id_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    tracing::warn!(id = %id_str, "skipping memory row with unparseable id");
+                    continue;
+                }
+            };
             // Extract text from content JSON. Bind by ref + clone: MemContent implements
             // Drop (zeroize-on-drop), so its inner String cannot be moved out.
             if let Ok(crate::types::MemContent::Text(ref text)) =
@@ -1740,7 +1759,9 @@ fn parse_person_row(row: &rusqlite::Row) -> Result<Person, rusqlite::Error> {
     let style_json: String = row.get(8)?;
 
     Ok(Person {
-        id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+        id: Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         identities: Vec::new(), // loaded separately
         display_name,
         relationship_to_user: relationship,
@@ -1765,7 +1786,9 @@ fn parse_belief_row(row: &rusqlite::Row) -> Result<Belief, rusqlite::Error> {
     let updated_str: String = row.get(4)?;
 
     Ok(Belief {
-        id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+        id: Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         key,
         probability,
         observations: serde_json::from_str(&obs_json).unwrap_or_default(),
@@ -1783,7 +1806,9 @@ fn parse_pattern_row(row: &rusqlite::Row) -> Result<Pattern, rusqlite::Error> {
     let last_seen_str: String = row.get(4)?;
 
     Ok(Pattern {
-        id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+        id: Uuid::parse_str(&id_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         trigger,
         actions: serde_json::from_str(&actions_json).unwrap_or_default(),
         frequency,
