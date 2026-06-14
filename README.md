@@ -96,7 +96,7 @@ Academic-grade long-term conversation memory evaluation — 10 conversations, 15
 |--------|-----------|-----------|-------------|----------|---------|
 | Backboard | 89.4% | 75.0% | 91.2% | 91.9% | 90.0% |
 | MemMachine v0.2 | — | — | — | — | 84.9% |
-| **Cortex v1.7** | **72.5%** | **59.5%** | **88.8%** | **74.1%** | **73.7%** |
+| **Cortex** | **72.5%** | **59.5%** | **88.8%** | **74.1%** | **73.7%** |
 | Mem0-Graph | 65.7% | 47.2% | 75.7% | 58.1% | 68.4% |
 | Mem0 | 67.1% | 51.2% | 72.9% | 55.5% | 66.9% |
 | OpenAI Memory | — | — | — | — | 52.9% |
@@ -110,7 +110,7 @@ Academic-grade long-term conversation memory evaluation — 10 conversations, 15
 
 Cortex outperforms Mem0 on all 4 categories — while running 100% locally, end-to-end encrypted, at $0 cost.
 
-> **Setup:** Claude Sonnet 4 (QA + judge), nomic-embed-text (embeddings via Ollama), top-30 retrieval. Fully reproducible: `python3 bench/locomo_bench.py`
+> **Setup:** Claude Sonnet 4 (QA + judge), nomic-embed-text (embeddings via Ollama), top-30 retrieval. Reproducible with that setup: `python3 bench/locomo_bench.py` (needs `ANTHROPIC_API_KEY` + a local Ollama with `nomic-embed-text`). Numbers measured on the v1.7 engine; the v2.2 retrieval beam fix (paraphrase recall 40%→90% at 5K, see `docs/scale-test-2026-06-13.md`) has not yet been re-run on LoCoMo, so these are reported as the last verified figures, not a v2.2 claim.
 
 ## Architecture
 
