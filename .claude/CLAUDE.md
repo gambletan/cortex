@@ -1,5 +1,16 @@
 # Cortex Project Instructions
 
+## Decision Protocol — get a Codex second opinion
+
+Before handing the user a **substantive** decision (architecture, a release, a risky or
+hard-to-reverse change, an ambiguous tradeoff, or a non-trivial design choice), first spawn
+the **`codex-advisor`** agent with the decision + full inline context, and fold its
+recommendation into what you present — note where Codex agrees or pushes back.
+
+Skip it for trivial confirmations and fast back-and-forth (don't add a Codex round-trip to
+every micro-step — that kills the loop). Use judgment: high-stakes or genuinely uncertain →
+consult Codex; routine → proceed.
+
 ## Project Goal
 Build the **most privacy-advanced memory engine** for personal AI agents.
 
