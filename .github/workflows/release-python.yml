@@ -16,15 +16,18 @@ jobs:
       # Don't let one target cancel the others mid-build.
       fail-fast: false
       matrix:
-        # Targets that build cleanly AND have available runners today. Omitted: aarch64-linux
-        # & windows-msvc (native-dep cross-builds), and macos-13/x86_64 (the Intel-mac runner
-        # is retired and queues forever, blocking the whole release). All omitted platforms
-        # install from the sdist, which always ships. Tracked in docs/ROADMAP.md.
+        # Both macOS arches cross-build on the macos-latest (Apple-silicon) runner — the
+        # retired macos-13/Intel runner that queued forever is no longer referenced (this is
+        # the same approach release-binary.yml uses for x86_64-apple-darwin). Omitted:
+        # aarch64-linux & windows-msvc (native-dep cross-builds not yet sorted); those users
+        # install from the sdist, which always ships.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
