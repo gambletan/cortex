@@ -32,6 +32,20 @@ This is the prioritized forward plan. The per-iteration security audits
   macOS-version warnings are cosmetic.
 
 ### Shipped this cycle
+- ✅ **Iteration 21 — Unify single & batch ingest into one lifecycle (data-integrity, 2026-06-16).**
+  `ingest_batch` had silently diverged from single ingest — it skipped near-dedup,
+  fact-contradiction resolution, relationship extraction, the `on_post_ingest` hook, and
+  deferred plugin side-effects, so batching N memories was materially weaker than N single
+  ingests. Both now share `prepare_ingest` → `near_dedup_check`/`reinforce_existing` → store →
+  `finalize_ingest`; plugin pre-ingest runs before the dedup hash (fixed batch's reversed
+  order); batch near-dedup covers stored + intra-batch siblings; contradiction context is
+  queried fresh per memory (memory N sees memory N-1's facts). Also made
+  `store_memories_batch` atomic (all-or-nothing) — a failed INSERT used to commit a partial
+  set, leaving the index/event-bus/sync/finalize processing ghost memories. Codex-reviewed
+  design + adversarial Rust review (caught the ghost-memory bug). New `test_ingest_parity.rs`;
+  full workspace green. This also closes the Iteration 17 "batch per-item privacy" follow-up's
+  sibling gaps. Distribution: Dockerfile defaulted to MCP-stdio entrypoint for Glama/MCP
+  registry; awesome-mcp-servers PR rebased clean (#8145, supersedes conflicted #7989).
 - ✅ Frecency ranking in `retrieval.rs` (P2) — access frequency + recency boost, tested.
 - ✅ CI restored to green; sync + fact/preference/contradiction integration tests revived.
 - ✅ Privacy enforcement relocated to the context boundary (above).
