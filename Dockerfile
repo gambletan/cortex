@@ -46,6 +46,10 @@ ENV CORTEX_PORT=3315
 
 EXPOSE 3315
 
-# HTTP mode (default): docker run -p 3315:3315 image
-# MCP stdio mode:      docker run --entrypoint cortex-mcp-server image /data/memory.db
-ENTRYPOINT ["cortex-http"]
+# This image's identity is the MCP server (see the LABEL above), so MCP stdio is the
+# default entrypoint — `docker run -i image` starts the JSON-RPC server on stdin/stdout
+# and responds to `initialize`/`tools/list` introspection out of the box (what MCP
+# clients and the Glama registry expect). The DB path comes from CORTEX_DB_PATH.
+#
+# HTTP REST mode (alternate): docker run -p 3315:3315 --entrypoint cortex-http image
+ENTRYPOINT ["cortex-mcp-server"]
