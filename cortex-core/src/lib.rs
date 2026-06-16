@@ -148,6 +148,38 @@ fn warn_on_write_err<T>(kind: &str, r: Result<T, CortexError>) {
 /// into the LLM's "Known Facts".
 const SPECULATIVE_RELATION_MAX_CONFIDENCE: f32 = 0.29;
 
+/// A fully-prepared ingest candidate: the built memory plus everything the
+/// post-store [`Cortex::finalize_ingest`] pass needs (inference, deferred plugin
+/// side-effects, the source text for relationship extraction). Produced by
+/// [`Cortex::prepare_ingest`] and consumed identically by both the single and the
+/// batch ingest paths — this is the "one ingest lifecycle" both routes share.
+struct PreparedIngest {
+    mem: MemObject,
+    text: String,
+    channel: String,
+    embedding: Option<Vec<f32>>,
+    inferred: inference::InferredKnowledge,
+    deferred_actions: Vec<PluginAction>,
+}
+
+/// Outcome of [`Cortex::prepare_ingest`]: either a candidate to store, or an early
+/// exit that mirrors single-ingest's historical return values (the built `MemObject`
+/// is returned even on dedup/skip so callers can hand it back).
+enum PrepareOutcome {
+    Store(Box<PreparedIngest>),
+    DedupExact(MemObject),
+    SkipByPlugin(MemObject),
+}
+
+/// Result of the near-duplicate (semantic) dedup check.
+enum NearDup {
+    /// Near-duplicate of an already-stored memory — reinforce it and drop the new copy.
+    Existing(Uuid),
+    /// Near-duplicate of an earlier-accepted item in the *same* batch (its memory id) —
+    /// bump that pending memory's recall count before it's stored and drop the new copy.
+    Pending(Uuid),
+}
+
 /// Main Cortex instance — the entry point for all memory operations.
 pub struct Cortex {
     storage: SqliteStorage,
@@ -618,106 +650,31 @@ impl Cortex {
         namespace: Option<&str>,
         privacy: Option<crate::types::PrivacyLevel>,
     ) -> Result<MemObject, CortexError> {
-        let mut source = MemSource::new(channel);
-        let embedding = self.auto_embed(text, embedding);
-
-        // Resolve person identity if user_id provided
-        if let Some(uid) = user_id {
-            let people = PeopleGraph::new(&self.storage);
-            let person = people.resolve_identity(channel, uid, None, None)?;
-            source.identity_id = Some(person.id);
-            people.record_interaction(person.id)?;
-        }
-
-        // ── Proactive inference (with optional LLM) ────────────────────
-        let inferred = inference::extract_with_llm(text, self.inference_fn.as_ref());
-
-        // Set durability based on temporal hint
-        let durability = match inferred.temporal_hint {
-            inference::TemporalHint::Temporary => MemoryDurability::Temporary,
-            inference::TemporalHint::Permanent => MemoryDurability::Permanent,
-            inference::TemporalHint::Unknown => MemoryDurability::Normal,
+        // Single and batch ingest share ONE lifecycle: prepare → (near-dedup) → store →
+        // finalize. See `prepare_ingest`/`near_dedup_check`/`finalize_ingest`.
+        let people = PeopleGraph::new(&self.storage);
+        let prepared = match self.prepare_ingest(
+            text, channel, user_id, salience_hint, embedding, namespace, privacy, &people, &[],
+        )? {
+            PrepareOutcome::DedupExact(mem) => return Ok(mem),
+            PrepareOutcome::SkipByPlugin(mem) => return Ok(mem),
+            PrepareOutcome::Store(prepared) => prepared,
         };
 
-        let mut builder = crate::types::MemObjectBuilder::new(
-            MemoryTier::Episodic,
-            MemContent::Text(text.to_string()),
-            source,
-        )
-        .salience(crate::types::Salience::new(salience_hint.unwrap_or(0.5)))
-        .durability(durability);
-
-        if let Some(emb) = embedding.clone() {
-            builder = builder.embedding(emb);
-        }
-        if let Some(ns) = namespace {
-            builder = builder.namespace(ns.to_string());
-        }
-        if let Some(p) = privacy {
-            builder = builder.privacy(p);
+        // Near-duplicate (semantic) dedup against already-stored memories: reinforce the
+        // existing memory and drop the near-copy rather than crowding retrieval with it.
+        if let Some(NearDup::Existing(existing_id)) = self.near_dedup_check(&prepared.embedding, &[]) {
+            self.reinforce_existing(existing_id);
+            return Ok(prepared.mem);
         }
 
-        let mut mem = builder.build();
-
-        // ── Plugin: on_pre_ingest ─────────────────────────────────────────
-        let plugin_ctx = PluginContext {
-            storage: &self.storage,
-            index: &self.index,
-        };
-        let pre_actions = self.plugins.on_pre_ingest(&mem, text, &plugin_ctx);
-        let skip = PluginManager::apply_actions(&pre_actions, &mut mem);
-        if skip {
-            return Ok(mem);
+        self.storage.store_memory(&prepared.mem)?;
+        if let Some(ref emb) = prepared.embedding {
+            self.index.insert(prepared.mem.id, emb.clone());
         }
+        let result = prepared.mem.clone();
 
-        // Apply plugin-requested side effects (facts, preferences, beliefs)
-        let deferred_actions: Vec<_> = pre_actions
-            .iter()
-            .filter(|a| matches!(a, PluginAction::AddFact { .. } | PluginAction::AddPreference { .. } | PluginAction::ObserveBelief { .. }))
-            .cloned()
-            .collect();
-
-        // ── Deduplication check ─────────────────────────────────────────
-        if self.dedup_config.exact_dedup {
-            if let Some(ref hash) = mem.content_hash {
-                if self.storage.find_by_content_hash(hash)?.is_some() {
-                    self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(hash = %hash, "Exact duplicate skipped");
-                    return Ok(mem);
-                }
-            }
-        }
-
-        // Near-duplicate (semantic) dedup: a chatty agent re-saving the same thing in
-        // slightly different words would otherwise accumulate near-identical memories that
-        // crowd retrieval. If the new memory is ~identical (cosine ≥ threshold) to an
-        // existing one, REINFORCE the existing memory (bump its recall recency/count) and
-        // drop the near-copy, rather than silently losing the signal. Requires an
-        // embedding; with CORTEX_NO_EMBEDDINGS this is skipped (exact-dedup still applies).
-        if self.dedup_config.near_dedup {
-            if let Some(ref emb) = embedding {
-                if let Some((existing_id, sim)) = self.index.search(emb, 1).first().copied() {
-                    if sim >= self.dedup_config.near_dedup_threshold {
-                        if let Ok(Some(mut existing)) = self.storage.get_memory(existing_id) {
-                            existing.temporal.access_count += 1;
-                            existing.temporal.last_accessed = chrono::Utc::now();
-                            let _ = self.storage.update_memory(&existing);
-                        }
-                        self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(existing = %existing_id, sim, "Near-duplicate reinforced existing memory");
-                        return Ok(mem);
-                    }
-                }
-            }
-        }
-
-        self.storage.store_memory(&mem)?;
-        if let Some(emb) = embedding {
-            self.index.insert(mem.id, emb);
-        }
-        let result = mem.clone();
-
-        // Emit event + sync
+        // Emit event + sync + metrics.
         let event = CortexEvent::MemoryCreated {
             id: result.id,
             tier: result.tier,
@@ -726,98 +683,9 @@ impl Cortex {
         self.sync_record_event(&event);
         self.metrics.ingests.fetch_add(1, Ordering::Relaxed);
 
-        // ── Plugin: on_post_ingest ────────────────────────────────────────
-        self.plugins.on_post_ingest(&result, &plugin_ctx);
-
-        // ── Auto-extract facts ───────────────────────────────────────────
-        let semantic = SemanticStore::new(&self.storage, &self.index);
-        if !inferred.facts.is_empty() {
-            // Batch-load all existing facts for relevant subjects in a single query
-            let subjects: Vec<String> = inferred.facts.iter()
-                .map(|f| f.subject.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let existing_facts = self.storage.query_facts_by_entities(&subjects)?;
-
-            for fact in &inferred.facts {
-                // Check contradictions against preloaded facts (in-memory, no SQL)
-                let contradictions: Vec<(&MemObject, f32)> = existing_facts.iter()
-                    .filter_map(|m| {
-                        if let MemContent::Fact { subject: ref s, predicate: ref p, object: ref o } = m.content {
-                            if s.to_lowercase() == fact.subject.to_lowercase()
-                                && p.to_lowercase() == fact.predicate.to_lowercase()
-                                && o.to_lowercase() != fact.object.to_lowercase()
-                            {
-                                return Some((m, m.salience.effective_score));
-                            }
-                        }
-                        None
-                    })
-                    .collect();
-
-                if !contradictions.is_empty() {
-                    let new_fact = semantic.add_fact(
-                        &fact.subject, &fact.predicate, &fact.object,
-                        fact.confidence,
-                        MemSource::new(channel),
-                        None,
-                    )?;
-                    for (old, _score) in &contradictions {
-                        semantic.merge_facts(old.id, new_fact.id)?;
-                        tracing::info!(
-                            subject = %fact.subject,
-                            predicate = %fact.predicate,
-                            new = %fact.object,
-                            "Contradiction resolved: superseded old fact"
-                        );
-                    }
-                } else {
-                    warn_on_write_err("fact", semantic.add_fact(
-                        &fact.subject, &fact.predicate, &fact.object,
-                        fact.confidence,
-                        MemSource::new(channel),
-                        None,
-                    ));
-                }
-            }
-        }
-
-        // ── Auto-extract preferences ─────────────────────────────────────
-        for pref in &inferred.preferences {
-            warn_on_write_err("preference", semantic.add_preference(&pref.key, &pref.value, pref.confidence));
-        }
-
-        // ── Auto-extract relationships (bidirectional) ─────────────────
-        // These come from single-sentence proper-noun-pair patterns ("X works with Y"),
-        // which can't tell a person relationship ("Alice works with Bob") from tech prose
-        // ("React works with TypeScript"). Store them at a SPECULATIVE confidence (below
-        // the context-injection floor) so they remain queryable and feed the people graph,
-        // but are NOT presented to the LLM as authoritative "Known Facts" — that
-        // auto-injection of tech-prose guesses was the cortex-user-skeptic #1 walk-away.
-        // Explicit fact_add and corroborated facts keep their full confidence and do show.
-        let relationships = relationship::extract_relationships(text);
-        let bidirectional = relationship::with_inverses(&relationships);
-        for rel in &bidirectional {
-            let speculative = (rel.confidence * 0.3).min(SPECULATIVE_RELATION_MAX_CONFIDENCE);
-            warn_on_write_err("relationship", semantic.add_fact(
-                &rel.person_a,
-                &rel.relation,
-                &rel.person_b,
-                speculative,
-                MemSource::new(channel),
-                None,
-            ));
-            tracing::info!(
-                a = %rel.person_a,
-                relation = %rel.relation,
-                b = %rel.person_b,
-                "Auto-extracted relationship"
-            );
-        }
-
-        // ── Plugin: apply deferred actions (facts, preferences, beliefs) ──
-        self.apply_plugin_side_effects(&deferred_actions, "pre_ingest");
+        // Post-store: plugins, facts (+contradiction resolution), preferences,
+        // relationships, deferred plugin side-effects — shared with batch ingest.
+        self.finalize_ingest(&prepared);
 
         // Auto-consolidation: run every N ingests
         let count = self.ingest_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -834,6 +702,242 @@ impl Cortex {
         Ok(result)
     }
 
+    /// Build a candidate memory and run the pre-store pipeline shared by single and batch
+    /// ingest: source, embedding, identity resolution, inference, builder, the
+    /// `on_pre_ingest` plugin hook, then exact dedup. The plugin hook runs BEFORE the dedup
+    /// hash check (a plugin may rewrite content, changing the hash) — this matches historical
+    /// single-ingest order; batch ingest used to dedup first, a latent divergence now fixed.
+    /// `pending_hashes` lets a batch also dedup against not-yet-stored items in the same call.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_ingest(
+        &self,
+        text: &str,
+        channel: &str,
+        user_id: Option<&str>,
+        salience_hint: Option<f32>,
+        embedding: Option<Vec<f32>>,
+        namespace: Option<&str>,
+        privacy: Option<crate::types::PrivacyLevel>,
+        people: &PeopleGraph<'_>,
+        pending_hashes: &[String],
+    ) -> Result<PrepareOutcome, CortexError> {
+        let mut source = MemSource::new(channel);
+        let embedding = self.auto_embed(text, embedding);
+
+        if let Some(uid) = user_id {
+            let person = people.resolve_identity(channel, uid, None, None)?;
+            source.identity_id = Some(person.id);
+            people.record_interaction(person.id)?;
+        }
+
+        let inferred = inference::extract_with_llm(text, self.inference_fn.as_ref());
+        let durability = match inferred.temporal_hint {
+            inference::TemporalHint::Temporary => MemoryDurability::Temporary,
+            inference::TemporalHint::Permanent => MemoryDurability::Permanent,
+            inference::TemporalHint::Unknown => MemoryDurability::Normal,
+        };
+
+        let mut builder = crate::types::MemObjectBuilder::new(
+            MemoryTier::Episodic,
+            MemContent::Text(text.to_string()),
+            source,
+        )
+        .salience(crate::types::Salience::new(salience_hint.unwrap_or(0.5)))
+        .durability(durability);
+        if let Some(emb) = embedding.clone() {
+            builder = builder.embedding(emb);
+        }
+        if let Some(ns) = namespace {
+            builder = builder.namespace(ns.to_string());
+        }
+        if let Some(p) = privacy {
+            builder = builder.privacy(p);
+        }
+        let mut mem = builder.build();
+
+        // ── Plugin: on_pre_ingest (BEFORE dedup — may mutate content/hash) ─
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+        let pre_actions = self.plugins.on_pre_ingest(&mem, text, &plugin_ctx);
+        let skip = PluginManager::apply_actions(&pre_actions, &mut mem);
+        if skip {
+            return Ok(PrepareOutcome::SkipByPlugin(mem));
+        }
+        let deferred_actions: Vec<PluginAction> = pre_actions
+            .iter()
+            .filter(|a| matches!(a, PluginAction::AddFact { .. } | PluginAction::AddPreference { .. } | PluginAction::ObserveBelief { .. }))
+            .cloned()
+            .collect();
+
+        // ── Exact dedup (storage + the in-flight batch) ───────────────────
+        if self.dedup_config.exact_dedup {
+            if let Some(ref hash) = mem.content_hash {
+                if self.storage.find_by_content_hash(hash)?.is_some()
+                    || pending_hashes.iter().any(|h| h == hash)
+                {
+                    self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(hash = %hash, "Exact duplicate skipped");
+                    return Ok(PrepareOutcome::DedupExact(mem));
+                }
+            }
+        }
+
+        Ok(PrepareOutcome::Store(Box::new(PreparedIngest {
+            mem,
+            text: text.to_string(),
+            channel: channel.to_string(),
+            embedding,
+            inferred,
+            deferred_actions,
+        })))
+    }
+
+    /// Semantic near-duplicate check. Returns the action to take when the candidate's
+    /// embedding is at or above the configured cosine threshold to either an already-stored
+    /// memory (`Existing`) or an earlier-accepted item in the same batch (`Pending`).
+    /// Returns `None` when near-dedup is disabled, there is no embedding, or nothing matches.
+    /// Existing stored memories take precedence over in-batch matches (matches single ingest).
+    fn near_dedup_check(&self, embedding: &Option<Vec<f32>>, pending: &[(Uuid, Vec<f32>)]) -> Option<NearDup> {
+        if !self.dedup_config.near_dedup {
+            return None;
+        }
+        let emb = embedding.as_ref()?;
+        if let Some((existing_id, sim)) = self.index.search(emb, 1).first().copied() {
+            if sim >= self.dedup_config.near_dedup_threshold {
+                return Some(NearDup::Existing(existing_id));
+            }
+        }
+        for (id, pemb) in pending.iter() {
+            if crate::storage::memory_index::cosine_similarity(emb, pemb)
+                >= self.dedup_config.near_dedup_threshold
+            {
+                return Some(NearDup::Pending(*id));
+            }
+        }
+        None
+    }
+
+    /// Reinforce an already-stored memory matched by near-dedup: bump its recall
+    /// recency/count and record the dedup metric. The near-copy is dropped by the caller.
+    fn reinforce_existing(&self, id: Uuid) {
+        if let Ok(Some(mut existing)) = self.storage.get_memory(id) {
+            existing.temporal.access_count += 1;
+            existing.temporal.last_accessed = chrono::Utc::now();
+            let _ = self.storage.update_memory(&existing);
+        }
+        self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(existing = %id, "Near-duplicate reinforced existing memory");
+    }
+
+    /// Post-store processing shared by single and batch ingest, run once per stored memory
+    /// in input order: the `on_post_ingest` plugin hook, auto-extracted facts WITH
+    /// contradiction resolution, preferences, speculative relationships, and the deferred
+    /// plugin side-effects collected during pre-ingest. Contradiction context is queried
+    /// fresh from storage (not preloaded once) so that, within a batch, memory N sees the
+    /// facts written by memory N-1. Derived-write failures are logged, never fatal — the
+    /// primary memory is already durably stored by the time finalize runs.
+    fn finalize_ingest(&self, prepared: &PreparedIngest) {
+        let plugin_ctx = PluginContext {
+            storage: &self.storage,
+            index: &self.index,
+        };
+        self.plugins.on_post_ingest(&prepared.mem, &plugin_ctx);
+
+        let semantic = SemanticStore::new(&self.storage, &self.index);
+        let channel = prepared.channel.as_str();
+
+        // ── Auto-extract facts (with contradiction resolution) ────────────
+        if !prepared.inferred.facts.is_empty() {
+            let subjects: Vec<String> = prepared.inferred.facts.iter()
+                .map(|f| f.subject.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let existing_facts = match self.storage.query_facts_by_entities(&subjects) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fact contradiction preload failed; adding facts without supersede");
+                    Vec::new()
+                }
+            };
+
+            for fact in &prepared.inferred.facts {
+                let contradictions: Vec<(&MemObject, f32)> = existing_facts.iter()
+                    .filter_map(|m| {
+                        if let MemContent::Fact { subject: ref s, predicate: ref p, object: ref o } = m.content {
+                            if s.to_lowercase() == fact.subject.to_lowercase()
+                                && p.to_lowercase() == fact.predicate.to_lowercase()
+                                && o.to_lowercase() != fact.object.to_lowercase()
+                            {
+                                return Some((m, m.salience.effective_score));
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                if !contradictions.is_empty() {
+                    match semantic.add_fact(
+                        &fact.subject, &fact.predicate, &fact.object,
+                        fact.confidence, MemSource::new(channel), None,
+                    ) {
+                        Ok(new_fact) => {
+                            for (old, _score) in &contradictions {
+                                if let Err(e) = semantic.merge_facts(old.id, new_fact.id) {
+                                    tracing::warn!(error = %e, "merge_facts failed during contradiction resolution");
+                                } else {
+                                    tracing::info!(
+                                        subject = %fact.subject,
+                                        predicate = %fact.predicate,
+                                        new = %fact.object,
+                                        "Contradiction resolved: superseded old fact"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, kind = "fact", "derived write failed during ingest (memory stored, this fact was not)"),
+                    }
+                } else {
+                    warn_on_write_err("fact", semantic.add_fact(
+                        &fact.subject, &fact.predicate, &fact.object,
+                        fact.confidence, MemSource::new(channel), None,
+                    ));
+                }
+            }
+        }
+
+        // ── Auto-extract preferences ──────────────────────────────────────
+        for pref in &prepared.inferred.preferences {
+            warn_on_write_err("preference", semantic.add_preference(&pref.key, &pref.value, pref.confidence));
+        }
+
+        // ── Auto-extract relationships (bidirectional, SPECULATIVE confidence) ──
+        // Single-sentence proper-noun-pair patterns ("X works with Y") can't tell a person
+        // relationship from tech prose ("React works with TypeScript"), so they're stored
+        // below the context-injection floor: queryable + feed the people graph, but never
+        // auto-injected to the LLM as authoritative "Known Facts".
+        let relationships = relationship::extract_relationships(&prepared.text);
+        let bidirectional = relationship::with_inverses(&relationships);
+        for rel in &bidirectional {
+            let speculative = (rel.confidence * 0.3).min(SPECULATIVE_RELATION_MAX_CONFIDENCE);
+            warn_on_write_err("relationship", semantic.add_fact(
+                &rel.person_a, &rel.relation, &rel.person_b,
+                speculative, MemSource::new(channel), None,
+            ));
+            tracing::info!(
+                a = %rel.person_a,
+                relation = %rel.relation,
+                b = %rel.person_b,
+                "Auto-extracted relationship"
+            );
+        }
+
+        // ── Plugin: apply deferred actions (facts, preferences, beliefs) ──
+        self.apply_plugin_side_effects(&prepared.deferred_actions, "pre_ingest");
+    }
+
     /// Batch ingest multiple memories in a single transaction.
     /// Supports deduplication and batched index rebuild.
     #[tracing::instrument(skip(self, items), fields(count = items.len()))]
@@ -846,125 +950,101 @@ impl Cortex {
             ..Default::default()
         };
 
-        let mut mems_to_store: Vec<MemObject> = Vec::with_capacity(items.len());
-        let mut embeddings_to_index: Vec<(Uuid, Vec<f32>)> = Vec::new();
-        let mut batch_inferred: Vec<(String, inference::InferredKnowledge)> = Vec::new();
-
-        let plugin_ctx = PluginContext {
-            storage: &self.storage,
-            index: &self.index,
-        };
-
-        // Create PeopleGraph once for the entire batch
+        // One PeopleGraph for the whole batch.
         let people = PeopleGraph::new(&self.storage);
 
-        for item in &items {
-            let mut source = MemSource::new(&item.channel);
-            let embedding = self.auto_embed(&item.text, item.embedding.clone());
+        // Survivors of exact + near dedup, each carrying everything `finalize_ingest` needs.
+        let mut prepared_items: Vec<PreparedIngest> = Vec::with_capacity(items.len());
+        // Exact-dup guard against earlier accepted items in THIS batch.
+        let mut pending_hashes: Vec<String> = Vec::new();
+        // (id, embedding) of earlier accepted items, for intra-batch near-dedup.
+        let mut pending_embeddings: Vec<(Uuid, Vec<f32>)> = Vec::new();
 
-            if let Some(ref uid) = item.user_id {
-                if let Ok(person) = people.resolve_identity(&item.channel, uid, None, None) {
-                    source.identity_id = Some(person.id);
-                    let _ = people.record_interaction(person.id);
+        for item in items {
+            // Same prepare pipeline as single ingest (plugin pre-ingest BEFORE exact dedup),
+            // including dedup against not-yet-stored siblings in this batch.
+            match self.prepare_ingest(
+                &item.text,
+                &item.channel,
+                item.user_id.as_deref(),
+                item.salience_hint,
+                item.embedding.clone(),
+                item.namespace.as_deref(),
+                item.privacy.clone(),
+                &people,
+                &pending_hashes,
+            )? {
+                PrepareOutcome::DedupExact(_) => report.deduplicated += 1,
+                PrepareOutcome::SkipByPlugin(_) => report.skipped_by_plugin += 1,
+                PrepareOutcome::Store(prepared) => {
+                    // Near-dedup against stored memories AND earlier accepted batch items,
+                    // mirroring `for item in items { ingest(item) }`.
+                    match self.near_dedup_check(&prepared.embedding, &pending_embeddings) {
+                        Some(NearDup::Existing(existing_id)) => {
+                            self.reinforce_existing(existing_id);
+                            report.deduplicated += 1;
+                        }
+                        Some(NearDup::Pending(sibling_id)) => {
+                            // Reinforce the earlier, not-yet-stored sibling in place so the
+                            // bump is persisted by the single batch store below. The id is
+                            // sourced from `pending_embeddings`, which is grown in lock-step
+                            // with `prepared_items` (both only in the `None` arm below), so
+                            // the sibling is always present — a miss signals a logic bug.
+                            match prepared_items.iter_mut().find(|p| p.mem.id == sibling_id) {
+                                Some(sib) => {
+                                    sib.mem.temporal.access_count += 1;
+                                    sib.mem.temporal.last_accessed = chrono::Utc::now();
+                                }
+                                None => tracing::error!(
+                                    %sibling_id,
+                                    "near-dup sibling missing from prepared_items — pending/prepared desync"
+                                ),
+                            }
+                            self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                            report.deduplicated += 1;
+                        }
+                        None => {
+                            if let Some(ref hash) = prepared.mem.content_hash {
+                                pending_hashes.push(hash.clone());
+                            }
+                            if let Some(ref emb) = prepared.embedding {
+                                pending_embeddings.push((prepared.mem.id, emb.clone()));
+                            }
+                            prepared_items.push(*prepared);
+                        }
+                    }
                 }
             }
-
-            let inferred = inference::extract_with_llm(&item.text, self.inference_fn.as_ref());
-            let durability = match inferred.temporal_hint {
-                inference::TemporalHint::Temporary => MemoryDurability::Temporary,
-                inference::TemporalHint::Permanent => MemoryDurability::Permanent,
-                inference::TemporalHint::Unknown => MemoryDurability::Normal,
-            };
-
-            let mut builder = MemObjectBuilder::new(
-                MemoryTier::Episodic,
-                MemContent::Text(item.text.clone()),
-                source,
-            )
-            .salience(Salience::new(item.salience_hint.unwrap_or(0.5)))
-            .durability(durability);
-
-            if let Some(ref ns) = item.namespace {
-                builder = builder.namespace(ns.clone());
-            }
-            if let Some(ref p) = item.privacy {
-                builder = builder.privacy(p.clone());
-            }
-            if let Some(ref emb) = embedding {
-                builder = builder.embedding(emb.clone());
-            }
-
-            let mut mem = builder.build();
-
-            // Dedup check
-            if self.dedup_config.exact_dedup {
-                if let Some(ref hash) = mem.content_hash {
-                    if self.storage.find_by_content_hash(hash)?.is_some() {
-                        report.deduplicated += 1;
-                        self.metrics.dedup_hits.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    // Also check within current batch
-                    if mems_to_store.iter().any(|m| m.content_hash.as_ref() == Some(hash)) {
-                        report.deduplicated += 1;
-                        continue;
-                    }
-                }
-            }
-
-            // Plugin pre-ingest
-            let pre_actions = self.plugins.on_pre_ingest(&mem, &item.text, &plugin_ctx);
-            let skip = PluginManager::apply_actions(&pre_actions, &mut mem);
-            if skip {
-                report.skipped_by_plugin += 1;
-                continue;
-            }
-
-            if let Some(emb) = embedding {
-                embeddings_to_index.push((mem.id, emb));
-            }
-            // Collect inferred knowledge for post-batch fact/preference extraction
-            if !inferred.facts.is_empty() || !inferred.preferences.is_empty() {
-                batch_inferred.push((item.channel.clone(), inferred));
-            }
-            mems_to_store.push(mem);
         }
 
-        // Batch store in a single transaction
+        // Single-transaction store of all survivors.
+        let mems_to_store: Vec<MemObject> = prepared_items.iter().map(|p| p.mem.clone()).collect();
         let stored = self.storage.store_memories_batch(&mems_to_store)?;
         report.stored = stored;
 
-        // Batch index insert
-        for (id, emb) in embeddings_to_index {
-            self.index.insert(id, emb);
+        // Index insert.
+        for p in &prepared_items {
+            if let Some(ref emb) = p.embedding {
+                self.index.insert(p.mem.id, emb.clone());
+            }
         }
 
-        // Emit events + sync
-        for mem in &mems_to_store {
+        // Emit events + sync.
+        for p in &prepared_items {
             let event = CortexEvent::MemoryCreated {
-                id: mem.id,
-                tier: mem.tier,
+                id: p.mem.id,
+                tier: p.mem.tier,
             };
             self.event_bus.emit(&event);
             self.sync_record_event(&event);
         }
 
-        // Auto-extract facts and preferences from batch (like single ingest)
-        if !batch_inferred.is_empty() {
-            let semantic = SemanticStore::new(&self.storage, &self.index);
-            for (channel, inferred) in &batch_inferred {
-                for fact in &inferred.facts {
-                    warn_on_write_err("fact", semantic.add_fact(
-                        &fact.subject, &fact.predicate, &fact.object,
-                        fact.confidence,
-                        MemSource::new(channel.as_str()),
-                        None,
-                    ));
-                }
-                for pref in &inferred.preferences {
-                    warn_on_write_err("preference", semantic.add_preference(&pref.key, &pref.value, pref.confidence));
-                }
-            }
+        // Finalize each stored memory through the SAME post-store pipeline as single ingest
+        // (post_ingest plugin, facts + contradiction resolution, preferences, relationships,
+        // deferred plugin side-effects), in input order. This closes the historical batch
+        // gap where these steps were skipped or weakened.
+        for prepared in &prepared_items {
+            self.finalize_ingest(prepared);
         }
 
         self.metrics.batch_ingests.fetch_add(1, Ordering::Relaxed);

@@ -1374,15 +1374,24 @@ impl StorageBackend for SqliteStorage {
                     now,
                 ],
             );
-            if result.is_ok() {
-                // FTS5 synced via trigger (memories_fts_ai)
-                count += 1;
+            // All-or-nothing: a single failed INSERT rolls back the whole batch rather
+            // than silently committing a partial set. A partial commit would leave the
+            // caller's stored-count < submitted while the index, event bus, sync log, and
+            // per-memory finalize pass all process memories that aren't durably stored
+            // (ghost memories). Surfacing the error keeps the batch atomic.
+            if let Err(e) = result {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(CortexError::Storage(format!(
+                    "batch insert failed for memory {id_str}: {e}"
+                )));
             }
+            // FTS5 synced via trigger (memories_fts_ai)
+            count += 1;
         }
 
         conn.execute_batch("COMMIT;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-        // Populate cache for batch-stored memories
+        // Populate cache for batch-stored memories (all committed at this point)
         {
             let mut cache = self.mem_cache.lock();
             for mem in mems {
