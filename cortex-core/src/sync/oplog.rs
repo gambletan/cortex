@@ -270,7 +270,29 @@ pub fn read_oplog(
 
         match result {
             Ok(op) => {
-                // Verify HMAC if present (backward compatible: old operations lack HMAC field)
+                // SECURITY (forward secrecy against key compromise): in encryption mode every
+                // op MUST carry a per-op HMAC keyed by the separate, never-rotated `hmac_key`.
+                // The writer always sets it when a crypto context is present, so a decrypted op
+                // with `hmac: None` is never legitimate here — it is either pre-HMAC legacy data
+                // or a forgery by an attacker who holds a leaked AES version key (which lets them
+                // produce a decryptable envelope but NOT a valid HMAC). Accepting it would let
+                // such an attacker forge ops, defeating the HMAC's entire purpose. Reject it.
+                if crypto.is_some() && op.hmac.is_none() {
+                    tracing::error!(
+                        "Rejecting encrypted op {} at offset {} with no HMAC — possible forgery with a leaked key, or pre-HMAC legacy data (resync required)",
+                        op.op_id, offset
+                    );
+                    {
+                        use zeroize::Zeroize;
+                        let mut disposable = json_str;
+                        disposable.zeroize();
+                    }
+                    offset += bytes_read as u64;
+                    continue;
+                }
+
+                // Verify HMAC if present (plaintext mode stays backward compatible: ops written
+                // without a crypto context legitimately lack the HMAC field).
                 if let Some(hmac_str) = &op.hmac {
                     if let Some(ctx) = crypto {
                         // Reconstruct the operation without the HMAC field for verification
@@ -446,6 +468,39 @@ mod tests {
             "forged plaintext op must NOT be accepted when encryption is enabled"
         );
         assert!(ops.is_empty(), "no plaintext op may be replayed in encryption mode");
+    }
+
+    /// SECURITY (forward secrecy against key compromise): when encryption is enabled, every
+    /// op carries a per-op HMAC keyed by a SEPARATE key (`hmac_key`, always version-0 derived,
+    /// never rotated). An attacker who exfiltrates a single AES version key — the documented
+    /// forward-secrecy threat — can still produce a *decryptable* envelope, but cannot forge a
+    /// valid HMAC. So the reader MUST reject any encrypted op that arrives with `hmac: None`;
+    /// accepting it lets an AES-key-only attacker forge ops (the HMAC's whole purpose is to be
+    /// the integrity anchor the leaked AES key cannot satisfy).
+    #[test]
+    fn test_encrypted_op_without_hmac_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("oplog-2026-01-01-001.jsonl");
+
+        // Attacker holds a valid AES key (the leaked version key) and forges an op,
+        // deliberately omitting the HMAC field, then encrypts it into a valid envelope.
+        let ctx = test_crypto();
+        let forged = make_op("victim-device", 9999);
+        let forged_id = forged.op_id;
+        assert!(forged.hmac.is_none(), "this op carries no HMAC");
+        let plaintext = serde_json::to_string(&forged).unwrap();
+        let enc_line = crate::sync::crypto::encrypt_line(&ctx, plaintext.as_bytes()).unwrap();
+        assert!(crate::sync::crypto::is_encrypted_line(&enc_line));
+        std::fs::write(&path, format!("{}\n", enc_line)).unwrap();
+
+        // The reader is in encryption mode and the line decrypts cleanly — but it has no HMAC.
+        let (ops, _offset) = read_oplog(&path, 0, Some(&ctx)).unwrap();
+
+        assert!(
+            ops.iter().all(|o| o.op_id != forged_id),
+            "an encrypted op with hmac:None must NOT be accepted in encryption mode"
+        );
+        assert!(ops.is_empty(), "no HMAC-less op may be replayed in encryption mode");
     }
 
     /// Legitimately encrypted lines must still be read back correctly in encryption mode.
