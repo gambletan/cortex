@@ -108,6 +108,22 @@ pub fn restore_from_snapshot(
         let line = String::from_utf8(raw)
             .map_err(|e| CortexError::Storage(format!("Encrypted snapshot not UTF-8: {}", e)))?;
         crypto::decrypt_line(ctx, line.trim())?
+    } else if crypto.is_some() {
+        // SECURITY: encryption is enabled but this snapshot is not an encrypted (.enc)
+        // envelope. `create_snapshot` ALWAYS writes `.enc` when a crypto context is present,
+        // so a plaintext snapshot here is never legitimate — it is corruption or an injection
+        // attempt by someone with write access to the (untrusted) cloud sync directory.
+        // Accepting it would bypass AES-GCM authentication entirely (no key required), letting
+        // an attacker inject forged memories on new-device bootstrap. Reject it, do not import.
+        // Mirrors the oplog reader's rejection of unencrypted lines in encryption mode.
+        tracing::error!(
+            path = %path.display(),
+            "Rejecting unencrypted snapshot while encryption is enabled — possible injection or downgrade attack"
+        );
+        return Err(CortexError::Storage(format!(
+            "Refusing to restore unencrypted snapshot {} while sync encryption is enabled — possible injection or downgrade attack",
+            path.display()
+        )));
     } else {
         raw
     };
@@ -188,6 +204,48 @@ mod tests {
         // Verify data was restored
         let stats = cortex2.stats().unwrap();
         assert!(stats.total > 0, "Should have restored memories");
+    }
+
+    /// SECURITY: an attacker with write access to the (untrusted) cloud sync folder — but NO
+    /// key — can drop a plaintext `snapshot-<late-date>.json.zst` carrying forged Public
+    /// memories. `find_latest_snapshot` would pick it, and restore must REFUSE it when
+    /// encryption is enabled: accepting a non-`.enc` snapshot in encryption mode bypasses
+    /// AES-GCM authentication entirely (key-less forged-memory injection on bootstrap).
+    /// Mirrors the oplog reader's plaintext-line rejection.
+    #[test]
+    fn test_plaintext_snapshot_rejected_when_encryption_enabled() {
+        // Attacker forges a plaintext snapshot (no key required).
+        let forge = crate::Cortex::in_memory().unwrap();
+        let mem = crate::types::MemObjectBuilder::new(
+            crate::MemoryTier::Episodic,
+            crate::MemContent::Text("forged injected memory".to_string()),
+            crate::MemSource::new("attacker"),
+        )
+        .privacy(crate::PrivacyLevel::Public)
+        .build();
+        forge.storage().store_memory(&mem).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        let path = create_snapshot(forge.storage(), &dir, None).unwrap();
+        assert!(path.to_string_lossy().ends_with(".json.zst"));
+        assert!(!path.to_string_lossy().ends_with(".enc"));
+
+        // Victim device restores in encryption mode (crypto context present).
+        let ctx =
+            crypto::derive_key("victim-pass", &crypto::new_encryption_manifest()).unwrap();
+        let victim = crate::Cortex::in_memory().unwrap();
+        let result = restore_from_snapshot(&path, victim.storage(), victim.index(), Some(&ctx));
+
+        assert!(
+            result.is_err(),
+            "plaintext snapshot must be rejected when encryption is enabled (key-less injection)"
+        );
+        assert_eq!(
+            victim.stats().unwrap().total,
+            0,
+            "no forged memory may be imported from a plaintext snapshot in encryption mode"
+        );
     }
 
     #[test]
