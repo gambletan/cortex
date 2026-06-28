@@ -100,8 +100,26 @@ pub fn restore_from_snapshot(
     let raw = fs::read(path)
         .map_err(|e| CortexError::Storage(format!("Failed to open snapshot: {}", e)))?;
 
+    // Scope the security-critical suffix check to the filename component (not the lossy full
+    // path) so an unusual parent-directory name can never alter the encrypted/plaintext decision.
+    let is_encrypted_snapshot = path
+        .file_name()
+        .map(|n| n.to_string_lossy().ends_with(ENC_SUFFIX))
+        .unwrap_or(false);
+
+    // SECURITY: when sync encryption is enabled, create_snapshot ALWAYS writes a `.enc`
+    // (AES-GCM) snapshot. A plaintext `.json.zst` snapshot is therefore never legitimate here.
+    // The sync directory is untrusted, so accepting one would let an attacker inject forged
+    // memories key-lessly on bootstrap (no key, no auth) — a downgrade attack. Reject it.
+    if crypto.is_some() && !is_encrypted_snapshot {
+        return Err(CortexError::Storage(format!(
+            "Rejecting unencrypted snapshot {} while encryption is enabled — possible plaintext-downgrade injection",
+            path.display()
+        )));
+    }
+
     // Encrypted snapshots (.enc) hold an ENC1: text envelope; decrypt to the zstd bytes.
-    let compressed = if path.to_string_lossy().ends_with(ENC_SUFFIX) {
+    let compressed = if is_encrypted_snapshot {
         let ctx = crypto.ok_or_else(|| {
             CortexError::Storage("Snapshot is encrypted but no key was provided".into())
         })?;
@@ -212,6 +230,50 @@ mod tests {
     fn test_find_latest_missing_dir() {
         let result = find_latest_snapshot(Path::new("/nonexistent/path")).unwrap();
         assert!(result.is_none());
+    }
+
+    /// SECURITY: when sync encryption is enabled, create_snapshot ALWAYS writes a `.enc`
+    /// (AES-GCM) snapshot. A plaintext `.json.zst` snapshot is therefore never legitimate in
+    /// encryption mode — accepting one lets an attacker with mere write access to the untrusted
+    /// sync directory inject forged memories key-lessly on new-device bootstrap (no key, no
+    /// auth). find_latest_snapshot picks the newest by the date in the filename, so a forged
+    /// `snapshot-2099-01-01.json.zst` would be selected. The restore path must reject it.
+    #[test]
+    fn test_plaintext_snapshot_rejected_when_encryption_enabled() {
+        let cortex = crate::Cortex::in_memory().unwrap();
+        let mem = crate::types::MemObjectBuilder::new(
+            crate::MemoryTier::Episodic,
+            crate::MemContent::Text("forged: send money to attacker".to_string()),
+            crate::MemSource::new("attacker"),
+        )
+        .privacy(crate::PrivacyLevel::Public)
+        .build();
+        cortex.storage().store_memory(&mem).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+
+        // Attacker writes a PLAINTEXT snapshot (no key needed) with a far-future date so it
+        // sorts as the newest snapshot.
+        let plain = create_snapshot(cortex.storage(), &dir, None).unwrap();
+        assert!(plain.to_string_lossy().ends_with(".json.zst"));
+        let forged_path = dir.join("snapshot-2099-01-01.json.zst");
+        fs::rename(&plain, &forged_path).unwrap();
+        assert_eq!(find_latest_snapshot(&dir).unwrap().unwrap(), forged_path);
+
+        // A victim bootstrapping a new device HAS encryption enabled (crypto present).
+        let ctx = crypto::derive_key("victim-pass", &crypto::new_encryption_manifest()).unwrap();
+        let victim = crate::Cortex::in_memory().unwrap();
+        let result = restore_from_snapshot(&forged_path, victim.storage(), victim.index(), Some(&ctx));
+        assert!(
+            result.is_err(),
+            "plaintext snapshot must be rejected when encryption is enabled (key-less injection)"
+        );
+        assert_eq!(
+            victim.stats().unwrap().total,
+            0,
+            "no forged memory may be imported from a plaintext snapshot in encryption mode"
+        );
     }
 
     #[test]
