@@ -525,7 +525,7 @@ impl SyncEngine {
         index: &MemoryIndex,
     ) -> Result<Option<crate::export::ImportReport>, CortexError> {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
-        match snapshot::find_latest_snapshot(&snapshots_dir)? {
+        match snapshot::find_latest_snapshot(&snapshots_dir, self.crypto.is_some())? {
             Some(path) => {
                 let (report, _) =
                     snapshot::restore_from_snapshot(&path, storage, index, self.crypto.as_deref())?;
