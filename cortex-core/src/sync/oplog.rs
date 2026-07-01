@@ -270,6 +270,27 @@ pub fn read_oplog(
 
         match result {
             Ok(op) => {
+                // SECURITY: in encryption mode every legitimate op carries an HMAC (the writer
+                // always attaches one when a crypto context is present). The HMAC key is derived
+                // separately from the content-encryption key, so an attacker holding only a
+                // leaked/old *content* key can forge a valid AES-GCM envelope but not the HMAC.
+                // An encrypted op with `hmac: None` is therefore never legitimate — accepting it
+                // would downgrade integrity to "content key only" and defeat forward secrecy after
+                // key rotation. Reject it (fail closed).
+                if op.hmac.is_none() && crypto.is_some() {
+                    tracing::error!(
+                        "Rejecting encrypted operation {} without HMAC at offset {} — possible forgery or downgrade attack",
+                        op.op_id, offset
+                    );
+                    {
+                        use zeroize::Zeroize;
+                        let mut disposable = json_str;
+                        disposable.zeroize();
+                    }
+                    offset += bytes_read as u64;
+                    continue;
+                }
+
                 // Verify HMAC if present (backward compatible: old operations lack HMAC field)
                 if let Some(hmac_str) = &op.hmac {
                     if let Some(ctx) = crypto {
@@ -446,6 +467,37 @@ mod tests {
             "forged plaintext op must NOT be accepted when encryption is enabled"
         );
         assert!(ops.is_empty(), "no plaintext op may be replayed in encryption mode");
+    }
+
+    /// SECURITY: when encryption is enabled, an encrypted (AES-GCM) envelope whose inner
+    /// op carries `hmac: None` must be rejected. The operation HMAC is keyed by a key that
+    /// is derived separately from the content-encryption key, so an attacker who only holds
+    /// a leaked/old *content* key can forge a valid AES-GCM envelope but cannot forge the
+    /// HMAC. The legitimate writer ALWAYS attaches an HMAC when a crypto context is present,
+    /// so an encrypted op with no HMAC is never legitimate — accepting it downgrades the
+    /// integrity guarantee to "content key only" and defeats forward secrecy after rotation.
+    #[test]
+    fn test_encrypted_op_without_hmac_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("oplog-2026-01-01-001.jsonl");
+        let ctx = test_crypto();
+
+        // Attacker forges an op with no HMAC, then encrypts it with a (leaked) content key.
+        let forged = make_op("victim-device", 9999);
+        let forged_id = forged.op_id;
+        assert!(forged.hmac.is_none());
+        let plaintext = serde_json::to_string(&forged).unwrap();
+        let enc_line = crate::sync::crypto::encrypt_line(&ctx, plaintext.as_bytes()).unwrap();
+        assert!(crate::sync::crypto::is_encrypted_line(&enc_line));
+        std::fs::write(&path, format!("{}\n", enc_line)).unwrap();
+
+        let (ops, _offset) = read_oplog(&path, 0, Some(&ctx)).unwrap();
+
+        assert!(
+            ops.iter().all(|o| o.op_id != forged_id),
+            "encrypted op with hmac:None must NOT be accepted when encryption is enabled"
+        );
+        assert!(ops.is_empty(), "no HMAC-less op may be replayed in encryption mode");
     }
 
     /// Legitimately encrypted lines must still be read back correctly in encryption mode.
