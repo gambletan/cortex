@@ -1342,7 +1342,7 @@ fn tool_sync_enable(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String
     Ok(json!({
         "status": "enabled",
         "provider": detected.provider.as_str(),
-        "sync_dir": detected.sync_dir.display().to_string(),
+        "sync_dir": redact_emails(&detected.sync_dir.display().to_string()),
         "device_id": device_id,
         "device_name": device_name,
         "encryption": true,
@@ -1368,7 +1368,7 @@ fn tool_sync_status(cortex: &Arc<Cortex>) -> Result<String, String> {
                 "device_id": status.device_id,
                 "device_name": status.device_name,
                 "provider": status.provider,
-                "sync_dir": status.sync_dir,
+                "sync_dir": redact_emails(&status.sync_dir),
                 "remote_devices": status.remote_devices,
             }).to_string())
         }
@@ -1384,7 +1384,7 @@ fn tool_sync_status(cortex: &Arc<Cortex>) -> Result<String, String> {
                 let detected: Vec<Value> = providers.iter().map(|p| {
                     json!({
                         "provider": p.provider.as_str(),
-                        "sync_dir": p.sync_dir.display().to_string(),
+                        "sync_dir": redact_emails(&p.sync_dir.display().to_string()),
                     })
                 }).collect();
                 Ok(json!({
@@ -1403,7 +1403,7 @@ fn tool_sync_providers() -> Result<String, String> {
     let items: Vec<Value> = providers.iter().map(|p| {
         json!({
             "provider": p.provider.as_str(),
-            "sync_dir": p.sync_dir.display().to_string(),
+            "sync_dir": redact_emails(&p.sync_dir.display().to_string()),
             "exists": p.sync_dir.exists(),
         })
     }).collect();
@@ -1412,4 +1412,99 @@ fn tool_sync_providers() -> Result<String, String> {
         "providers": items,
         "total": items.len(),
     }).to_string())
+}
+
+/// Redact email addresses embedded in a path (or any string) before it is returned to the
+/// LLM/agent in an MCP tool response.
+///
+/// PRIVACY: cloud-provider sync directories embed the user's account email in the path — e.g.
+/// `.../CloudStorage/GoogleDrive-alice@gmail.com/My Drive/cortex-sync`. Emitting that raw
+/// (as `sync_dir`) leaks the user's real email into the model's context on every
+/// `sync_status` / `sync_providers` / `sync_enable` call. Cortex's mission is 100% local,
+/// zero-telemetry privacy, so account PII must never ride along in a tool response.
+///
+/// We conservatively treat the local-part as `[A-Za-z0-9._+%]` (deliberately excluding `-`
+/// so a provider prefix like `GoogleDrive-` is preserved) and the domain as
+/// `[A-Za-z0-9.-]` containing at least one dot. Any match is replaced with `[redacted-email]`.
+fn redact_emails(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let is_local = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'%');
+    let is_domain = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-');
+
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    // Track how far we've already copied into `out`.
+    let mut copied = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            // Expand left over the local-part.
+            let mut start = i;
+            while start > copied && is_local(bytes[start - 1]) {
+                start -= 1;
+            }
+            // Expand right over the domain.
+            let mut end = i + 1;
+            while end < bytes.len() && is_domain(bytes[end]) {
+                end += 1;
+            }
+            // Only treat it as an email if there is a non-empty local-part and a domain that
+            // contains a dot (so a bare `foo@bar` or `@` alone is left untouched).
+            let has_local = start < i;
+            let domain = &input[i + 1..end];
+            let looks_like_email = has_local && domain.contains('.') && !domain.ends_with('.');
+            if looks_like_email {
+                out.push_str(&input[copied..start]);
+                out.push_str("[redacted-email]");
+                copied = end;
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&input[copied..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_google_drive_account_email_in_sync_path() {
+        let path = "/Users/alice/Library/CloudStorage/GoogleDrive-ethanchang32@gmail.com/My Drive/cortex-sync";
+        let redacted = redact_emails(path);
+        assert!(
+            !redacted.contains("ethanchang32@gmail.com"),
+            "account email must not survive redaction: {redacted}"
+        );
+        assert!(
+            !redacted.contains("ethanchang32"),
+            "email local-part must not survive redaction: {redacted}"
+        );
+        assert!(
+            !redacted.contains("gmail.com"),
+            "email domain must not survive redaction: {redacted}"
+        );
+        assert!(redacted.contains("[redacted-email]"), "should mark the redaction: {redacted}");
+        // The provider prefix and the rest of the path are preserved for usefulness.
+        assert!(redacted.contains("GoogleDrive-"), "provider hint preserved: {redacted}");
+        assert!(redacted.contains("cortex-sync"), "trailing path preserved: {redacted}");
+    }
+
+    #[test]
+    fn leaves_non_email_paths_untouched() {
+        let path = "/Users/alice/Library/Mobile Documents/iCloud~Drive/cortex-sync";
+        assert_eq!(redact_emails(path), path);
+        // A bare `@` or `user@host` with no dotted domain is not an email address.
+        assert_eq!(redact_emails("build @ host"), "build @ host");
+        assert_eq!(redact_emails("a@localhost"), "a@localhost");
+    }
+
+    #[test]
+    fn redacts_multiple_emails() {
+        let s = "from a@x.com to b@y.org";
+        let r = redact_emails(s);
+        assert_eq!(r, "from [redacted-email] to [redacted-email]");
+    }
 }
