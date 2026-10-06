@@ -9,7 +9,7 @@ description = "MCP server for Cortex memory engine — gives LLMs persistent mem
 default = ["embeddings", "gateway"]
 embeddings = ["cortex-core/embeddings"]
 # Muse gateway (remote MCP over HTTP). Off in the lite build, which keeps zero network code.
-gateway = ["dep:axum", "dep:tower", "dep:tower-http"]
+gateway = ["dep:axum", "dep:tower"]
 
 [dependencies]
 cortex-core = { path = "../cortex-core" }
@@ -25,7 +25,6 @@ hostname = "0.4"
 rand = "0.8"
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", features = ["limit"], optional = true }
-tower-http = { version = "0.6", features = ["timeout"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

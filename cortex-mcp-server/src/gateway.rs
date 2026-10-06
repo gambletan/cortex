@@ -758,7 +758,7 @@ fn rpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response {
     (status, [("content-type", "application/json")], body).into_response()
 }
 
-async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body: axum::body::Body) -> Response {
     let authorized = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -775,6 +775,21 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
             return StatusCode::FORBIDDEN.into_response();
         }
     }
+    // The body is read only after auth, under an ABSOLUTE deadline (a per-frame timer would
+    // let a client trickle one byte every few seconds and hold a slot indefinitely).
+    let declared = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > MAX_BODY_BYTES) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let read = axum::body::to_bytes(body, MAX_BODY_BYTES);
+    let body: Bytes = match tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), read).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => return rpc_error_response(StatusCode::BAD_REQUEST, -32700, "Parse error"),
@@ -815,13 +830,10 @@ fn router(state: Arc<HttpState>) -> Router {
         )
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        // Bound slow request bodies. Deliberately NOT a whole-request timeout: that would
-        // drop the response while the blocking disclosure keeps running (charging budget,
-        // auditing "ok") — the work itself is short and bounded by `workers`.
+        // Body reads have an absolute deadline in `handle_post`. Deliberately no whole-request
+        // timeout: that would drop the response while the blocking disclosure keeps running
+        // (charging budget, auditing "ok"); that work is short and bounded by `workers`.
         // Header-phase slowloris is absorbed by the tunnel in front of this loopback listener.
-        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(std::time::Duration::from_secs(
-            REQUEST_TIMEOUT_SECS,
-        )))
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
         .with_state(state)
 }

@@ -39,7 +39,7 @@ fn bootstrap_ignores_a_planted_newer_snapshot_because_the_manifest_pins_the_real
     std::fs::write(sync_dir.join("snapshots/snapshot-2099-01-01.json.zst.enc"), "ENC1:garbage\nHMAC:AAAA\n").unwrap();
 
     let b = Cortex::in_memory().unwrap();
-    let engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
     let report = engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().expect("restored");
     assert_eq!(report.memories, 1);
 }
@@ -87,7 +87,7 @@ fn replaying_an_older_snapshot_under_the_same_name_is_rejected() {
     std::fs::write(&path2, &old_bytes).unwrap();
 
     let b = Cortex::in_memory().unwrap();
-    let engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
     assert!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).is_err());
     assert_eq!(b.stats().unwrap().total, 0, "deleted data must not resurrect");
 }
@@ -103,7 +103,7 @@ fn corrupted_pointed_snapshot_fails_closed() {
     std::fs::write(&path, "ENC1:garbage\nHMAC:AAAA\n").unwrap();
 
     let b = Cortex::in_memory().unwrap();
-    let engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
     assert!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).is_err());
 
     // Deleting it is also an error, not "no snapshot".
@@ -203,7 +203,7 @@ fn a_device_that_saw_a_newer_manifest_rejects_a_replayed_older_one() {
 
     // Device b syncs and sees generation N.
     let b = Cortex::in_memory().unwrap();
-    let engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
     assert_eq!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap().memories, 0);
 
     // Whole-manifest rollback: both files validly signed, just old.
@@ -221,7 +221,7 @@ fn a_device_that_saw_a_newer_manifest_rejects_a_replayed_older_one() {
 
     // Documented residual: a brand-new device has no anchor and accepts it.
     let c = Cortex::in_memory().unwrap();
-    let engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    let mut engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
     assert_eq!(engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap().unwrap().memories, 1);
 }
 
@@ -283,7 +283,7 @@ fn two_same_day_snapshots_both_exist_and_the_pointer_names_the_second() {
     assert_eq!(snapshot_path(&sync_dir), second);
 
     let b = Cortex::in_memory().unwrap();
-    let engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
     assert_eq!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap().memories, 2);
 }
 
@@ -309,7 +309,7 @@ fn crash_between_snapshot_write_and_pointer_update_keeps_the_old_pin_restorable(
     assert!(pinned.exists(), "the pinned snapshot must never be overwritten");
     assert_eq!(snapshot_path(&sync_dir), pinned);
     let b = Cortex::in_memory().unwrap();
-    let engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
     assert_eq!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap().memories, 1);
 }
 
@@ -332,7 +332,7 @@ fn snapshot_by_a_device_with_a_stale_key_after_another_rotated_is_still_restorab
     );
 
     let c = Cortex::in_memory().unwrap();
-    let engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    let mut engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
     assert_eq!(engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap().unwrap().memories, 1);
 }
 
@@ -391,7 +391,73 @@ fn pinned_snapshot_stays_restorable_after_key_rotation() {
     engine_a.rotate_key(a.sqlite_storage()).unwrap();
 
     let c = Cortex::in_memory().unwrap();
-    let engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    let mut engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
     let report = engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap().expect("restored");
     assert_eq!(report.memories, 1);
+}
+
+fn last_oplog_line(sync_dir: &std::path::Path, device: &str) -> String {
+    let files = cortex_core::sync::oplog::list_oplog_files(&sync_dir.join("devices").join(device)).unwrap();
+    let text = std::fs::read_to_string(files.last().expect("an oplog file")).unwrap();
+    text.lines().rev().find(|l| !l.trim().is_empty()).expect("an oplog line").to_string()
+}
+
+/// Codex round 4, P1: A rotates (gen N+1, v1) while B, which hasn't seen it, snapshots
+/// (gen N+1, v0) and B's manifest lands last. A must not adopt the lower key version on
+/// restart; it repairs the manifest back to v1 and keeps writing ENC2 at v1.
+#[test]
+fn concurrent_writer_cannot_roll_back_the_key_version() {
+    use cortex_core::sync::crypto;
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let manifest_path = sync_dir.join("manifest.json");
+    let a = Cortex::in_memory().unwrap();
+    let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    let b = Cortex::in_memory().unwrap();
+    b.storage().store_memory(&public_mem("from b")).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let before = std::fs::read(&manifest_path).unwrap(); // generation N, v0
+
+    // A rotates: generation N+1, v1.
+    engine_a.rotate_key(a.sqlite_storage()).unwrap();
+    // B never saw that write (cloud sync lag): it snapshots from generation N and its
+    // manifest (generation N+1, v0) lands last.
+    std::fs::write(&manifest_path, &before).unwrap();
+    engine_b.create_snapshot(b.sqlite_storage()).unwrap();
+    assert_eq!(manifest_json(&sync_dir)["encryption"]["key_version"], 0);
+
+    // A restarts and must not adopt v0.
+    drop(engine_a);
+    let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    assert_eq!(manifest_json(&sync_dir)["encryption"]["key_version"], 1, "manifest repaired to v1");
+    engine_a.record_op(SyncPayload::MemoryUpsert { memory: public_mem("after restart") }).unwrap();
+    assert_eq!(crypto::envelope_version(&last_oplog_line(&sync_dir, "a")), Some(1));
+
+    // The repaired manifest kept B's pointer, and B's snapshot is still restorable.
+    let c = Cortex::in_memory().unwrap();
+    let mut engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    assert_eq!(engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap().unwrap().memories, 1);
+
+    // B, still running, also follows the repaired manifest instead of reverting it.
+    engine_b.pull_remote(b.sqlite_storage(), b.index()).unwrap();
+    engine_b.record_op(SyncPayload::MemoryUpsert { memory: public_mem("b later") }).unwrap();
+    assert_eq!(crypto::envelope_version(&last_oplog_line(&sync_dir, "b")), Some(1));
+}
+
+/// Codex round 4, P2: B's context predates A's rotation; restoring A's pinned v1 snapshot
+/// must adopt the manifest's key version instead of rejecting it.
+#[test]
+fn restore_after_another_device_rotated_and_snapshotted_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let a = Cortex::in_memory().unwrap();
+    a.storage().store_memory(&public_mem("from a")).unwrap();
+    let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    let b = Cortex::in_memory().unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+
+    engine_a.rotate_key(a.sqlite_storage()).unwrap();
+    engine_a.create_snapshot(a.sqlite_storage()).unwrap();
+
+    assert_eq!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap().memories, 1);
 }

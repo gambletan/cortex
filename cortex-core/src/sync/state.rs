@@ -83,6 +83,11 @@ pub fn init_sync_tables(conn: &Connection) -> Result<(), CortexError> {
         CREATE TABLE IF NOT EXISTS sync_manifest_generation (
             group_salt TEXT PRIMARY KEY,
             generation INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_manifest_key_version (
+            group_salt TEXT PRIMARY KEY,
+            key_version INTEGER NOT NULL
         );",
     )
     .map_err(|e| CortexError::Storage(format!("Failed to init sync tables: {}", e)))
@@ -115,6 +120,32 @@ pub fn raise_manifest_generation(conn: &Connection, group_salt: &str, generation
         "INSERT INTO sync_manifest_generation (group_salt, generation) VALUES (?1, ?2)
          ON CONFLICT(group_salt) DO UPDATE SET generation = MAX(generation, excluded.generation)",
         params![group_salt, generation],
+    )
+    .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// The highest manifest `key_version` this device has accepted or written for this group
+/// (0 if none recorded). Kept separately from the generation so it can be added to existing
+/// databases with `CREATE TABLE IF NOT EXISTS` (no ALTER TABLE migration).
+pub fn get_manifest_key_version(conn: &Connection, group_salt: &str) -> Result<u32, CortexError> {
+    let v = conn
+        .query_row(
+            "SELECT key_version FROM sync_manifest_key_version WHERE group_salt = ?1",
+            params![group_salt],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(v.map(|v| v.clamp(0, u32::MAX as i64) as u32).unwrap_or(0))
+}
+
+/// Raise the recorded key version to `key_version` (never lowers it).
+pub fn raise_manifest_key_version(conn: &Connection, group_salt: &str, key_version: u32) -> Result<(), CortexError> {
+    conn.execute(
+        "INSERT INTO sync_manifest_key_version (group_salt, key_version) VALUES (?1, ?2)
+         ON CONFLICT(group_salt) DO UPDATE SET key_version = MAX(key_version, excluded.key_version)",
+        params![group_salt, key_version as i64],
     )
     .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(())

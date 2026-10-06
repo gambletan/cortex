@@ -125,6 +125,8 @@ pub struct SyncEngine {
     group_salt: Option<String>,
     /// Highest manifest `generation` accepted so far (in memory; at least the persisted mark).
     manifest_generation: std::sync::atomic::AtomicU64,
+    /// Highest manifest `key_version` accepted or written so far (at least the persisted mark).
+    max_key_version: std::sync::atomic::AtomicU32,
 }
 
 impl SyncEngine {
@@ -174,15 +176,19 @@ impl SyncEngine {
         })?;
 
         // Set up encryption if passphrase is provided
-        let (crypto_ctx, group_salt, generation) = if let Some(ref passphrase) = config.encryption_passphrase {
+        let (crypto_ctx, group_salt, generation, key_version) = if let Some(ref passphrase) = config.encryption_passphrase {
             let enc_manifest = match load_verified_manifest(&manifest_path, passphrase)? {
-                (_, Some(manifest)) => {
+                (manifest_json, Some(manifest)) => {
                     // Anti-rollback: the manifest must be at least as new as the newest one this
-                    // device has accepted before (persisted locally, per sync group).
-                    let seen = storage
-                        .with_write_conn(|conn| state::get_manifest_generation(conn, &manifest.salt))?;
-                    check_generation(&manifest, seen)?;
-                    manifest
+                    // device has accepted before, and must not lower the key version (both
+                    // persisted locally, per sync group).
+                    let (seen_gen, max_kv) = storage.with_write_conn(|conn| {
+                        Ok::<_, CortexError>((
+                            state::get_manifest_generation(conn, &manifest.salt)?,
+                            state::get_manifest_key_version(conn, &manifest.salt)?,
+                        ))
+                    })?;
+                    enforce_manifest_marks(&manifest_path, passphrase, manifest_json, manifest, seen_gen, max_kv)?.1
                 }
                 // First time: generate salt and write an HMAC-protected encryption block.
                 (manifest_json, None) => write_encryption_manifest(
@@ -193,13 +199,15 @@ impl SyncEngine {
                 )?,
             };
             let generation = enc_manifest.generation.unwrap_or(0);
+            let key_version = enc_manifest.key_version.unwrap_or(0);
             storage.with_write_conn(|conn| {
-                state::raise_manifest_generation(conn, &enc_manifest.salt, generation)
+                state::raise_manifest_generation(conn, &enc_manifest.salt, generation)?;
+                state::raise_manifest_key_version(conn, &enc_manifest.salt, key_version)
             })?;
             let ctx = crypto::derive_key(passphrase, &enc_manifest)?;
-            (Some(std::sync::Arc::new(ctx)), Some(enc_manifest.salt), generation)
+            (Some(std::sync::Arc::new(ctx)), Some(enc_manifest.salt), generation, key_version)
         } else {
-            (None, None, 0)
+            (None, None, 0, 0)
         };
 
         let hlc = HlcClock::new(&config.device_id);
@@ -212,11 +220,14 @@ impl SyncEngine {
             crypto: crypto_ctx,
             group_salt,
             manifest_generation: std::sync::atomic::AtomicU64::new(generation),
+            max_key_version: std::sync::atomic::AtomicU32::new(key_version),
         })
     }
 
-    /// Load + verify the manifest and enforce the generation high-water mark (raising the
-    /// in-memory mark on success). See [`load_verified_manifest`].
+    /// Load + verify the manifest and enforce the anti-rollback marks (raising the in-memory
+    /// marks on success): a lower generation is an error; a lower key version is a writer
+    /// conflict that gets repaired (see [`enforce_manifest_marks`]). See
+    /// [`load_verified_manifest`].
     fn load_manifest_checked(
         &self,
         passphrase: &str,
@@ -231,11 +242,19 @@ impl SyncEngine {
                         .into(),
                 ));
             }
-            check_generation(m, self.manifest_generation.load(Ordering::Acquire))?;
-            self.manifest_generation
-                .fetch_max(m.generation.unwrap_or(0), Ordering::AcqRel);
         }
-        Ok((json, manifest))
+        let Some(m) = manifest else { return Ok((json, None)) };
+        let (json, m) = enforce_manifest_marks(
+            &manifest_path,
+            passphrase,
+            json,
+            m,
+            self.manifest_generation.load(Ordering::Acquire),
+            self.max_key_version.load(Ordering::Acquire),
+        )?;
+        self.manifest_generation.fetch_max(m.generation.unwrap_or(0), Ordering::AcqRel);
+        self.max_key_version.fetch_max(m.key_version.unwrap_or(0), Ordering::AcqRel);
+        Ok((json, Some(m)))
     }
 
     /// Sign and write the manifest (bumping its generation) and raise the in-memory mark.
@@ -249,14 +268,21 @@ impl SyncEngine {
         let manifest = write_encryption_manifest(&manifest_path, manifest_json, manifest, passphrase)?;
         self.manifest_generation
             .fetch_max(manifest.generation.unwrap_or(0), Ordering::AcqRel);
+        self.max_key_version
+            .fetch_max(manifest.key_version.unwrap_or(0), Ordering::AcqRel);
         Ok(manifest)
     }
 
-    /// Persist the in-memory generation mark to the local database (never lowers it).
+    /// Persist the in-memory anti-rollback marks (generation + key version) to the local
+    /// database (never lowers them).
     fn persist_manifest_generation(&self, storage: &SqliteStorage) -> Result<(), CortexError> {
         if let Some(salt) = &self.group_salt {
             let generation = self.manifest_generation.load(Ordering::Acquire);
-            storage.with_write_conn(|conn| state::raise_manifest_generation(conn, salt, generation))?;
+            let key_version = self.max_key_version.load(Ordering::Acquire);
+            storage.with_write_conn(|conn| {
+                state::raise_manifest_generation(conn, salt, generation)?;
+                state::raise_manifest_key_version(conn, salt, key_version)
+            })?;
         }
         Ok(())
     }
@@ -630,22 +656,26 @@ impl SyncEngine {
     /// pointer, and plaintext mode, use the newest validly-named snapshot, also without
     /// fallback.
     pub fn restore_from_snapshot(
-        &self,
+        &mut self,
         storage: &SqliteStorage,
         index: &MemoryIndex,
     ) -> Result<Option<crate::export::ImportReport>, CortexError> {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
-        if let (Some(ctx), Some(passphrase)) =
-            (self.crypto.as_deref(), self.config.encryption_passphrase.as_deref())
+        if let (true, Some(passphrase)) =
+            (self.crypto.is_some(), self.config.encryption_passphrase.clone())
         {
             // Verified, and not older than any manifest this device has accepted.
-            let (_, manifest) = self.load_manifest_checked(passphrase)?;
+            let (_, manifest) = self.load_manifest_checked(&passphrase)?;
             self.persist_manifest_generation(storage)?;
             let manifest = manifest.ok_or_else(|| {
                 CortexError::Storage(
                     "Encryption manifest is missing — refusing to restore (possible downgrade)".into(),
                 )
             })?;
+            // Another device may have rotated since this engine started: adopt the current key
+            // version, or a pinned snapshot under it would look like a future version.
+            self.adopt_key_version(&manifest, &passphrase)?;
+            let ctx = self.crypto.as_deref().ok_or_else(|| CortexError::Storage("no crypto context".into()))?;
             if let Some(ptr) = manifest.latest_snapshot {
                 // The pointer is authenticated, but still only accept a plain snapshot name.
                 if snapshot::snapshot_date(&ptr.file, true).is_none() {
@@ -790,6 +820,45 @@ fn load_verified_manifest(
         ));
     }
     Ok((manifest_json, Some(manifest)))
+}
+
+/// Apply this device's anti-rollback marks to a verified manifest.
+///
+/// - `generation < seen_gen` → a replayed older manifest: `Err` ("manifest rollback").
+/// - Otherwise, `key_version < max_kv` → a writer conflict: a device that hadn't seen the
+///   latest rotation published a manifest (same or newer generation) carrying the old key
+///   version. Never adopt the lower version; re-publish the manifest with
+///   `key_version = max_kv` (generation bumped, re-signed, snapshot pointer kept).
+///
+/// Returns the (possibly repaired) manifest JSON and encryption manifest (hmac stripped).
+fn enforce_manifest_marks(
+    manifest_path: &std::path::Path,
+    passphrase: &str,
+    manifest_json: serde_json::Value,
+    manifest: crypto::EncryptionManifest,
+    seen_gen: u64,
+    max_kv: u32,
+) -> Result<(serde_json::Value, crypto::EncryptionManifest), CortexError> {
+    check_generation(&manifest, seen_gen)?;
+    let found_kv = manifest.key_version.unwrap_or(0);
+    if found_kv >= max_kv {
+        return Ok((manifest_json, manifest));
+    }
+    tracing::warn!(
+        found = found_kv,
+        expected = max_kv,
+        "Sync manifest carries an older key version than this device has seen \
+         (concurrent writer); re-publishing it at the newer version"
+    );
+    let mut repaired = manifest;
+    repaired.key_version = Some(max_kv);
+    let mut repaired = write_encryption_manifest(manifest_path, manifest_json.clone(), repaired, passphrase)?;
+    let mut json = manifest_json;
+    json["encryption"] =
+        serde_json::to_value(&repaired).map_err(|e| CortexError::Serialization(e.to_string()))?;
+    repaired.hmac = None;
+    repaired.hmac_salt = None;
+    Ok((json, repaired))
 }
 
 /// Reject a manifest older than the newest generation this device has accepted (`seen`).
@@ -1003,7 +1072,7 @@ mod tests {
         plant_valid_snapshot(&engine_a, &cortex_with("deleted long ago"), "snapshot-2001-01-01.json.zst.enc");
 
         let b = crate::Cortex::in_memory().unwrap();
-        let engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
+        let mut engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
 
         // Intact pin: exactly the pinned snapshot is restored.
         let report = engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap();
@@ -1028,7 +1097,7 @@ mod tests {
         fs::write(sync_dir.join("snapshots/snapshot-2002-01-01.json.zst.enc"), "ENC1:x\nHMAC:AAAA\n").unwrap();
 
         let b = crate::Cortex::in_memory().unwrap();
-        let engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
+        let mut engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
         assert!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).is_err());
         assert_eq!(b.stats().unwrap().total, 0);
     }

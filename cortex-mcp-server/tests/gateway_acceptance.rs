@@ -772,3 +772,41 @@ fn audit_records_metadata_without_query_or_snippet() {
         }
     }
 }
+
+/// Slow-body defense: the body has an absolute read deadline (~10 s), and an
+/// unauthenticated request is refused before any body byte is read.
+#[test]
+fn trickled_body_is_cut_off_and_unauthenticated_never_waits() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+    let env = Env::new("slowbody");
+    let srv = env.serve(&[]);
+
+    // Unauthenticated: 401 immediately even though the body never arrives.
+    let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(s, "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n").unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("401"));
+
+    // Authenticated trickle: one byte per second never completes; cut off by the deadline.
+    let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    write!(s, "POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n").unwrap();
+    let start = Instant::now();
+    let mut response = String::new();
+    while start.elapsed() < Duration::from_secs(20) {
+        let _ = s.write_all(b" ");
+        match s.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                response.push_str(&String::from_utf8_lossy(&buf[..n]));
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(800)),
+        }
+    }
+    assert!(response.contains("408"), "expected 408, got {response:?} after {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(15));
+}

@@ -60,7 +60,7 @@ from the internet, through a tunnel the user runs. Full design and threat model:
 |---|---|
 | Scope | One read-only MCP tool. Only memories added with `gateway allow` (namespace `muse-export`, which is reserved: core rejects ordinary ingest and sync-peer writes to it). |
 | Freshness | Each request reads the export straight from SQLite, with no shared index or cache, so `revoke` takes effect on the next request. |
-| Auth | Bearer token (≥ 32 chars, random), constant-time compare; `Origin` allowlist; 64 KiB body; 10 s timeout; 16 concurrent requests; one server per database. |
+| Auth | Bearer token (≥ 32 chars, random), constant-time compare, checked before any body byte is read; `Origin` allowlist; 64 KiB body with an absolute 10 s read deadline; 16 concurrent requests; one server per database. |
 | Budgets | Per UTC day: requests and **distinct** memories disclosed. Every call is charged first. Over the disclosure budget, unseen matches are withheld silently, so no search oracle. |
 | Kill switch | `gateway off` takes effect immediately and fails closed on I/O errors. |
 | Audit | Local JSONL with metadata only (ids, counts, outcome), never the query or text. 0600, rotated. |
