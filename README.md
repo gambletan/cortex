@@ -23,7 +23,7 @@ _Private. Free. Local. — a memory engine for personal AI agents._
 - 🧠 **Real memory, not a text file** — 4 tiers, multi-signal retrieval, self-correcting Bayesian beliefs, a cross-channel people graph.
 - ⚡ **Sub-millisecond** — 156µs ingest, 568µs search. ~528× faster than cloud memory APIs, with no network round-trip.
 - 🔌 **Drop-in for any agent** — one MCP server gives Claude Code / Claude Desktop (or any MCP client) persistent cross-session memory.
-- 🤝 **Works with Meta Muse — without handing over your memory** — Muse sees only what you explicitly export, under a daily budget, with a one-command kill switch and a local audit log. [How →](docs/muse.md)
+- 🤝 **Use Meta Muse without handing Meta your memory**: your archive stays encrypted in *your own* drive, with the key on your devices. Muse gets only the excerpts you allow, under a daily budget, with a one-command kill switch and a local audit log. [How →](docs/muse.md)
 - ☁️ **Yours across devices** — optional end-to-end-encrypted sync through *your own* iCloud / Drive / Dropbox. No server of ours, ever.
 
 **See it remember across sessions — ~30 seconds:**

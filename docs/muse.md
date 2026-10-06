@@ -8,9 +8,13 @@ Muse is far more useful when it knows you: your kid's peanut allergy, that you a
 the aisle seat, which coffee you like. Other memory connectors for Muse handle this by
 putting **your whole memory on their servers.**
 
-Cortex works the other way round. **All your memory stays on your machine. Muse sees only
-the memories you put in the export, it is capped by a daily budget, and you can cut it off
-with one command.**
+Cortex works the other way round: **your memory archive stays on your device, and synced
+copies are encrypted in your own cloud drive (iCloud / Google Drive / Dropbox / OneDrive)
+with a key that only your devices hold.** Muse gets only the excerpts you allow, under a
+daily budget, and you can cut it off with one command.
+
+Don't connect your whole Google Drive to Muse. That gives Meta the plaintext of every file.
+Connect Cortex instead, and Muse gets only what you put in the export.
 
 ## Why this is different
 
@@ -50,9 +54,18 @@ cortex-mcp-server gateway preview "what should I avoid buying for my kid?"
 export CORTEX_GATEWAY_TOKEN=$(cortex-mcp-server gateway token)
 cortex-mcp-server gateway serve            # → http://127.0.0.1:3316/mcp
 
-# 4. Give it an HTTPS address Muse can reach (any tunnel works)
-cloudflared tunnel --url http://127.0.0.1:3316
+# 4. Give it an HTTPS address Muse can reach
+tailscale funnel 3316          # recommended: TLS terminates on YOUR machine
 ```
+
+Use a tunnel that terminates TLS **on your machine**, such as Tailscale Funnel or an opaque
+TCP relay. Tunnels that terminate TLS at their edge (for example `cloudflared` quick tunnels)
+can see the plaintext of every request and response.
+
+Run the gateway on a machine you own that stays on (a home mini-PC, a NAS, or a desktop).
+When it is off, Muse simply can't reach your memory. That fails closed, which is
+intentional. Don't run it on a rented cloud server: the server would hold your key, so you
+would be trusting that provider instead of Meta.
 
 5. In Muse, say *"create a custom connector"*. Enter the URL `https://<your-tunnel>/mcp`
    (MCP) and use `CORTEX_GATEWAY_TOKEN` as the bearer token.
@@ -70,13 +83,26 @@ Budgets: `serve --daily-requests 100 --daily-disclosures 30` are the defaults. T
 disclosure budget counts *distinct* memories per UTC day, so Muse cannot drain your export
 by asking many questions. Requests over budget are refused, and nothing is disclosed.
 
+## What Meta can and cannot see
+
+**Meta can see:** what you ask Muse, and the excerpts the gateway returns (bounded by your
+export list and daily budget). Muse keeps those in its VM and conversation history.
+
+**Meta cannot see:** everything else in your memory: the rest of the archive, your
+history, people graph, beliefs, and anything Private. These never leave your devices
+except as ciphertext in your own drive.
+
+**Your cloud drive provider can see:** that encrypted Cortex files exist, plus their sizes,
+timestamps and your account. It cannot see the contents.
+
 ## Honest limits
 
 - What Muse receives lives in Meta's cloud (your Muse VM and conversation history) and
   cannot be recalled. Meta may use de-identified conversations for training. **Turn that off
   in Muse's settings.**
-- When your computer is off, the tunnel is down and Muse can't reach your memory. That is
-  part of the design.
+- Turning off Muse's own memory doesn't prove Meta deleted anything, and doesn't stop
+  training on de-identified conversations. Use Muse's settings for that.
+- Anyone who controls the machine running the gateway can read your memory. It holds the key.
 - Redaction only catches email addresses. Treat the export list itself as your real
   control, and only export what you'd be comfortable telling Muse directly.
 - Only `cortex-mcp-server gateway` should go through the tunnel. **Never tunnel

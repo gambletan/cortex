@@ -37,7 +37,7 @@ port; it opens the same SQLite DB and exposes exactly one MCP tool. No shared ro
 Docker image; reuses the MCP JSON-RPC types and `redact_emails`.
 
 ```
-Muse (Meta cloud) ──HTTPS──▶ tunnel (cloudflared) ──▶ 127.0.0.1:3316 cortex-mcp-server gateway
+Muse (Meta cloud) ──HTTPS──▶ tunnel (TLS ends on device) ──▶ 127.0.0.1:3316 cortex-mcp-server gateway
                                                          │  auth → kill switch → budget
                                                          │  → retrieve(ns = export ns)
                                                          │  → re-check ns → redact → cap
