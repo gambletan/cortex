@@ -968,15 +968,41 @@ fn write_encryption_manifest(
     let text = serde_json::to_string_pretty(&manifest_json)
         .map_err(|e| CortexError::Serialization(e.to_string()))?;
 
-    let dir = manifest_path.parent().unwrap_or(std::path::Path::new("."));
-    let tmp = dir.join(format!(".manifest.json.tmp-{}", Uuid::new_v4()));
-    fs::write(&tmp, text)
-        .and_then(|_| fs::rename(&tmp, manifest_path))
-        .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            CortexError::Storage(format!("Failed to write manifest: {}", e))
-        })?;
+    write_atomic_durable(manifest_path, text.as_bytes())
+        .map_err(|e| CortexError::Storage(format!("Failed to write manifest: {}", e)))?;
     Ok(manifest)
+}
+
+/// Atomic AND durable publish: exclusive temp file → write → fsync → rename → fsync the
+/// parent directory. Callers advance persistent rollback marks only after this returns, so a
+/// power loss can never leave a mark newer than what actually survived on disk.
+pub(crate) fn write_atomic_durable(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = dir.join(format!(".{}.tmp-{}", name, Uuid::new_v4()));
+    let result = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        sync_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Windows can't open a directory as a file to fsync it; NTFS rename is journaled.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Refuse to run in plaintext mode in a sync folder that belongs to an encrypted group.
@@ -1171,5 +1197,15 @@ mod tests {
         let mut engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
         assert!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).is_err());
         assert_eq!(b.stats().unwrap().total, 0);
+    }
+
+    #[test]
+    fn write_atomic_durable_replaces_and_leaves_no_temp_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        write_atomic_durable(&path, b"one").unwrap();
+        write_atomic_durable(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "no stray temp files");
     }
 }

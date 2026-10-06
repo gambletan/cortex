@@ -125,13 +125,9 @@ pub(crate) fn create_snapshot_with_mac(
     if path.exists() {
         return Err(CortexError::Storage(format!("Snapshot name collision: {}", filename)));
     }
-    let tmp = snapshots_dir.join(format!(".{}.tmp-{}", filename, uuid::Uuid::new_v4()));
-    fs::write(&tmp, &bytes)
-        .and_then(|_| fs::rename(&tmp, &path))
-        .map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            CortexError::Storage(format!("Snapshot write error: {}", e))
-        })?;
+    // Durable before its pointer can be published (see `write_atomic_durable`).
+    crate::sync::write_atomic_durable(&path, &bytes)
+        .map_err(|e| CortexError::Storage(format!("Snapshot write error: {}", e)))?;
 
     tracing::info!(path = %path.display(), size_bytes = bytes.len(), encrypted = crypto.is_some(), "Snapshot created");
     Ok((path, mac))
