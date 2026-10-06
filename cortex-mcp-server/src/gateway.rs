@@ -569,7 +569,10 @@ impl Gateway {
             Ok(()) => {}
             // Same reply as success: a distinct "full" answer would tell Muse whether the
             // user has been draining the inbox. The audit log still records the drop.
+            // It is charged exactly like a stored item, so the daily cap can't reveal it either.
             Err(e) if e == "inbox_full" => {
+                budget.remembers += 1;
+                let _ = save_budget(&self.paths.budget, &budget);
                 let _ = self.audit(REMEMBER_TOOL, 0, &[], 0, "dropped:inbox_full");
                 return json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] });
             }
@@ -1212,6 +1215,30 @@ mod tests {
         assert!(read_inbox(&p).unwrap().is_empty());
         std::fs::write(&p, "{broken\n").unwrap();
         assert!(read_inbox(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_inbox_is_indistinguishable_including_the_daily_cap() {
+        let dir = std::env::temp_dir().join(format!("gw-full-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_db(dir.join("db.sqlite").to_str().unwrap());
+        let filler = InboxItem { id: "x".into(), ts: "t".into(), text: "x".into(), source: "muse".into() };
+        write_inbox(&paths.inbox, &vec![filler; MAX_INBOX]).unwrap();
+        let gw = Gateway {
+            cortex: Cortex::in_memory().unwrap(),
+            paths,
+            daily_requests: 100,
+            daily_disclosures: 5,
+            remember_enabled: true,
+            daily_remembers: 2,
+            lock: Mutex::new(()),
+        };
+        let call = || gw.call_remember(&json!({"text": "hello"}));
+        assert_eq!(call()["content"][0]["text"], REMEMBER_ACK);
+        assert_eq!(call()["content"][0]["text"], REMEMBER_ACK);
+        // Same as with an empty inbox: the third call hits the daily cap.
+        assert_eq!(call()["isError"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

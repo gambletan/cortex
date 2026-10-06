@@ -42,18 +42,32 @@ pub(crate) fn snapshot_mac_input(file_name: &str, envelope: &str) -> Vec<u8> {
     v
 }
 
-/// `snapshot-YYYY-MM-DD.json.zst` (plaintext) / `….json.zst.enc` (encrypted) with a real date.
+/// Length of the random tag in a snapshot name (lowercase hex).
+const NAME_TAG_LEN: usize = 8;
+
+/// Parse a snapshot file name for the given mode and return its date:
+/// `snapshot-YYYY-MM-DD-<8 hex>.json.zst[.enc]` (current; every snapshot gets a unique,
+/// never-overwritten name) or the legacy date-only `snapshot-YYYY-MM-DD.json.zst[.enc]`.
 pub(crate) fn snapshot_date(name: &str, encrypted: bool) -> Option<chrono::NaiveDate> {
     let suffix = if encrypted { ".json.zst.enc" } else { ".json.zst" };
-    let date = name.strip_prefix("snapshot-")?.strip_suffix(suffix)?;
-    if date.len() != 10 {
-        return None;
-    }
+    let stem = name.strip_prefix("snapshot-")?.strip_suffix(suffix)?;
+    let date = match stem.len() {
+        10 => stem,
+        n if n == 10 + 1 + NAME_TAG_LEN => {
+            let (date, tag) = stem.split_at(10);
+            let tag = tag.strip_prefix('-')?;
+            if !tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                return None;
+            }
+            date
+        }
+        _ => return None,
+    };
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
 }
 
 /// Create a compressed snapshot of the entire database.
-/// Saved to `{sync_dir}/snapshots/snapshot-{date}.json.zst` (or `.json.zst.enc` when a
+/// Saved to `{sync_dir}/snapshots/snapshot-{date}-{tag}.json.zst` (or `.json.zst.enc` when a
 /// crypto context is supplied). When sync encryption is on, the snapshot — like the oplog
 /// — is AES-256-GCM encrypted, so nothing cloud-bound is ever written in plaintext.
 pub fn create_snapshot(
@@ -83,7 +97,10 @@ pub(crate) fn create_snapshot_with_mac(
     let compressed = zstd::encode_all(&json[..], 3)
         .map_err(|e| CortexError::Storage(format!("Zstd encode error: {}", e)))?;
 
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Unique per snapshot, so a new snapshot never overwrites an existing (possibly pinned)
+    // one — the pointer is only moved after the new file is completely written.
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..NAME_TAG_LEN];
+    let date = format!("{}-{}", chrono::Utc::now().format("%Y-%m-%d"), tag);
     let (filename, bytes, mac) = match crypto {
         Some(ctx) => {
             use base64::Engine;
@@ -101,6 +118,9 @@ pub(crate) fn create_snapshot_with_mac(
 
     // Write to a temp file and rename, so a reader never sees a half-written snapshot.
     let path = snapshots_dir.join(&filename);
+    if path.exists() {
+        return Err(CortexError::Storage(format!("Snapshot name collision: {}", filename)));
+    }
     let tmp = snapshots_dir.join(format!(".{}.tmp-{}", filename, uuid::Uuid::new_v4()));
     fs::write(&tmp, &bytes)
         .and_then(|_| fs::rename(&tmp, &path))
@@ -141,8 +161,22 @@ pub fn list_snapshots(snapshots_dir: &Path, encrypted: bool) -> Result<Vec<PathB
             snapshots.push((date, mtime, entry.path()));
         }
     }
-    snapshots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    snapshots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.cmp(&a.2)));
     Ok(snapshots.into_iter().map(|(_, _, p)| p).collect())
+}
+
+/// Delete all but the newest `keep` snapshots of the given mode, never touching `protect`
+/// (the pinned snapshot). Best effort: failures are logged, not returned.
+pub(crate) fn prune_snapshots(snapshots_dir: &Path, encrypted: bool, keep: usize, protect: &Path) {
+    let Ok(all) = list_snapshots(snapshots_dir, encrypted) else { return };
+    for old in all.into_iter().skip(keep) {
+        if old == protect {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(&old) {
+            tracing::warn!(path = %old.display(), error = %e, "failed to prune old snapshot");
+        }
+    }
 }
 
 /// Newest snapshot for the given mode (see [`list_snapshots`]).
@@ -541,6 +575,11 @@ mod tests {
             "snapshot-zzzz.json.zst.enc",
             "snapshot-9999-99-99.json.zst.enc",
             "snapshot-2026-03-25.json.zst",
+            "snapshot-2026-03-24-0a1b2c3d.json.zst.enc",
+            "snapshot-2026-03-24-ZZZZZZZZ.json.zst.enc",
+            "snapshot-2026-03-24-0a1b2c3.json.zst.enc",
+            "snapshot-2026-03-24_0a1b2c3d.json.zst.enc",
+            "snapshot-2026-03-24-0a1b2c3d.json.zst",
         ] {
             fs::write(dir.join(name), b"x").unwrap();
         }
@@ -549,7 +588,14 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec!["snapshot-2026-03-23.json.zst.enc", "snapshot-2026-03-20.json.zst.enc"]);
+        assert_eq!(
+            names,
+            vec![
+                "snapshot-2026-03-24-0a1b2c3d.json.zst.enc",
+                "snapshot-2026-03-23.json.zst.enc",
+                "snapshot-2026-03-20.json.zst.enc",
+            ]
+        );
     }
 
     #[test]

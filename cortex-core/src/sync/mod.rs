@@ -112,6 +112,9 @@ pub struct RemoteDevice {
     pub oplog_files: usize,
 }
 
+/// How many snapshots of the current mode to keep (the pinned one is always kept too).
+const SNAPSHOTS_TO_KEEP: usize = 3;
+
 /// Main sync engine.
 pub struct SyncEngine {
     config: SyncConfig,
@@ -267,9 +270,6 @@ impl SyncEngine {
     /// writer to encrypt under the new version. Returns the new active version. Requires sync
     /// encryption to be enabled.
     ///
-    /// This takes no storage handle, so the bumped manifest generation is enforced in memory
-    /// immediately and persisted to the local database on the next `pull_remote`,
-    /// `create_snapshot` or `restore_from_snapshot` (or the next `new`, which re-reads it).
     /// Takes the local storage so the new manifest generation is persisted immediately: a
     /// crash right after rotating must not leave a window where the pre-rotation manifest
     /// could be replayed.
@@ -378,6 +378,15 @@ impl SyncEngine {
     ) -> Result<usize, CortexError> {
         // Flush any in-memory manifest generation (e.g. from `rotate_key`) to the local mark.
         self.persist_manifest_generation(storage)?;
+
+        // Follow key rotations made by other devices, so this device stops writing under a
+        // retired key even if it never creates a snapshot. Also re-checks for rollback.
+        if let Some(passphrase) = self.config.encryption_passphrase.clone() {
+            if let (_, Some(manifest)) = self.load_manifest_checked(&passphrase)? {
+                self.adopt_key_version(&manifest, &passphrase)?;
+                self.persist_manifest_generation(storage)?;
+            }
+        }
 
         let devices_dir = self.config.devices_dir();
         if !devices_dir.exists() {
@@ -535,24 +544,80 @@ impl SyncEngine {
     /// In encryption mode the snapshot is also pinned in the manifest (`latest_snapshot`,
     /// HMAC-protected), which is what [`Self::restore_from_snapshot`] restores — so a stale
     /// snapshot can't be replayed and a newer one can't be suppressed into a fallback.
-    pub fn create_snapshot(&self, storage: &SqliteStorage) -> Result<std::path::PathBuf, CortexError> {
+    ///
+    /// Ordering: (1) load + verify the manifest and, if another device rotated the key, adopt
+    /// the current key version first, so the snapshot is never written under a retired key;
+    /// (2) write the snapshot under a fresh unique name (never overwriting the pinned one);
+    /// (3) only then publish the pointer; (4) prune old unpinned snapshots. A crash at any
+    /// point leaves the previous pin intact and restorable.
+    pub fn create_snapshot(&mut self, storage: &SqliteStorage) -> Result<std::path::PathBuf, CortexError> {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
+        let encrypted = self.crypto.is_some();
+        let Some(passphrase) = self.config.encryption_passphrase.clone().filter(|_| encrypted) else {
+            let path = snapshot::create_snapshot(storage, &snapshots_dir, None)?;
+            snapshot::prune_snapshots(&snapshots_dir, false, SNAPSHOTS_TO_KEEP, &path);
+            return Ok(path);
+        };
+
+        let (_, manifest) = self.load_manifest_checked(&passphrase)?;
+        let manifest = manifest.ok_or_else(|| {
+            CortexError::Storage("Encryption manifest disappeared — cannot create snapshot".into())
+        })?;
+        self.adopt_key_version(&manifest, &passphrase)?;
+        let key_version = manifest.key_version;
+
         let (path, mac) =
             snapshot::create_snapshot_with_mac(storage, &snapshots_dir, self.crypto.as_deref())?;
-        if let (Some(mac), Some(passphrase)) = (mac, self.config.encryption_passphrase.as_deref()) {
-            let (manifest_json, manifest) = self.load_manifest_checked(passphrase)?;
-            let mut manifest = manifest.ok_or_else(|| {
-                CortexError::Storage("Encryption manifest disappeared — cannot pin snapshot".into())
-            })?;
-            let file = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            manifest.latest_snapshot = Some(crypto::SnapshotPointer { file, mac });
-            self.write_manifest(manifest_json, manifest, passphrase)?;
-            self.persist_manifest_generation(storage)?;
+        let mac = mac.ok_or_else(|| CortexError::Storage("Encrypted snapshot has no MAC".into()))?;
+
+        // Re-read right before publishing to shrink the race with other writers. If the key
+        // was rotated meanwhile, don't pin a snapshot written under the now-retired key.
+        let (manifest_json, manifest) = self.load_manifest_checked(&passphrase)?;
+        let mut manifest = manifest.ok_or_else(|| {
+            CortexError::Storage("Encryption manifest disappeared — cannot pin snapshot".into())
+        })?;
+        if manifest.key_version != key_version {
+            let _ = fs::remove_file(&path);
+            return Err(CortexError::Storage(
+                "Sync key was rotated while the snapshot was being written — retry".into(),
+            ));
         }
+        let file = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        manifest.latest_snapshot = Some(crypto::SnapshotPointer { file, mac });
+        self.write_manifest(manifest_json, manifest, &passphrase)?;
+        self.persist_manifest_generation(storage)?;
+
+        snapshot::prune_snapshots(&snapshots_dir, true, SNAPSHOTS_TO_KEEP, &path);
         Ok(path)
+    }
+
+    /// If the (verified) manifest's key version differs from ours — another device rotated —
+    /// re-derive the crypto context and rebuild the oplog writer, as `rotate_key` does, so
+    /// new data is written under the current key. An older manifest version is refused.
+    fn adopt_key_version(
+        &mut self,
+        manifest: &crypto::EncryptionManifest,
+        passphrase: &str,
+    ) -> Result<(), CortexError> {
+        let current = self.crypto.as_ref().map(|c| c.active_version()).unwrap_or(0);
+        let wanted = manifest.key_version.unwrap_or(0);
+        if wanted == current {
+            return Ok(());
+        }
+        if wanted < current {
+            return Err(CortexError::Storage(format!(
+                "Manifest key version {wanted} is older than this device's active version {current} — \
+                 refusing (possible key-version rollback)"
+            )));
+        }
+        let ctx = std::sync::Arc::new(crypto::derive_key(passphrase, manifest)?);
+        self.writer = OpLogWriter::new(self.config.my_device_dir(), Some(ctx.clone()))?;
+        self.crypto = Some(ctx);
+        tracing::info!(from = current, to = wanted, "Adopted rotated sync key version");
+        Ok(())
     }
 
     /// Restore from the authoritative snapshot. Returns None if no snapshot exists.
@@ -933,7 +998,7 @@ mod tests {
         let cfg = |dev: &str| SyncConfig::new(sync_dir.clone(), dev.into(), dev.into()).with_encryption("pass-123");
 
         let a = cortex_with("current");
-        let engine_a = SyncEngine::new(cfg("a"), a.sqlite_storage()).unwrap();
+        let mut engine_a = SyncEngine::new(cfg("a"), a.sqlite_storage()).unwrap();
         let pinned = engine_a.create_snapshot(a.sqlite_storage()).unwrap();
         plant_valid_snapshot(&engine_a, &cortex_with("deleted long ago"), "snapshot-2001-01-01.json.zst.enc");
 
