@@ -552,7 +552,36 @@ fn list_tools_builtin() -> Value {
 
 /// Execute a tool call and return the result as a string.
 fn scrub(r: Result<String, String>) -> Result<String, String> {
-    r.map(|s| redact_local(&s)).map_err(|e| redact_local(&e))
+    r.map(|s| scrub_json_text(&s)).map_err(|e| redact_local(&e))
+}
+
+/// Results are serialized JSON: redact each string value (keys too) and re-serialize, so
+/// redaction can never break JSON escaping. Non-JSON text is redacted as plain text.
+fn scrub_json_text(s: &str) -> String {
+    fn walk(v: &mut Value) {
+        match v {
+            Value::String(t) => *t = redact_local(t),
+            Value::Array(a) => a.iter_mut().for_each(walk),
+            Value::Object(o) => {
+                let entries: Vec<(String, Value)> = std::mem::take(o)
+                    .into_iter()
+                    .map(|(k, mut v)| {
+                        walk(&mut v);
+                        (redact_local(&k), v)
+                    })
+                    .collect();
+                o.extend(entries);
+            }
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<Value>(s) {
+        Ok(mut v) => {
+            walk(&mut v);
+            v.to_string()
+        }
+        Err(_) => redact_local(s),
+    }
 }
 
 /// `redact_emails` plus the user's home directory (it carries the OS login name),
@@ -1674,5 +1703,14 @@ mod tests {
     #[test]
     fn redacts_quoted_local_part() {
         assert_eq!(redact_emails(r#"x "a b"@x.com y"#), "x [redacted-email] y");
+    }
+
+    #[test]
+    fn scrub_keeps_json_valid_with_quoted_emails() {
+        let input = json!({"device_id": "\"a b\"@x.com", "remote_devices": ["GoogleDrive-u@x.com"]}).to_string();
+        let out = scrub(Ok(input)).unwrap();
+        let v: Value = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(v["device_id"], "[redacted-email]");
+        assert_eq!(v["remote_devices"][0], "GoogleDrive-[redacted-email]");
     }
 }
