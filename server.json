@@ -2,24 +2,27 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.gambletan/cortex",
   "title": "Cortex Memory Engine",
-  "description": "Local-first AI memory engine with 4-tier memory model (working/episodic/semantic/procedural), people graph, and Bayesian belief tracking. 29 MCP tools. Rust binary, sub-millisecond operations, AES-256-GCM encrypted.",
+  "description": "Local-first, encrypted AI memory: 4-tier memory, people graph, Bayesian beliefs. Rust, sub-ms.",
   "repository": {
     "url": "https://github.com/gambletan/cortex",
     "source": "github"
   },
-  "version": "2.0.0",
+  "version": "2.2.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/gambletan/cortex/cortex-http:2.0.0",
+      "identifier": "ghcr.io/gambletan/cortex/cortex-http:2.2.0",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
       },
-      "environmentVariables": {
-        "CORTEX_DB_PATH": "/data/memory.db"
-      },
-      "entrypoint": ["cortex-mcp-server", "/data/memory.db"]
+      "environmentVariables": [
+        {
+          "name": "CORTEX_DB_PATH",
+          "description": "Path to the SQLite memory database inside the container",
+          "default": "/data/memory.db"
+        }
+      ]
     }
   ]
 }
