@@ -1423,16 +1423,53 @@ fn tool_sync_providers() -> Result<String, String> {
 /// `sync_status` / `sync_providers` / `sync_enable` call. Cortex's mission is 100% local,
 /// zero-telemetry privacy, so account PII must never ride along in a tool response.
 ///
-/// We conservatively treat the local-part as `[A-Za-z0-9._+%]` (deliberately excluding `-`
-/// so a provider prefix like `GoogleDrive-` is preserved) and the domain as
-/// `[A-Za-z0-9.-]` containing at least one dot. Any match is replaced with `[redacted-email]`.
+/// Two passes:
+/// 1. A known provider folder (`GoogleDrive-<account>`) has everything after the prefix up to
+///    the next path separator replaced wholesale — no character whitelist can leak part of it.
+/// 2. Any other email: the local-part is RFC 5322 `atext` plus `.` and non-ASCII (minus `/`
+///    and `\`, which are path separators); the domain is `[A-Za-z0-9.-]` with at least one dot.
 fn redact_emails(input: &str) -> String {
+    redact_bare_emails(&redact_provider_accounts(input))
+}
+
+const PROVIDER_PREFIXES: &[&str] = &["GoogleDrive-"];
+
+fn redact_provider_accounts(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some((pos, prefix)) = PROVIDER_PREFIXES
+        .iter()
+        .filter_map(|p| rest.find(p).map(|pos| (pos, *p)))
+        .min_by_key(|(pos, _)| *pos)
+    {
+        let account_start = pos + prefix.len();
+        let account_len = rest[account_start..]
+            .find(['/', '\\'])
+            .unwrap_or(rest.len() - account_start);
+        let account = &rest[account_start..account_start + account_len];
+        out.push_str(&rest[..account_start]);
+        if account.contains('@') {
+            out.push_str("[redacted-email]");
+        } else {
+            out.push_str(account);
+        }
+        rest = &rest[account_start + account_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_bare_emails(input: &str) -> String {
     let bytes = input.as_bytes();
-    // `-` is valid in a local-part (`alice-smith@`), so it must be included or the part before
-    // the hyphen leaks. Cloud-storage folder prefixes like `GoogleDrive-` are stripped below.
-    let is_local =
-        |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'%' | b'-');
-    const PROVIDER_PREFIXES: &[&str] = &["GoogleDrive-"];
+    let is_local = |c: u8| {
+        c.is_ascii_alphanumeric()
+            || c >= 0x80
+            || matches!(
+                c,
+                b'.' | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'=' | b'?'
+                    | b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'-'
+            )
+    };
     let is_domain = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-');
 
     let mut out = String::with_capacity(input.len());
@@ -1445,13 +1482,6 @@ fn redact_emails(input: &str) -> String {
             let mut start = i;
             while start > copied && is_local(bytes[start - 1]) {
                 start -= 1;
-            }
-            // Keep a known provider folder prefix visible; redact only the email after it.
-            if let Some(p) = PROVIDER_PREFIXES
-                .iter()
-                .find(|p| input[start..i].starts_with(**p))
-            {
-                start += p.len();
             }
             // Expand right over the domain.
             let mut end = i + 1;
@@ -1539,5 +1569,27 @@ mod tests {
     #[test]
     fn redacts_bare_hyphenated_email() {
         assert_eq!(redact_emails("x mary-jane@ex.org y"), "x [redacted-email] y");
+    }
+
+    #[test]
+    fn redacts_apostrophe_and_unusual_local_parts_in_provider_folder() {
+        for acct in ["alice.o'connor@example.com", "a!b#c@example.com", "jos\u{e9}@example.com"] {
+            let path = format!("/CloudStorage/GoogleDrive-{acct}/My Drive/cortex-sync");
+            assert_eq!(
+                redact_emails(&path),
+                "/CloudStorage/GoogleDrive-[redacted-email]/My Drive/cortex-sync"
+            );
+        }
+    }
+
+    #[test]
+    fn redacts_apostrophe_bare_email() {
+        assert_eq!(redact_emails("to o'brien@ex.com now"), "to [redacted-email] now");
+    }
+
+    #[test]
+    fn keeps_provider_folder_without_email() {
+        let p = "/CloudStorage/GoogleDrive-Shared/x";
+        assert_eq!(redact_emails(p), p);
     }
 }
