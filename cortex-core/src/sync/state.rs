@@ -88,6 +88,14 @@ pub fn init_sync_tables(conn: &Connection) -> Result<(), CortexError> {
         CREATE TABLE IF NOT EXISTS sync_manifest_key_version (
             group_salt TEXT PRIMARY KEY,
             key_version INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_manifest_accepted (
+            group_salt TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL,
+            identity TEXT NOT NULL,
+            pointer_file TEXT,
+            pointer_mac TEXT
         );",
     )
     .map_err(|e| CortexError::Storage(format!("Failed to init sync tables: {}", e)))
@@ -146,6 +154,55 @@ pub fn raise_manifest_key_version(conn: &Connection, group_salt: &str, key_versi
         "INSERT INTO sync_manifest_key_version (group_salt, key_version) VALUES (?1, ?2)
          ON CONFLICT(group_salt) DO UPDATE SET key_version = MAX(key_version, excluded.key_version)",
         params![group_salt, key_version as i64],
+    )
+    .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// The manifest this device accepted at a given generation: its content identity (hash of
+/// the signed, hmac-free bytes) and its snapshot pointer. Used to tell a same-generation
+/// fork (two devices publishing from the same parent) from a re-load of the same manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedManifest {
+    pub generation: u64,
+    pub identity: String,
+    pub pointer: Option<crate::sync::crypto::SnapshotPointer>,
+}
+
+pub fn get_accepted_manifest(conn: &Connection, group_salt: &str) -> Result<Option<AcceptedManifest>, CortexError> {
+    conn.query_row(
+        "SELECT generation, identity, pointer_file, pointer_mac FROM sync_manifest_accepted WHERE group_salt = ?1",
+        params![group_salt],
+        |row| {
+            let file: Option<String> = row.get(2)?;
+            let mac: Option<String> = row.get(3)?;
+            Ok(AcceptedManifest {
+                generation: row.get::<_, i64>(0)?.max(0) as u64,
+                identity: row.get(1)?,
+                pointer: file.zip(mac).map(|(file, mac)| crate::sync::crypto::SnapshotPointer { file, mac }),
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| CortexError::Storage(e.to_string()))
+}
+
+/// Record the accepted manifest; never replaces a record for a higher generation.
+pub fn record_accepted_manifest(conn: &Connection, group_salt: &str, accepted: &AcceptedManifest) -> Result<(), CortexError> {
+    let generation = i64::try_from(accepted.generation)
+        .map_err(|_| CortexError::Storage("manifest generation out of range".into()))?;
+    let (file, mac) = match &accepted.pointer {
+        Some(p) => (Some(p.file.as_str()), Some(p.mac.as_str())),
+        None => (None, None),
+    };
+    conn.execute(
+        "INSERT INTO sync_manifest_accepted (group_salt, generation, identity, pointer_file, pointer_mac)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(group_salt) DO UPDATE SET
+             generation = excluded.generation, identity = excluded.identity,
+             pointer_file = excluded.pointer_file, pointer_mac = excluded.pointer_mac
+         WHERE excluded.generation >= sync_manifest_accepted.generation",
+        params![group_salt, generation, accepted.identity, file, mac],
     )
     .map_err(|e| CortexError::Storage(e.to_string()))?;
     Ok(())

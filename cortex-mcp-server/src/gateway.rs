@@ -552,6 +552,15 @@ impl Gateway {
         if budget.remembers >= self.daily_remembers {
             return self.deny(REMEMBER_TOOL, "denied:remember_budget", "Daily remember budget exhausted.");
         }
+        // Account first, durably, and fail closed: an item is only ever stored after it has
+        // been charged against the daily cap AND recorded in the audit log.
+        budget.remembers += 1;
+        if save_budget(&self.paths.budget, &budget).is_err() {
+            return tool_error("Refusing: could not record the request.");
+        }
+        if self.audit(REMEMBER_TOOL, 0, &[], text.len(), "accepted").is_err() {
+            return tool_error("Refusing: could not record the request.");
+        }
         let item = InboxItem {
             id: Uuid::new_v4().to_string(),
             ts: chrono::Utc::now().to_rfc3339(),
@@ -566,22 +575,17 @@ impl Gateway {
             append_inbox(&self.paths.inbox, &item)
         });
         match stored {
-            Ok(()) => {}
-            // Same reply as success: a distinct "full" answer would tell Muse whether the
-            // user has been draining the inbox. The audit log still records the drop.
-            // It is charged exactly like a stored item, so the daily cap can't reveal it either.
+            Ok(()) => json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] }),
+            // Same reply (and the same charge, above) as success: a distinct "full" answer or
+            // an uncharged cap would tell Muse whether the user has been draining the inbox.
+            // The audit log records the drop.
             Err(e) if e == "inbox_full" => {
-                budget.remembers += 1;
-                let _ = save_budget(&self.paths.budget, &budget);
                 let _ = self.audit(REMEMBER_TOOL, 0, &[], 0, "dropped:inbox_full");
-                return json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] });
+                json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] })
             }
-            Err(_) => return self.deny(REMEMBER_TOOL, "error:inbox", "Could not save."),
+            // The charge stands (conservative): a failed write never refunds the cap.
+            Err(_) => self.deny(REMEMBER_TOOL, "error:inbox", "Could not save."),
         }
-        budget.remembers += 1;
-        let _ = save_budget(&self.paths.budget, &budget);
-        let _ = self.audit(REMEMBER_TOOL, 0, &[], text.len(), "ok");
-        json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] })
     }
 
     fn handle(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -1251,6 +1255,29 @@ mod tests {
         assert_eq!(call()["content"][0]["text"], REMEMBER_ACK);
         // Same as with an empty inbox: the third call hits the daily cap.
         assert_eq!(call()["isError"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_fails_closed_when_accounting_cannot_be_persisted() {
+        let dir = std::env::temp_dir().join(format!("gw-acct-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_db(dir.join("db.sqlite").to_str().unwrap());
+        // Audit path is a directory → every audit write fails.
+        std::fs::create_dir_all(&paths.audit).unwrap();
+        let inbox = paths.inbox.clone();
+        let gw = Gateway {
+            cortex: Cortex::in_memory().unwrap(),
+            paths,
+            daily_requests: 100,
+            daily_disclosures: 5,
+            remember_enabled: true,
+            daily_remembers: 5,
+            lock: Mutex::new(()),
+        };
+        let r = gw.call_remember(&json!({"text": "unaudited"}));
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(read_inbox(&inbox).unwrap().is_empty(), "nothing stored without an audit record");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

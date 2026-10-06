@@ -461,3 +461,86 @@ fn restore_after_another_device_rotated_and_snapshotted_succeeds() {
 
     assert_eq!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap().memories, 1);
 }
+
+/// Codex round 5, P1: two devices publish from generation N concurrently, giving two
+/// validly-signed generation N+1 manifests with different snapshot pointers. A device that
+/// accepted one must never later restore the other's snapshot via a same-generation replay.
+fn same_generation_conflict(restart_observer: bool) {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let manifest_path = sync_dir.join("manifest.json");
+
+    let a = Cortex::in_memory().unwrap();
+    a.storage().store_memory(&public_mem("a1")).unwrap();
+    let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    let b = Cortex::in_memory().unwrap();
+    b.storage().store_memory(&public_mem("b1")).unwrap();
+    b.storage().store_memory(&public_mem("b2")).unwrap();
+    let mut engine_b = SyncEngine::new(config(&sync_dir, "b", Some("pass-123")), b.sqlite_storage()).unwrap();
+    let c = Cortex::in_memory().unwrap();
+    let mut engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    let gen_n = std::fs::read(&manifest_path).unwrap();
+
+    // A and B both publish from generation N (cloud sync lag between them).
+    let snap_a = engine_a.create_snapshot(a.sqlite_storage()).unwrap();
+    let manifest_a = std::fs::read(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, &gen_n).unwrap();
+    engine_b.create_snapshot(b.sqlite_storage()).unwrap();
+    let manifest_b = std::fs::read(&manifest_path).unwrap();
+    let generation = |bytes: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["encryption"]["generation"].as_u64().unwrap()
+    };
+    assert_eq!(generation(&manifest_a), generation(&manifest_b), "same-generation fork");
+
+    // C accepts A's manifest and restores A's snapshot.
+    std::fs::write(&manifest_path, &manifest_a).unwrap();
+    engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap().unwrap();
+    assert_eq!(c.stats().unwrap().total, 1);
+
+    // Attacker (or lagging sync) replays B's equally-new manifest.
+    std::fs::write(&manifest_path, &manifest_b).unwrap();
+    if restart_observer {
+        drop(engine_c);
+        engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    }
+    // Superseded, not adopted: C re-publishes at N+2 keeping the pointer it accepted.
+    let _ = engine_c.restore_from_snapshot(c.sqlite_storage(), c.index());
+    assert_eq!(c.stats().unwrap().total, 1, "B's snapshot must never be restored");
+    let on_disk = std::fs::read(&manifest_path).unwrap();
+    assert_eq!(generation(&on_disk), generation(&manifest_a) + 1);
+    assert_eq!(snapshot_path(&sync_dir), snap_a);
+
+    // B's manifest is now strictly older → a plain rollback.
+    std::fs::write(&manifest_path, &manifest_b).unwrap();
+    let err = engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap_err();
+    assert!(err.to_string().contains("rollback"), "{err}");
+    assert_eq!(c.stats().unwrap().total, 1);
+}
+
+#[test]
+fn same_generation_conflicting_manifest_is_superseded_live() {
+    same_generation_conflict(false);
+}
+
+#[test]
+fn same_generation_conflicting_manifest_is_superseded_after_restart() {
+    same_generation_conflict(true);
+}
+
+#[test]
+fn reloading_the_accepted_manifest_is_a_no_op() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let manifest_path = sync_dir.join("manifest.json");
+    let a = Cortex::in_memory().unwrap();
+    let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    engine_a.create_snapshot(a.sqlite_storage()).unwrap();
+    let accepted = std::fs::read(&manifest_path).unwrap();
+
+    engine_a.pull_remote(a.sqlite_storage(), a.index()).unwrap();
+    engine_a.pull_remote(a.sqlite_storage(), a.index()).unwrap();
+    engine_a.restore_from_snapshot(a.sqlite_storage(), a.index()).unwrap();
+    drop(engine_a);
+    SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), accepted, "no re-publish for the same manifest");
+}
