@@ -12,12 +12,14 @@
 //! process. This is strictly better than persisting the passphrase in a file
 //! and is the standard mechanism available without a native keychain binding.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 const ENV_VAR: &str = "CORTEX_SYNC_PASSPHRASE";
 /// Set to any non-empty value to disable all keychain access (used by tests so
 /// they never touch the developer's real login keychain).
 const NO_KEYCHAIN_ENV: &str = "CORTEX_NO_KEYCHAIN";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "cortex-sync";
 
 fn keychain_disabled() -> bool {

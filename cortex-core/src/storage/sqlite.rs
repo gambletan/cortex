@@ -385,14 +385,14 @@ fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
     // Check for f16 magic prefix
     if b.len() >= 2 && b[0] == F16_MAGIC[0] && b[1] == F16_MAGIC[1] {
         let data = &b[2..];
-        // A truncated body would otherwise be silently shortened by chunks_exact,
+        // A truncated body would otherwise be silently shortened by as_chunks,
         // yielding a wrong-dimension vector. Reject the whole blob instead.
         if !data.len().is_multiple_of(2) {
             return Vec::new();
         }
         let mut result = Vec::with_capacity(data.len() / 2);
-        for chunk in data.chunks_exact(2) {
-            result.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+        for chunk in data.as_chunks::<2>().0 {
+            result.push(f16::from_le_bytes(*chunk).to_f32());
         }
         return result;
     }
@@ -403,8 +403,8 @@ fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
         return Vec::new();
     }
     let mut result = Vec::with_capacity(b.len() / 4);
-    for chunk in b.chunks_exact(4) {
-        result.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in b.as_chunks::<4>().0 {
+        result.push(f32::from_le_bytes(*chunk));
     }
     result
 }
