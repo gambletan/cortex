@@ -38,6 +38,12 @@ pub fn apply_op(
                     "Remote device attempted to sync Private memory — rejected".into(),
                 ));
             }
+            // The Muse export is local consent; a peer must never be able to add to it.
+            if memory.namespace.as_deref() == Some(crate::types::MUSE_EXPORT_NAMESPACE) {
+                return Err(CortexError::InvalidInput(
+                    "Remote device attempted to write the reserved Muse export namespace — rejected".into(),
+                ));
+            }
 
             let entity_type = EntityType::Memory;
             let entity_id = memory.id;
@@ -321,6 +327,26 @@ mod tests {
             .collect();
         ts.sort_unstable();
         ts
+    }
+
+    #[test]
+    fn test_peer_cannot_write_muse_export_namespace() {
+        use crate::types::{MemContent, MemObjectBuilder, MemSource, MemoryTier, PrivacyLevel, MUSE_EXPORT_NAMESPACE};
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let idx = MemoryIndex::new();
+        let memory = MemObjectBuilder::new(MemoryTier::Semantic, MemContent::Text("injected".into()), MemSource::new("x"))
+            .privacy(PrivacyLevel::Public)
+            .namespace(MUSE_EXPORT_NAMESPACE)
+            .build();
+        let id = memory.id;
+        let op = SyncOp {
+            op_id: Uuid::new_v4(),
+            hlc: HlcTimestamp::new(100, 0, "dev-evil"),
+            payload: SyncPayload::MemoryUpsert { memory },
+            hmac: None,
+        };
+        assert!(apply_op(&op, &s, &idx).is_err());
+        assert!(s.get_memory(id).unwrap().is_none());
     }
 
     #[test]

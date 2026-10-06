@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.3.0 — Meta Muse gateway: share a slice of memory, keep the rest on your device
+
+### New: `cortex-mcp-server gateway` ([guide](docs/muse.md))
+- Remote MCP endpoint for **Meta Muse** custom connectors, exposing one read-only tool, `recall_memory`
+- **Explicit export only.** Muse can read only what you add with `gateway allow`. The `muse-export` namespace is reserved in core, so ordinary ingest and sync peers cannot write to it
+- **Budgets.** Per-day caps on requests and on *distinct* memories disclosed. Every call is charged up front, and once the disclosure budget is spent, new matches are withheld silently
+- **Kill switch.** `gateway off` refuses every request immediately; `revoke` takes effect on the next request even while the server is running (no shared cache)
+- **Preview + audit.** `gateway preview` shows exactly what Muse would get. The audit log records only metadata, never your query or the shared text
+- Bearer auth, Origin check, body, time and concurrency limits, email redaction, single instance per DB
+- Preview status: Muse OAuth-only connectors are not supported yet
+
 ## v2.2.1 — Sync hardening, MCP Registry fix
 
 ### Security & privacy

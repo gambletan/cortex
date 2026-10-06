@@ -19,6 +19,7 @@ use tracing::{debug, error, info};
 use cortex_core::Cortex;
 
 mod capabilities;
+mod gateway;
 mod tools;
 
 use capabilities::CapabilityPolicy;
@@ -148,6 +149,11 @@ enum Command {
         /// Number of days to include (default: 7)
         #[arg(short, long, default_value_t = 7)]
         days: u64,
+    },
+    /// Muse gateway: share an explicit slice of memory with Meta Muse over remote MCP
+    Gateway {
+        #[command(subcommand)]
+        action: gateway::GatewayAction,
     },
 }
 
@@ -722,6 +728,11 @@ fn main() {
             println!("cortex-mcp-server {}", SERVER_VERSION);
             println!("DB path:    {}", db_path);
             println!("Embeddings: {}", if has_embeddings { "enabled" } else { "disabled (lite)" });
+        }
+        Some(Command::Gateway { action }) => {
+            let db_path = resolve_db_path(cli.db_path.as_deref());
+            ensure_db_dir(&db_path);
+            gateway::run(action, &db_path);
         }
         None => {
             // Default: run MCP server (backward compatible)

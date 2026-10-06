@@ -432,6 +432,11 @@ fn deserialize_arc_embedding<'de, D: serde::Deserializer<'de>>(
     Ok(opt.map(Arc::new))
 }
 
+/// Namespace reserved for memories the user explicitly exported to the Muse gateway
+/// (`cortex-mcp-server gateway allow`). Ordinary ingest and sync must never write into
+/// it: membership is the user's consent to disclose to a third-party cloud agent.
+pub const MUSE_EXPORT_NAMESPACE: &str = "muse-export";
+
 /// Compute SHA-256 hash of memory content for deduplication.
 pub fn compute_content_hash(content: &MemContent) -> String {
     let text = match content {

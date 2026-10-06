@@ -692,7 +692,7 @@ fn tool_memory_set_privacy(cortex: &Arc<Cortex>, args: &Value) -> Result<String,
     .to_string())
 }
 
-fn content_to_string(content: &cortex_core::types::MemContent) -> String {
+pub(crate) fn content_to_string(content: &cortex_core::types::MemContent) -> String {
     match content {
         cortex_core::types::MemContent::Text(t) => t.clone(),
         cortex_core::types::MemContent::Fact { subject, predicate, object } => {
@@ -1428,7 +1428,7 @@ fn tool_sync_providers() -> Result<String, String> {
 ///    the next path separator replaced wholesale — no character whitelist can leak part of it.
 /// 2. Any other email: the local-part is RFC 5322 `atext` plus `.` and non-ASCII (minus `/`
 ///    and `\`, which are path separators); the domain is `[A-Za-z0-9.-]` with at least one dot.
-fn redact_emails(input: &str) -> String {
+pub(crate) fn redact_emails(input: &str) -> String {
     redact_bare_emails(&redact_provider_accounts(input))
 }
 

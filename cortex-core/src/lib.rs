@@ -562,6 +562,12 @@ impl Cortex {
     /// Auto-generate embedding if embedder is available and none provided.
     /// Lazily initializes the embedding model on first call.
     #[allow(unused_variables)]
+    /// Embed `text` with the local model, or `None` when embeddings are compiled out,
+    /// disabled via `CORTEX_NO_EMBEDDINGS`, or the model failed to load.
+    pub fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
+        self.auto_embed(text, None)
+    }
+
     fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
         if embedding.is_some() {
             return embedding;
@@ -721,6 +727,12 @@ impl Cortex {
         people: &PeopleGraph<'_>,
         pending_hashes: &[String],
     ) -> Result<PrepareOutcome, CortexError> {
+        if namespace == Some(crate::types::MUSE_EXPORT_NAMESPACE) {
+            return Err(CortexError::InvalidInput(format!(
+                "namespace '{}' is reserved for `cortex-mcp-server gateway allow`",
+                crate::types::MUSE_EXPORT_NAMESPACE
+            )));
+        }
         let mut source = MemSource::new(channel);
         let embedding = self.auto_embed(text, embedding);
 

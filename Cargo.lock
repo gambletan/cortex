@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-core"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-http"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "axum",
  "chrono",
@@ -623,8 +623,9 @@ dependencies = [
 
 [[package]]
 name = "cortex-mcp-server"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
+ "axum",
  "chrono",
  "clap",
  "cortex-core",
@@ -633,6 +634,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -640,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-python"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "cortex-core",
  "pyo3",
@@ -649,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-wasm"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "chrono",
  "js-sys",
@@ -3485,6 +3488,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -3503,6 +3507,7 @@ dependencies = [
  "http-body",
  "iri-string",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",

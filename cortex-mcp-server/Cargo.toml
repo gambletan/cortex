@@ -1,6 +1,6 @@
 [package]
 name = "cortex-mcp-server"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2021"
 description = "MCP server for Cortex memory engine — gives LLMs persistent memory"
 
@@ -20,3 +20,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hostname = "0.4"
 rand = "0.8"
+axum = "0.8"
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["timeout"] }
