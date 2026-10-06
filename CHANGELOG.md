@@ -9,6 +9,7 @@
 - **Kill switch.** `gateway off` refuses every request immediately; `revoke` takes effect on the next request even while the server is running (no shared cache)
 - **Preview + audit.** `gateway preview` shows exactly what Muse would get. The audit log records only metadata, never your query or the shared text
 - Bearer auth, Origin check, body, time and concurrency limits, email redaction, single instance per DB
+- `-lite` binary (`--no-default-features`) excludes the gateway and keeps zero HTTP/network crates
 - Preview status: Muse OAuth-only connectors are not supported yet
 
 ## v2.2.1 — Sync hardening, MCP Registry fix

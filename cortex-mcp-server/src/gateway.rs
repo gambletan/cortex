@@ -290,22 +290,25 @@ fn rank(rows: &[MemObject], query: &str, query_emb: Option<&[f32]>, limit: usize
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
 
+    // The cap applies to the tool result as actually serialized on the wire (the results
+    // JSON is embedded as a string, so quotes/backslashes are escaped twice).
     let mut out = Vec::new();
-    let mut bytes = 2;
     for (_, m) in scored.into_iter().take(limit) {
-        let d = Disclosed {
+        out.push(Disclosed {
             id: m.id,
             text: truncate_chars(&redact_emails(&content_to_string(&m.content)), MAX_SNIPPET_CHARS),
             created_at: m.temporal.ingestion_time.to_rfc3339(),
-        };
-        let size = serde_json::to_string(&d).map(|s| s.len() + 1).unwrap_or(usize::MAX);
-        if bytes + size + 16 > MAX_RESPONSE_BYTES {
+        });
+        if tool_result(&out).to_string().len() > MAX_RESPONSE_BYTES {
+            out.pop();
             break;
         }
-        bytes += size;
-        out.push(d);
     }
     out
+}
+
+fn tool_result(items: &[Disclosed]) -> Value {
+    json!({ "content": [{ "type": "text", "text": results_json(items) }] })
 }
 
 fn disclose(cortex: &Cortex, query: &str, limit: usize) -> Result<Vec<Disclosed>, String> {
@@ -417,13 +420,14 @@ impl Gateway {
 
         let ids: Vec<String> = items.iter().map(|d| d.id.to_string()).collect();
         budget.disclosed.extend(ids.iter().cloned());
-        let text = results_json(&items);
+        let result = tool_result(&items);
+        let bytes = result.to_string().len();
         if save_budget(&self.paths.budget, &budget).is_err()
-            || self.audit(items.len(), &ids, text.len(), "ok").is_err()
+            || self.audit(items.len(), &ids, bytes, "ok").is_err()
         {
             return tool_error("Refusing to disclose: could not record the disclosure.");
         }
-        json!({ "content": [{ "type": "text", "text": text }] })
+        result
     }
 
     fn handle(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -766,8 +770,19 @@ mod tests {
             .map(|i| mem(&format!("zebra {i} {}", "y".repeat(1500)), Some(EXPORT_NS), PrivacyLevel::Private))
             .collect();
         let out = rank(&rows, "zebra", None, 5);
-        assert!(results_json(&out).len() <= MAX_RESPONSE_BYTES);
+        assert!(tool_result(&out).to_string().len() <= MAX_RESPONSE_BYTES);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn rank_caps_serialized_response_with_escaping_heavy_text() {
+        // Quotes are escaped twice on the wire (results JSON inside a JSON string).
+        let rows: Vec<_> = (0..5)
+            .map(|i| mem(&format!("zebra{i} {}", "\"".repeat(480)), Some(EXPORT_NS), PrivacyLevel::Private))
+            .collect();
+        let out = rank(&rows, "zebra0 zebra1 zebra2 zebra3 zebra4", None, 5);
+        assert!(!out.is_empty());
+        assert!(tool_result(&out).to_string().len() <= MAX_RESPONSE_BYTES);
     }
 
     #[test]

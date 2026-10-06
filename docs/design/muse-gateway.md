@@ -172,6 +172,14 @@ NOT in scope: OAuth 2.1 + DCR (spike first), write tools, `memory_context`, mult
 tunnel automation. Existing code reused: MCP JSON-RPC types, `redact_emails`, storage
 namespace query, embedder, release pipeline.
 
+## Pre-push Codex review fixes (2026-10-06)
+
+- Gateway and its HTTP stack (`axum`, `tower`, `tower-http` → `hyper`) sit behind the
+  `gateway` cargo feature (default on). The `--no-default-features` lite binary keeps
+  **zero** HTTP/network crates (verified with `cargo tree`).
+- The 4 KiB cap is enforced on the tool result as serialized (results JSON is embedded as a
+  string, so escaping doubles), with an escaping-heavy regression test.
+
 ## Adversarial review fixes (2026-10-06)
 
 Third-context review found no HIGH/CRITICAL. Fixed: (M1) refusals were uncharged → unmetered

@@ -569,6 +569,8 @@ impl Cortex {
     }
 
     fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
+        #[cfg(not(feature = "embeddings"))]
+        let _ = text;
         if embedding.is_some() {
             return embedding;
         }

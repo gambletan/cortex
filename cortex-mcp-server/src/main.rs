@@ -19,6 +19,7 @@ use tracing::{debug, error, info};
 use cortex_core::Cortex;
 
 mod capabilities;
+#[cfg(feature = "gateway")]
 mod gateway;
 mod tools;
 
@@ -151,6 +152,7 @@ enum Command {
         days: u64,
     },
     /// Muse gateway: share an explicit slice of memory with Meta Muse over remote MCP
+    #[cfg(feature = "gateway")]
     Gateway {
         #[command(subcommand)]
         action: gateway::GatewayAction,
@@ -729,6 +731,7 @@ fn main() {
             println!("DB path:    {}", db_path);
             println!("Embeddings: {}", if has_embeddings { "enabled" } else { "disabled (lite)" });
         }
+        #[cfg(feature = "gateway")]
         Some(Command::Gateway { action }) => {
             let db_path = resolve_db_path(cli.db_path.as_deref());
             ensure_db_dir(&db_path);

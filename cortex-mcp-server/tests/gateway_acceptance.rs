@@ -3,6 +3,7 @@
 //! Written by a context-isolated agent from `docs/design/muse-gateway.md` and the
 //! gateway contract only — never from the implementation. Drives the real binary:
 //! CLI subcommands + raw HTTP/1.1 against `gateway serve`.
+#![cfg(feature = "gateway")]
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};

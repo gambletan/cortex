@@ -31,6 +31,10 @@ item takes effect on the next request, even while the server is running.
 
 ## Setup (≈5 minutes)
 
+Requires the standard `cortex-mcp-server` build. The `-lite` build has no HTTP code at all,
+so it does not include the gateway.
+
+
 ```bash
 # 1. Choose what Muse may see (copy, not move; your originals stay private)
 cortex-mcp-server gateway allow "My daughter is allergic to peanuts"
