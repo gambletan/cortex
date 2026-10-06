@@ -376,3 +376,22 @@ fn a_running_device_follows_another_devices_key_rotation_on_pull() {
     let last = files.iter().flat_map(|f| std::fs::read_to_string(f).unwrap().lines().map(String::from).collect::<Vec<_>>()).last().unwrap();
     assert!(last.starts_with("ENC2:"), "B must write under the rotated key: {}", &last[..8]);
 }
+
+#[test]
+fn pinned_snapshot_stays_restorable_after_key_rotation() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let a = Cortex::in_memory().unwrap();
+    let mem = MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text("pre-rotation fact".into()), MemSource::new("t"))
+        .privacy(PrivacyLevel::Public)
+        .build();
+    a.storage().store_memory(&mem).unwrap();
+    let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
+    engine_a.create_snapshot(a.sqlite_storage()).unwrap();
+    engine_a.rotate_key(a.sqlite_storage()).unwrap();
+
+    let c = Cortex::in_memory().unwrap();
+    let engine_c = SyncEngine::new(config(&sync_dir, "c", Some("pass-123")), c.sqlite_storage()).unwrap();
+    let report = engine_c.restore_from_snapshot(c.sqlite_storage(), c.index()).unwrap().expect("restored");
+    assert_eq!(report.memories, 1);
+}

@@ -51,6 +51,10 @@ const NAME_TAG_LEN: usize = 8;
 pub(crate) fn snapshot_date(name: &str, encrypted: bool) -> Option<chrono::NaiveDate> {
     let suffix = if encrypted { ".json.zst.enc" } else { ".json.zst" };
     let stem = name.strip_prefix("snapshot-")?.strip_suffix(suffix)?;
+    // Untrusted directory entries: never slice by byte offset into non-ASCII text.
+    if !stem.is_ascii() {
+        return None;
+    }
     let date = match stem.len() {
         10 => stem,
         n if n == 10 + 1 + NAME_TAG_LEN => {
@@ -270,15 +274,22 @@ pub(crate) fn restore_with_limits(
         if !ctx.verify_operation_hmac(&snapshot_mac_input(&file_name, envelope), mac)? {
             return Err(CortexError::Storage("Snapshot HMAC mismatch — tampered or forged".into()));
         }
-        // After a key rotation, envelopes under any version older than the active one use a
-        // rotated-out key (whoever leaked it could have produced them) — reject them.
-        match crypto::envelope_version(envelope) {
-            Some(v) if v >= ctx.active_version() => {}
-            _ => {
-                return Err(CortexError::Storage(
-                    "Snapshot uses a rotated-out key version — rejected".into(),
-                ))
-            }
+        // Envelope version policy:
+        // - Pinned restore (`expected_mac`): the exact bytes are bound by the manifest's
+        //   HMAC-protected pointer, so a snapshot written before a rotation stays restorable
+        //   (otherwise every rotation would break bootstrap until a new snapshot exists).
+        //   Only versions from the future are refused.
+        // - Unpinned (legacy) restore: nothing vouches for freshness, so anything under a
+        //   rotated-out key is rejected.
+        let version = crypto::envelope_version(envelope)
+            .ok_or_else(|| CortexError::Storage("Snapshot envelope version unreadable — rejected".into()))?;
+        let acceptable = if expected_mac.is_some() {
+            version <= ctx.active_version()
+        } else {
+            version >= ctx.active_version()
+        };
+        if !acceptable {
+            return Err(CortexError::Storage("Snapshot uses a rotated-out key version — rejected".into()));
         }
         crypto::decrypt_line(ctx, envelope)?
     } else if crypto.is_some() {
@@ -654,5 +665,11 @@ mod tests {
         };
         assert!(go("AAAA").is_err());
         assert!(go(&mac).is_ok());
+    }
+
+    #[test]
+    fn test_non_ascii_snapshot_names_are_rejected_not_panicking() {
+        assert!(snapshot_date("snapshot-123456789\u{e9}12345678.json.zst.enc", true).is_none());
+        assert!(snapshot_date("snapshot-2026-03-2\u{e9}.json.zst.enc", true).is_none());
     }
 }
