@@ -72,6 +72,31 @@ would be trusting that provider instead of Meta.
 5. In Muse, say *"create a custom connector"*. Enter the URL `https://<your-tunnel>/mcp`
    (MCP) and use `CORTEX_GATEWAY_TOKEN` as the bearer token.
 
+## Let Muse save to *your* memory (`remember`, v2.4)
+
+You can turn off Muse's built-in memory and have Muse save to Cortex instead:
+
+```bash
+cortex-mcp-server gateway serve --enable-remember     # adds the `remember` tool
+cortex-mcp-server gateway inbox                       # what Muse asked to keep
+cortex-mcp-server gateway approve <id>                # keep it (and let Muse recall it)
+cortex-mcp-server gateway reject <id>                 # or: reject --all
+```
+
+- **Muse can only append.** It can't read, search, edit or delete the inbox. Muse gets
+  back only "Saved for the user's review.", with no id and no echo of the text.
+- **Nothing moves until you approve.** Inbox items aren't searchable, aren't embedded, and
+  never sync. Approving an item makes it a normal Private memory and adds a copy to the
+  export, so `recall_memory` can find it.
+- **Bounded:** 1000 characters per item, 20 per day (`--daily-remembers`), 200 pending at
+  most. Calls also count against the daily request budget. The kill switch applies.
+- `gateway inbox` escapes control and bidi characters, so text written by Muse can't
+  control your terminal or disguise what you're approving.
+
+Approving means "Muse may see this", not "this is true". Muse saw the text in the
+conversation anyway; what changes is that the long-term copy lives with you and can be
+deleted with you, not with Meta.
+
 ## Day-to-day control
 
 ```bash

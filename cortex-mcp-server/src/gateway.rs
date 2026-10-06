@@ -62,6 +62,10 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const MIN_TOKEN_LEN: usize = 32;
 const MIN_COSINE: f32 = 0.2;
 const TOOL_NAME: &str = "recall_memory";
+const REMEMBER_TOOL: &str = "remember";
+const MAX_REMEMBER_CHARS: usize = 1000;
+const MAX_INBOX: usize = 200;
+const REMEMBER_ACK: &str = "Saved for the user's review.";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const ALL_TIERS: [MemoryTier; 5] = [
     MemoryTier::Working,
@@ -88,6 +92,22 @@ pub enum GatewayAction {
         /// Browser Origin allowed to call the endpoint (requests without Origin are fine)
         #[arg(long)]
         allow_origin: Vec<String>,
+        /// Offer the `remember` tool: Muse can add items to a review inbox (append-only)
+        #[arg(long)]
+        enable_remember: bool,
+        /// Max `remember` items accepted per UTC day
+        #[arg(long, default_value_t = 20)]
+        daily_remembers: u32,
+    },
+    /// List items Muse asked to remember, pending your review
+    Inbox,
+    /// Approve an inbox item: becomes a Private memory and is exported to Muse
+    Approve { id: String },
+    /// Discard an inbox item (or all of them with --all)
+    Reject {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// Print a fresh random bearer token
     Token,
@@ -122,6 +142,8 @@ struct Paths {
     budget: PathBuf,
     audit: PathBuf,
     lock: PathBuf,
+    inbox: PathBuf,
+    inbox_lock: PathBuf,
 }
 
 impl Paths {
@@ -136,12 +158,18 @@ impl Paths {
             budget: dir.join("gateway-state.json"),
             audit: dir.join("gateway-audit.jsonl"),
             lock: dir.join("gateway.lock"),
+            inbox: dir.join("gateway-inbox.jsonl"),
+            inbox_lock: dir.join("gateway-inbox.lock"),
         }
     }
 
     /// Kill switch. An I/O error while checking counts as OFF (fail closed).
     fn is_disabled(&self) -> bool {
-        self.disabled.try_exists().unwrap_or(true)
+        // Anything at the path (file, dir, even a dangling link) means OFF.
+        match std::fs::symlink_metadata(&self.disabled) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 }
 
@@ -154,6 +182,9 @@ struct Budget {
     /// and auditing each one would let a caller rotate real disclosure records away.
     #[serde(default)]
     over_budget_logged: bool,
+    /// `remember` calls stored today.
+    #[serde(default)]
+    remembers: u32,
 }
 
 fn today() -> String {
@@ -162,7 +193,7 @@ fn today() -> String {
 
 /// Missing file = fresh budget. Unreadable or corrupt = error (fail closed, never reset).
 fn load_budget(path: &Path, day: &str) -> Result<Budget, String> {
-    let b: Budget = match std::fs::read_to_string(path) {
+    let b: Budget = match read_private(path) {
         Ok(s) => serde_json::from_str(&s).map_err(|_| "budget state is corrupt".to_string())?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Budget::default(),
         Err(_) => return Err("budget state is unreadable".into()),
@@ -175,22 +206,44 @@ fn load_budget(path: &Path, day: &str) -> Result<Budget, String> {
 }
 
 /// Owner-only (0600 on Unix): budget and audit reveal when and what Muse asked for.
+///
+/// Never follows a symlink: the state files sit next to the DB, and a planted link must not
+/// redirect budget/audit/inbox reads or writes elsewhere.
 fn private_options() -> std::fs::OpenOptions {
     let mut o = std::fs::OpenOptions::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     o
 }
 
+/// Read a state file without following symlinks; NotFound passes through.
+fn read_private(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = private_options().read(true).open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// A fresh, unpredictable temp path next to `path`, created exclusively (no clobbering of a
+/// pre-planted file or link).
+fn create_temp_beside(path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
+    let f = private_options().write(true).create_new(true).open(&tmp)?;
+    Ok((tmp, f))
+}
+
 /// Atomic + durable: write a temp file, fsync, rename. A crash never leaves a torn file.
 fn save_budget(path: &Path, b: &Budget) -> Result<(), String> {
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let data = serde_json::to_vec(b).map_err(|e| e.to_string())?;
     let write = || -> std::io::Result<()> {
-        let mut f = private_options().write(true).create(true).truncate(true).open(&tmp)?;
+        let (tmp, mut f) = create_temp_beside(path)?;
         f.write_all(&data)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -362,6 +415,9 @@ struct Gateway {
     paths: Paths,
     daily_requests: u32,
     daily_disclosures: u32,
+    /// `remember` is opt-in (`serve --enable-remember`); without it the tool doesn't exist.
+    remember_enabled: bool,
+    daily_remembers: u32,
     /// Serializes budget read-modify-write across concurrent requests.
     lock: Mutex<()>,
 }
@@ -389,13 +445,13 @@ fn parse_args(args: &Value) -> Result<(String, usize), String> {
 }
 
 impl Gateway {
-    fn audit(&self, n: usize, ids: &[String], bytes: usize, outcome: &str) -> Result<(), String> {
+    fn audit(&self, tool: &str, n: usize, ids: &[String], bytes: usize, outcome: &str) -> Result<(), String> {
         append_audit(
             &self.paths.audit,
             &json!({
                 "ts": chrono::Utc::now().to_rfc3339(),
                 "method": "tools/call",
-                "tool": TOOL_NAME,
+                "tool": tool,
                 "n_results": n,
                 "memory_ids": ids,
                 "bytes": bytes,
@@ -404,46 +460,51 @@ impl Gateway {
         )
     }
 
-    fn deny(&self, outcome: &str, msg: &str) -> Value {
-        let _ = self.audit(0, &[], 0, outcome);
+    fn deny(&self, tool: &str, outcome: &str, msg: &str) -> Value {
+        let _ = self.audit(tool, 0, &[], 0, outcome);
         tool_error(msg)
     }
 
     /// Every authenticated call is charged against the request budget *before* anything
     /// else, including calls that are then refused, so refusals can't be used as a free,
-    /// unmetered search oracle. Once the distinct-disclosure budget is spent, unseen
-    /// matches are silently withheld (indistinguishable from "no match").
-    fn call_recall(&self, args: &Value) -> Value {
-        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-
-        let mut budget = match load_budget(&self.paths.budget, &today()) {
-            Ok(b) => b,
-            Err(e) => return self.deny("denied:budget_state", &format!("Refusing to disclose: {e}.")),
-        };
+    /// unmetered oracle. Then the kill switch. Caller must hold `self.lock`.
+    fn charge(&self, tool: &str) -> Result<Budget, Value> {
+        let mut budget = load_budget(&self.paths.budget, &today())
+            .map_err(|e| self.deny(tool, "denied:budget_state", &format!("Refusing: {e}.")))?;
         if budget.requests >= self.daily_requests {
             const MSG: &str = "Daily request budget exhausted.";
             if budget.over_budget_logged {
-                return tool_error(MSG);
+                return Err(tool_error(MSG));
             }
             budget.over_budget_logged = true;
             let _ = save_budget(&self.paths.budget, &budget);
-            return self.deny("denied:request_budget", MSG);
+            return Err(self.deny(tool, "denied:request_budget", MSG));
         }
         budget.requests += 1;
         if save_budget(&self.paths.budget, &budget).is_err() {
-            return tool_error("Refusing to disclose: could not record the request.");
+            return Err(tool_error("Refusing: could not record the request."));
         }
-
         if self.paths.is_disabled() {
-            return self.deny("denied:disabled", "Memory access for Muse is turned off by the user.");
+            return Err(self.deny(tool, "denied:disabled", "Memory access for Muse is turned off by the user."));
         }
+        Ok(budget)
+    }
+
+    /// Once the distinct-disclosure budget is spent, unseen matches are silently withheld
+    /// (indistinguishable from "no match").
+    fn call_recall(&self, args: &Value) -> Value {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut budget = match self.charge(TOOL_NAME) {
+            Ok(b) => b,
+            Err(v) => return v,
+        };
         let (query, limit) = match parse_args(args) {
             Ok(v) => v,
-            Err(e) => return self.deny("denied:bad_args", &e),
+            Err(e) => return self.deny(TOOL_NAME, "denied:bad_args", &e),
         };
         let mut items = match disclose(&self.cortex, &query, limit) {
             Ok(v) => v,
-            Err(_) => return self.deny("error:storage", "Memory lookup failed."),
+            Err(_) => return self.deny(TOOL_NAME, "error:storage", "Memory lookup failed."),
         };
         let mut remaining = (self.daily_disclosures as usize).saturating_sub(budget.disclosed.len());
         items.retain(|d| {
@@ -463,11 +524,61 @@ impl Gateway {
         let result = tool_result(&items);
         let bytes = result.to_string().len();
         if save_budget(&self.paths.budget, &budget).is_err()
-            || self.audit(items.len(), &ids, bytes, "ok").is_err()
+            || self.audit(TOOL_NAME, items.len(), &ids, bytes, "ok").is_err()
         {
             return tool_error("Refusing to disclose: could not record the disclosure.");
         }
         result
+    }
+
+    /// Append-only capture into the quarantined inbox. Muse gets an acknowledgement with no
+    /// id and no echo; nothing here is readable by Muse until the user approves it.
+    fn call_remember(&self, args: &Value) -> Value {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut budget = match self.charge(REMEMBER_TOOL) {
+            Ok(b) => b,
+            Err(v) => return v,
+        };
+        let text = match args.get("text").and_then(Value::as_str) {
+            Some(t) if !t.trim().is_empty() && t.chars().count() <= MAX_REMEMBER_CHARS => t,
+            _ => {
+                return self.deny(
+                    REMEMBER_TOOL,
+                    "denied:bad_args",
+                    &format!("`text` must be a non-empty string of at most {MAX_REMEMBER_CHARS} characters"),
+                )
+            }
+        };
+        if budget.remembers >= self.daily_remembers {
+            return self.deny(REMEMBER_TOOL, "denied:remember_budget", "Daily remember budget exhausted.");
+        }
+        let item = InboxItem {
+            id: Uuid::new_v4().to_string(),
+            ts: chrono::Utc::now().to_rfc3339(),
+            text: text.to_string(),
+            source: "muse".into(),
+        };
+        let stored = with_inbox_lock(&self.paths, || {
+            let pending = read_inbox(&self.paths.inbox)?;
+            if pending.len() >= MAX_INBOX {
+                return Err("inbox_full".to_string());
+            }
+            append_inbox(&self.paths.inbox, &item)
+        });
+        match stored {
+            Ok(()) => {}
+            // Same reply as success: a distinct "full" answer would tell Muse whether the
+            // user has been draining the inbox. The audit log still records the drop.
+            Err(e) if e == "inbox_full" => {
+                let _ = self.audit(REMEMBER_TOOL, 0, &[], 0, "dropped:inbox_full");
+                return json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] });
+            }
+            Err(_) => return self.deny(REMEMBER_TOOL, "error:inbox", "Could not save."),
+        }
+        budget.remembers += 1;
+        let _ = save_budget(&self.paths.budget, &budget);
+        let _ = self.audit(REMEMBER_TOOL, 0, &[], text.len(), "ok");
+        json!({ "content": [{ "type": "text", "text": REMEMBER_ACK }] })
     }
 
     fn handle(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -490,19 +601,123 @@ impl Gateway {
                 )
             }
             "ping" => JsonRpcResponse::success(id, json!({})),
-            "tools/list" => JsonRpcResponse::success(id, json!({ "tools": [tool_schema()] })),
+            "tools/list" => {
+                let mut tools = vec![tool_schema()];
+                if self.remember_enabled {
+                    tools.push(remember_schema());
+                }
+                JsonRpcResponse::success(id, json!({ "tools": tools }))
+            }
             "tools/call" => {
                 let name = req.params.get("name").and_then(Value::as_str).unwrap_or("");
-                if name != TOOL_NAME {
-                    JsonRpcResponse::error(id, -32602, format!("Unknown tool: {name}"))
-                } else {
-                    let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
-                    JsonRpcResponse::success(id, self.call_recall(&args))
+                let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
+                match name {
+                    TOOL_NAME => JsonRpcResponse::success(id, self.call_recall(&args)),
+                    REMEMBER_TOOL if self.remember_enabled => {
+                        JsonRpcResponse::success(id, self.call_remember(&args))
+                    }
+                    _ => JsonRpcResponse::error(id, -32602, format!("Unknown tool: {name}")),
                 }
             }
             other => JsonRpcResponse::error(id, -32601, format!("Method not found: {other}")),
         })
     }
+}
+
+fn remember_schema() -> Value {
+    json!({
+        "name": REMEMBER_TOOL,
+        "description": "Save something worth remembering about the user to the user's own private memory. \
+            The user reviews it first: you cannot read it back until they approve it, after which recall_memory can find it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "minLength": 1, "maxLength": MAX_REMEMBER_CHARS }
+            },
+            "required": ["text"]
+        }
+    })
+}
+
+// ── Remember inbox (quarantine) ──────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct InboxItem {
+    id: String,
+    ts: String,
+    text: String,
+    source: String,
+}
+
+/// Exclusive lock shared by the server (append) and the CLI (approve/reject), so the two
+/// processes never interleave a read-modify-write.
+fn with_inbox_lock<T>(paths: &Paths, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let lock = private_options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&paths.inbox_lock)
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let out = f();
+    let _ = lock.unlock();
+    out
+}
+
+/// Missing = empty. Any unparsable line = error (fail closed).
+fn read_inbox(path: &Path) -> Result<Vec<InboxItem>, String> {
+    let s = match read_private(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    s.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).map_err(|_| "inbox is corrupt".to_string()))
+        .collect()
+}
+
+fn append_inbox(path: &Path, item: &InboxItem) -> Result<(), String> {
+    let line = serde_json::to_string(item).map_err(|e| e.to_string())?;
+    let mut f = private_options().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    writeln!(f, "{line}").map_err(|e| e.to_string())?;
+    f.sync_data().map_err(|e| e.to_string())
+}
+
+fn write_inbox(path: &Path, items: &[InboxItem]) -> Result<(), String> {
+    let write = || -> std::io::Result<()> {
+        let (tmp, mut f) = create_temp_beside(path)?;
+        for item in items {
+            writeln!(f, "{}", serde_json::to_string(item).map_err(std::io::Error::other)?)?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| e.to_string())
+}
+
+/// Bidi controls, zero-width and other default-ignorable code points: invisible in a
+/// terminal, so they could hide or reorder what the user thinks they're approving.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// Inbox text is untrusted (Muse wrote it): escape control and invisible characters so
+/// printing it can't drive the user's terminal or disguise what they're approving.
+fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || is_invisible(c) {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn tool_schema() -> Value {
@@ -684,7 +899,7 @@ pub fn run(action: GatewayAction, db_path: &str) {
         GatewayAction::List => {
             let cortex = open(db_path);
             for m in export_rows(&cortex).unwrap_or_else(|e| die(&e)) {
-                println!("{}\t{}", m.id, content_to_string(&m.content).replace(['\n', '\t'], " "));
+                println!("{}\t{}", m.id, terminal_safe(&content_to_string(&m.content).replace(['\n', '\t'], " ")));
             }
         }
         GatewayAction::Revoke { id } => {
@@ -703,9 +918,9 @@ pub fn run(action: GatewayAction, db_path: &str) {
             let args = json!({ "query": query, "limit": limit });
             let (q, l) = parse_args(&args).unwrap_or_else(|e| die(&e));
             let items = disclose(&cortex, &q, l).unwrap_or_else(|e| die(&e));
-            println!("{}", results_json(&items));
+            println!("{}", terminal_safe(&results_json(&items)));
         }
-        GatewayAction::Audit => match std::fs::read_to_string(&paths.audit) {
+        GatewayAction::Audit => match read_private(&paths.audit) {
             Ok(s) => print!("{s}"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => die(&e.to_string()),
@@ -722,7 +937,60 @@ pub fn run(action: GatewayAction, db_path: &str) {
             }
             println!("Muse access is ON");
         }
-        GatewayAction::Serve { host, port, daily_requests, daily_disclosures, allow_origin } => {
+        GatewayAction::Inbox => {
+            let items = with_inbox_lock(&paths, || read_inbox(&paths.inbox)).unwrap_or_else(|e| die(&e));
+            for i in items {
+                println!("{}\t{}\t{}", i.id, i.ts, terminal_safe(&i.text));
+            }
+        }
+        GatewayAction::Approve { id } => {
+            let cortex = open(db_path);
+            let export_id = with_inbox_lock(&paths, || {
+                let mut items = read_inbox(&paths.inbox)?;
+                let pos = items.iter().position(|i| i.id == id).ok_or("no inbox item with that id")?;
+                let text = items[pos].text.clone();
+                // Memory writes first: if we crash before the inbox rewrite, the item is
+                // still pending and re-approving is idempotent (dedup).
+                cortex
+                    .ingest_with_options(&text, "muse", None, None, None, None, Some(PrivacyLevel::Private))
+                    .map_err(|e| e.to_string())?;
+                let export_id = allow(&cortex, &text)?;
+                items.remove(pos);
+                write_inbox(&paths.inbox, &items)?;
+                Ok(export_id)
+            })
+            .unwrap_or_else(|e| die(&e));
+            println!("{export_id}");
+        }
+        GatewayAction::Reject { id, all } => {
+            let removed = with_inbox_lock(&paths, || {
+                let mut items = read_inbox(&paths.inbox)?;
+                let before = items.len();
+                match (id.as_deref(), all) {
+                    (None, true) => items.clear(),
+                    (Some(id), false) => {
+                        items.retain(|i| i.id != id);
+                        if items.len() == before {
+                            return Err("no inbox item with that id".to_string());
+                        }
+                    }
+                    _ => return Err("give either an ID or --all".to_string()),
+                }
+                write_inbox(&paths.inbox, &items)?;
+                Ok(before - items.len())
+            })
+            .unwrap_or_else(|e| die(&e));
+            println!("rejected {removed}");
+        }
+        GatewayAction::Serve {
+            host,
+            port,
+            daily_requests,
+            daily_disclosures,
+            allow_origin,
+            enable_remember,
+            daily_remembers,
+        } => {
             let token = std::env::var("CORTEX_GATEWAY_TOKEN").unwrap_or_default();
             let distinct = token.chars().collect::<BTreeSet<_>>().len();
             if token.len() < MIN_TOKEN_LEN || distinct < MIN_TOKEN_DISTINCT_CHARS {
@@ -748,7 +1016,15 @@ pub fn run(action: GatewayAction, db_path: &str) {
                 Err(e) => die(&e),
             }
             let state = Arc::new(HttpState {
-                gw: Gateway { cortex, paths, daily_requests, daily_disclosures, lock: Mutex::new(()) },
+                gw: Gateway {
+                    cortex,
+                    paths,
+                    daily_requests,
+                    daily_disclosures,
+                    remember_enabled: enable_remember,
+                    daily_remembers,
+                    lock: Mutex::new(()),
+                },
                 token,
                 origins: allow_origin,
                 workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
@@ -881,6 +1157,8 @@ mod tests {
             paths,
             daily_requests: 1,
             daily_disclosures: 5,
+            remember_enabled: false,
+            daily_remembers: 0,
             lock: Mutex::new(()),
         };
         for _ in 0..20 {
@@ -912,5 +1190,28 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn terminal_safe_escapes_controls_and_bidi() {
+        let out = terminal_safe("ok\x1b[31mred\r\n\t\u{202E}e\u{200B}v\u{061C}i\u{FEFF}l");
+        assert!(!out.chars().any(|c| c.is_control() || is_invisible(c)), "{out}");
+        assert!(out.starts_with("ok") && out.contains("red") && out.contains("e\\u{200b}v"), "{out}");
+    }
+
+    #[test]
+    fn inbox_roundtrip_and_fails_closed_on_corruption() {
+        let dir = std::env::temp_dir().join(format!("gw-inbox-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("inbox.jsonl");
+        assert!(read_inbox(&p).unwrap().is_empty());
+        let item = InboxItem { id: "1".into(), ts: "t".into(), text: "x".into(), source: "muse".into() };
+        append_inbox(&p, &item).unwrap();
+        assert_eq!(read_inbox(&p).unwrap(), vec![item]);
+        write_inbox(&p, &[]).unwrap();
+        assert!(read_inbox(&p).unwrap().is_empty());
+        std::fs::write(&p, "{broken\n").unwrap();
+        assert!(read_inbox(&p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

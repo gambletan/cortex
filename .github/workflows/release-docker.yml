@@ -27,7 +27,13 @@ jobs:
       - name: Extract version from tag
         id: meta
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          # Tag push → version from the tag; workflow_dispatch from a branch → the crate
+          # version (GITHUB_REF would otherwise yield an invalid tag like refs/heads/main).
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(grep -m1 '^version' cortex-mcp-server/Cargo.toml | cut -d'"' -f2)
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - uses: docker/build-push-action@v5

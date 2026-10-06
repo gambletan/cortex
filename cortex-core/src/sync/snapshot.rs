@@ -13,6 +13,44 @@ use std::path::{Path, PathBuf};
 
 /// Suffix marking an encrypted snapshot.
 const ENC_SUFFIX: &str = ".enc";
+const HMAC_PREFIX: &str = "HMAC:";
+
+/// Upper bounds on what restore will read from the (untrusted) sync folder.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SnapshotLimits {
+    /// Size of the snapshot file on disk.
+    pub max_file_bytes: u64,
+    /// Size of the zstd-decompressed JSON (guards against decompression bombs).
+    pub max_decompressed_bytes: u64,
+}
+
+impl SnapshotLimits {
+    pub(crate) const DEFAULT: Self = Self {
+        max_file_bytes: 256 * 1024 * 1024,
+        max_decompressed_bytes: 1024 * 1024 * 1024,
+    };
+}
+
+/// HMAC input for an encrypted snapshot: domain-separated from op HMACs and bound to the
+/// file name (its date), so a snapshot can't be replayed under another name or forged by
+/// someone holding only a (leaked or rotated-out) content key.
+pub(crate) fn snapshot_mac_input(file_name: &str, envelope: &str) -> Vec<u8> {
+    let mut v = b"cortex-snapshot-v1\0".to_vec();
+    v.extend_from_slice(file_name.as_bytes());
+    v.push(0);
+    v.extend_from_slice(envelope.as_bytes());
+    v
+}
+
+/// `snapshot-YYYY-MM-DD.json.zst` (plaintext) / `….json.zst.enc` (encrypted) with a real date.
+pub(crate) fn snapshot_date(name: &str, encrypted: bool) -> Option<chrono::NaiveDate> {
+    let suffix = if encrypted { ".json.zst.enc" } else { ".json.zst" };
+    let date = name.strip_prefix("snapshot-")?.strip_suffix(suffix)?;
+    if date.len() != 10 {
+        return None;
+    }
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
 
 /// Create a compressed snapshot of the entire database.
 /// Saved to `{sync_dir}/snapshots/snapshot-{date}.json.zst` (or `.json.zst.enc` when a
@@ -23,6 +61,16 @@ pub fn create_snapshot(
     snapshots_dir: &Path,
     crypto: Option<&CryptoContext>,
 ) -> Result<PathBuf, CortexError> {
+    Ok(create_snapshot_with_mac(storage, snapshots_dir, crypto)?.0)
+}
+
+/// [`create_snapshot`], also returning the `HMAC:` line value of an encrypted snapshot so
+/// the caller can pin it in the manifest (`None` in plaintext mode).
+pub(crate) fn create_snapshot_with_mac(
+    storage: &dyn StorageBackend,
+    snapshots_dir: &Path,
+    crypto: Option<&CryptoContext>,
+) -> Result<(PathBuf, Option<String>), CortexError> {
     fs::create_dir_all(snapshots_dir)
         .map_err(|e| CortexError::Storage(format!("Failed to create snapshots dir: {}", e)))?;
 
@@ -36,24 +84,33 @@ pub fn create_snapshot(
         .map_err(|e| CortexError::Storage(format!("Zstd encode error: {}", e)))?;
 
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let (filename, bytes) = match crypto {
+    let (filename, bytes, mac) = match crypto {
         Some(ctx) => {
-            // ENC1:<base64(nonce||ciphertext)> — same envelope as encrypted oplog lines.
+            use base64::Engine;
+            // Line 1: the same envelope as encrypted oplog lines (ENC1/ENC2).
+            // Line 2: HMAC:<base64> over the name + envelope (see `snapshot_mac_input`).
             let line = crypto::encrypt_line(ctx, &compressed)?;
-            (
-                format!("snapshot-{}.json.zst{}", date, ENC_SUFFIX),
-                line.into_bytes(),
-            )
+            let filename = format!("snapshot-{}.json.zst{}", date, ENC_SUFFIX);
+            let mac = base64::engine::general_purpose::STANDARD
+                .encode(ctx.compute_operation_hmac(&snapshot_mac_input(&filename, &line)));
+            let bytes = format!("{line}\n{HMAC_PREFIX}{mac}\n").into_bytes();
+            (filename, bytes, Some(mac))
         }
-        None => (format!("snapshot-{}.json.zst", date), compressed),
+        None => (format!("snapshot-{}.json.zst", date), compressed, None),
     };
 
+    // Write to a temp file and rename, so a reader never sees a half-written snapshot.
     let path = snapshots_dir.join(&filename);
-    fs::write(&path, &bytes)
-        .map_err(|e| CortexError::Storage(format!("Snapshot write error: {}", e)))?;
+    let tmp = snapshots_dir.join(format!(".{}.tmp-{}", filename, uuid::Uuid::new_v4()));
+    fs::write(&tmp, &bytes)
+        .and_then(|_| fs::rename(&tmp, &path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            CortexError::Storage(format!("Snapshot write error: {}", e))
+        })?;
 
     tracing::info!(path = %path.display(), size_bytes = bytes.len(), encrypted = crypto.is_some(), "Snapshot created");
-    Ok(path)
+    Ok((path, mac))
 }
 
 /// Find the latest snapshot in the snapshots directory.
@@ -65,45 +122,35 @@ pub fn create_snapshot(
 /// [`restore_from_snapshot`] — starving the device of a legitimate older `.enc` snapshot
 /// (a bootstrap denial-of-service). Filtering by mode here means a wrong-mode decoy is never
 /// selected in the first place.
-pub fn find_latest_snapshot(
-    snapshots_dir: &Path,
-    encrypted: bool,
-) -> Result<Option<PathBuf>, CortexError> {
+pub fn list_snapshots(snapshots_dir: &Path, encrypted: bool) -> Result<Vec<PathBuf>, CortexError> {
     if !snapshots_dir.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-
-    let mut snapshots: Vec<PathBuf> = Vec::new();
     let entries = fs::read_dir(snapshots_dir)
         .map_err(|e| CortexError::Storage(format!("Failed to read snapshots dir: {}", e)))?;
-
+    let mut snapshots = Vec::new();
     for entry in entries {
         let entry = entry
             .map_err(|e| CortexError::Storage(format!("Failed to read dir entry: {}", e)))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("snapshot-") {
-            continue;
-        }
-        let is_enc = name.ends_with(".json.zst.enc");
-        // `.json.zst.enc` ends with `.enc`, not `.json.zst`, so these are mutually exclusive.
-        let is_plain = name.ends_with(".json.zst");
-        // Only consider snapshots matching the caller's active mode.
-        let matches_mode = if encrypted { is_enc } else { is_plain };
-        if matches_mode {
-            snapshots.push(entry.path());
+        // Strict name check (current mode + a real date): a junk name like `snapshot-zzzz…`
+        // can't sort itself to the front. In encryption mode the manifest's snapshot pointer
+        // decides what is restored; this ordering only matters for legacy (unpinned) groups.
+        if let Some(date) = snapshot_date(&name, encrypted) {
+            let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+            snapshots.push((date, mtime, entry.path()));
         }
     }
+    snapshots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    Ok(snapshots.into_iter().map(|(_, _, p)| p).collect())
+}
 
-    // Order by the date key (filename with the .enc suffix stripped) so encryption mode
-    // never changes recency ordering; break same-date ties by modification time.
-    let date_key = |p: &PathBuf| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().trim_end_matches(".enc").to_string())
-            .unwrap_or_default()
-    };
-    let mtime = |p: &PathBuf| p.metadata().and_then(|m| m.modified()).ok();
-    snapshots.sort_by(|a, b| date_key(a).cmp(&date_key(b)).then_with(|| mtime(a).cmp(&mtime(b))));
-    Ok(snapshots.last().cloned())
+/// Newest snapshot for the given mode (see [`list_snapshots`]).
+pub fn find_latest_snapshot(
+    snapshots_dir: &Path,
+    encrypted: bool,
+) -> Result<Option<PathBuf>, CortexError> {
+    Ok(list_snapshots(snapshots_dir, encrypted)?.into_iter().next())
 }
 
 /// Restore from a compressed snapshot.
@@ -114,23 +161,97 @@ pub fn restore_from_snapshot(
     index: &MemoryIndex,
     crypto: Option<&CryptoContext>,
 ) -> Result<(ImportReport, String), CortexError> {
-    let raw = fs::read(path)
-        .map_err(|e| CortexError::Storage(format!("Failed to open snapshot: {}", e)))?;
+    restore_with_limits(path, storage, index, crypto, None, SnapshotLimits::DEFAULT)
+}
 
-    // Encrypted snapshots (.enc) hold an ENC1: text envelope; decrypt to the zstd bytes.
+/// [`restore_from_snapshot`] that additionally requires an encrypted snapshot's `HMAC:` line
+/// to equal `expected_mac` (the manifest's snapshot pointer), so a validly-authenticated but
+/// stale snapshot replayed under the same name is rejected.
+pub(crate) fn restore_pinned(
+    path: &Path,
+    storage: &dyn StorageBackend,
+    index: &MemoryIndex,
+    crypto: &CryptoContext,
+    expected_mac: &str,
+) -> Result<(ImportReport, String), CortexError> {
+    restore_with_limits(path, storage, index, Some(crypto), Some(expected_mac), SnapshotLimits::DEFAULT)
+}
+
+pub(crate) fn restore_with_limits(
+    path: &Path,
+    storage: &dyn StorageBackend,
+    index: &MemoryIndex,
+    crypto: Option<&CryptoContext>,
+    expected_mac: Option<&str>,
+    limits: SnapshotLimits,
+) -> Result<(ImportReport, String), CortexError> {
+    use std::io::Read;
+
+    // Check the size before reading, and bound the read itself (the file may grow between
+    // the stat and the read).
+    let file = fs::File::open(path)
+        .map_err(|e| CortexError::Storage(format!("Failed to open snapshot: {}", e)))?;
+    let too_large = || {
+        CortexError::Storage(format!(
+            "Snapshot file too large (limit {} bytes) — rejected",
+            limits.max_file_bytes
+        ))
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| CortexError::Storage(format!("Failed to stat snapshot: {}", e)))?
+        .len();
+    if len > limits.max_file_bytes {
+        return Err(too_large());
+    }
+    let mut raw = Vec::with_capacity(len as usize);
+    file.take(limits.max_file_bytes.saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(|e| CortexError::Storage(format!("Failed to read snapshot: {}", e)))?;
+    if raw.len() as u64 > limits.max_file_bytes {
+        return Err(too_large());
+    }
+
+    // Encrypted snapshots (.enc) hold an ENC1/ENC2 text envelope; decrypt to the zstd bytes.
     let compressed = if path.to_string_lossy().ends_with(ENC_SUFFIX) {
         let ctx = crypto.ok_or_else(|| {
             CortexError::Storage("Snapshot is encrypted but no key was provided".into())
         })?;
-        let line = String::from_utf8(raw)
+        let text = String::from_utf8(raw)
             .map_err(|e| CortexError::Storage(format!("Encrypted snapshot not UTF-8: {}", e)))?;
-        crypto::decrypt_line(ctx, line.trim())?
+        let mut lines = text.lines();
+        let envelope = lines.next().unwrap_or("").trim();
+        let mac = lines
+            .next()
+            .and_then(|l| l.trim().strip_prefix(HMAC_PREFIX))
+            .ok_or_else(|| CortexError::Storage("Encrypted snapshot has no integrity HMAC — rejected".into()))?;
+        if let Some(expected) = expected_mac {
+            if mac != expected {
+                return Err(CortexError::Storage(
+                    "Snapshot does not match the manifest's snapshot pointer — stale or replayed, rejected".into(),
+                ));
+            }
+        }
+        let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if !ctx.verify_operation_hmac(&snapshot_mac_input(&file_name, envelope), mac)? {
+            return Err(CortexError::Storage("Snapshot HMAC mismatch — tampered or forged".into()));
+        }
+        // After a key rotation, envelopes under any version older than the active one use a
+        // rotated-out key (whoever leaked it could have produced them) — reject them.
+        match crypto::envelope_version(envelope) {
+            Some(v) if v >= ctx.active_version() => {}
+            _ => {
+                return Err(CortexError::Storage(
+                    "Snapshot uses a rotated-out key version — rejected".into(),
+                ))
+            }
+        }
+        crypto::decrypt_line(ctx, envelope)?
     } else if crypto.is_some() {
         // SECURITY: encryption is enabled, but this snapshot is not an encrypted (.enc)
-        // envelope. The cloud sync directory is untrusted and `find_latest_snapshot` picks
-        // by date, so an attacker with write access can drop a forged plaintext `.json.zst`
-        // (e.g. a far-future date) that would otherwise be restored with NO key and NO
-        // authentication — a key-less injection on new-device bootstrap. Restoring a
+        // envelope. The cloud sync directory is untrusted, so an attacker with write access
+        // can drop a forged plaintext `.json.zst` that would otherwise be restored with NO key
+        // and NO authentication — a key-less injection on new-device bootstrap. Restoring a
         // plaintext snapshot while encryption is active is a downgrade attack; fail closed.
         return Err(CortexError::Storage(
             "Rejecting plaintext snapshot while encryption is enabled — possible downgrade or injection attack".into(),
@@ -139,8 +260,20 @@ pub fn restore_from_snapshot(
         raw
     };
 
-    let json = zstd::decode_all(&compressed[..])
+    // Stream-decompress with a cap so a small zstd bomb can't exhaust memory.
+    let decoder = zstd::stream::read::Decoder::new(&compressed[..])
         .map_err(|e| CortexError::Storage(format!("Zstd decode error: {}", e)))?;
+    let mut json = Vec::new();
+    decoder
+        .take(limits.max_decompressed_bytes.saturating_add(1))
+        .read_to_end(&mut json)
+        .map_err(|e| CortexError::Storage(format!("Zstd decode error: {}", e)))?;
+    if json.len() as u64 > limits.max_decompressed_bytes {
+        return Err(CortexError::Storage(format!(
+            "Snapshot decompressed size exceeds limit of {} bytes — rejected",
+            limits.max_decompressed_bytes
+        )));
+    }
 
     let data: ExportData = serde_json::from_slice(&json)
         .map_err(|e| CortexError::Serialization(e.to_string()))?;
@@ -357,5 +490,123 @@ mod tests {
             0,
             "no forged memory may be injected from a plaintext snapshot in encryption mode"
         );
+    }
+
+    fn public_cortex() -> crate::Cortex {
+        let cortex = crate::Cortex::in_memory().unwrap();
+        let mem = crate::types::MemObjectBuilder::new(
+            crate::MemoryTier::Episodic,
+            crate::MemContent::Text("I live in Shanghai".to_string()),
+            crate::MemSource::new("test"),
+        )
+        .privacy(crate::PrivacyLevel::Public)
+        .build();
+        cortex.storage().store_memory(&mem).unwrap();
+        cortex
+    }
+
+    #[test]
+    fn test_encrypted_snapshot_requires_valid_hmac() {
+        let cortex = public_cortex();
+        let ctx = crypto::derive_key("snapshot-test-pass", &crypto::new_encryption_manifest()).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        let path = create_snapshot(cortex.storage(), &dir, Some(&ctx)).unwrap();
+        let target = crate::Cortex::in_memory().unwrap();
+
+        // Stripped HMAC (envelope only): rejected even though the key decrypts it.
+        let raw = fs::read_to_string(&path).unwrap();
+        let envelope = raw.lines().next().unwrap().to_string();
+        fs::write(&path, format!("{envelope}\n")).unwrap();
+        assert!(restore_from_snapshot(&path, target.storage(), target.index(), Some(&ctx)).is_err());
+
+        // Valid HMAC but replayed under another date: rejected (name is bound).
+        fs::write(&path, &raw).unwrap();
+        let renamed = dir.join("snapshot-2001-01-01.json.zst.enc");
+        fs::copy(&path, &renamed).unwrap();
+        assert!(restore_from_snapshot(&renamed, target.storage(), target.index(), Some(&ctx)).is_err());
+
+        // Untouched: restores.
+        assert!(restore_from_snapshot(&path, target.storage(), target.index(), Some(&ctx)).is_ok());
+    }
+
+    #[test]
+    fn test_list_snapshots_rejects_junk_names_and_orders_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "snapshot-2026-03-20.json.zst.enc",
+            "snapshot-2026-03-23.json.zst.enc",
+            "snapshot-zzzz.json.zst.enc",
+            "snapshot-9999-99-99.json.zst.enc",
+            "snapshot-2026-03-25.json.zst",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let names: Vec<String> = list_snapshots(&dir, true)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["snapshot-2026-03-23.json.zst.enc", "snapshot-2026-03-20.json.zst.enc"]);
+    }
+
+    #[test]
+    fn test_snapshot_rejects_envelope_older_than_active_version() {
+        let cortex = public_cortex();
+        let base = crypto::new_encryption_manifest();
+        let at = |v: u32| {
+            let mut m = base.clone();
+            m.key_version = Some(v);
+            crypto::derive_key("snapshot-test-pass", &m).unwrap()
+        };
+        let (ctx1, ctx2) = (at(1), at(2));
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        let path = create_snapshot(cortex.storage(), &dir, Some(&ctx1)).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().starts_with("ENC2:"));
+
+        // Same HMAC key (version-0 derived), but the envelope is at a retired version.
+        let target = crate::Cortex::in_memory().unwrap();
+        let err = restore_from_snapshot(&path, target.storage(), target.index(), Some(&ctx2)).unwrap_err();
+        assert!(err.to_string().contains("rotated-out"), "{err}");
+        assert!(restore_from_snapshot(&path, target.storage(), target.index(), Some(&ctx1)).is_ok());
+    }
+
+    #[test]
+    fn test_restore_enforces_size_limits() {
+        let cortex = public_cortex();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        let path = create_snapshot(cortex.storage(), &dir, None).unwrap();
+        let file_len = fs::metadata(&path).unwrap().len();
+        let target = crate::Cortex::in_memory().unwrap();
+        let restore = |limits: SnapshotLimits| {
+            restore_with_limits(&path, target.storage(), target.index(), None, None, limits)
+        };
+
+        let err = restore(SnapshotLimits { max_file_bytes: file_len - 1, max_decompressed_bytes: u64::MAX })
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let err = restore(SnapshotLimits { max_file_bytes: u64::MAX, max_decompressed_bytes: 16 }).unwrap_err();
+        assert!(err.to_string().contains("decompressed size"), "{err}");
+        assert!(restore(SnapshotLimits::DEFAULT).is_ok());
+    }
+
+    #[test]
+    fn test_restore_requires_expected_mac_when_given() {
+        let cortex = public_cortex();
+        let ctx = crypto::derive_key("snapshot-test-pass", &crypto::new_encryption_manifest()).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        let (path, mac) = create_snapshot_with_mac(cortex.storage(), &dir, Some(&ctx)).unwrap();
+        let mac = mac.expect("encrypted snapshot has a mac");
+        let target = crate::Cortex::in_memory().unwrap();
+        let go = |expected: &str| {
+            restore_with_limits(&path, target.storage(), target.index(), Some(&ctx), Some(expected), SnapshotLimits::DEFAULT)
+        };
+        assert!(go("AAAA").is_err());
+        assert!(go(&mac).is_ok());
     }
 }

@@ -1,7 +1,8 @@
 [package]
 name = "cortex-mcp-server"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
+rust-version = "1.89"
 description = "MCP server for Cortex memory engine — gives LLMs persistent memory"
 
 [features]
@@ -25,3 +26,6 @@ rand = "0.8"
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", features = ["limit"], optional = true }
 tower-http = { version = "0.6", features = ["timeout"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

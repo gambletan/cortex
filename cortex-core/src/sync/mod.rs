@@ -118,12 +118,22 @@ pub struct SyncEngine {
     hlc: HlcClock,
     writer: OpLogWriter,
     crypto: Option<std::sync::Arc<crypto::CryptoContext>>,
+    /// Encryption mode only: the sync group's KDF salt (keys the local generation mark).
+    group_salt: Option<String>,
+    /// Highest manifest `generation` accepted so far (in memory; at least the persisted mark).
+    manifest_generation: std::sync::atomic::AtomicU64,
 }
 
 impl SyncEngine {
     /// Initialize the sync engine. Creates sync folder structure.
     /// Sync tables are initialized in SqliteStorage::init() — no separate connection needed.
     pub fn new(config: SyncConfig, storage: &SqliteStorage) -> Result<Self, CortexError> {
+        // Without a key, refuse to join a group that is (or looks) encrypted — before writing
+        // anything into the shared folder.
+        if config.encryption_passphrase.is_none() {
+            ensure_plaintext_group(&config.sync_dir)?;
+        }
+
         // Create sync directory structure
         let my_dir = config.my_device_dir();
         fs::create_dir_all(&my_dir)
@@ -161,79 +171,91 @@ impl SyncEngine {
         })?;
 
         // Set up encryption if passphrase is provided
-        let crypto_ctx = if let Some(ref passphrase) = config.encryption_passphrase {
-            // Read or create encryption manifest
-            let manifest_path = config.sync_dir.join("manifest.json");
-            let manifest_json: serde_json::Value = if manifest_path.exists() {
-                let content = fs::read_to_string(&manifest_path)
-                    .map_err(|e| CortexError::Storage(format!("Failed to read manifest: {}", e)))?;
-                serde_json::from_str(&content)
-                    .map_err(|e| CortexError::Serialization(e.to_string()))?
-            } else {
-                serde_json::json!({})
-            };
-
-            let enc_manifest = if let Some(enc) = manifest_json.get("encryption") {
-                let mut manifest = serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
-                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
-
-                // Manifest integrity is MANDATORY once encryption is enabled. The manifest is
-                // stored in plaintext on (potentially untrusted) cloud storage, so its HMAC is
-                // the only thing binding `salt`, `kdf_params`, and `key_version`. If a missing
-                // HMAC were tolerated, an attacker could simply strip the field to bypass the
-                // integrity check and roll `key_version` back to a previously-compromised
-                // version, forcing new writes under a leaked key — defeating forward secrecy.
-                let stored_hmac = manifest.hmac.take().ok_or_else(|| {
-                    CortexError::Storage(
-                        "Encryption manifest is missing its integrity HMAC — refusing to load. \
-                         This indicates tampering or a downgrade attack on the sync directory.".into()
-                    )
-                })?;
-                let stored_salt = manifest.hmac_salt.take();
-                // Recompute HMAC to verify integrity
-                let manifest_without_hmac = serde_json::to_vec(&manifest)
-                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
-                if !crypto::verify_manifest_integrity(
-                    &manifest_without_hmac,
-                    &stored_hmac,
-                    passphrase,
-                    stored_salt.as_deref(),
-                )? {
-                    return Err(CortexError::Storage(
-                        "Manifest integrity check failed: HMAC mismatch. Data may be corrupted or tampered.".into()
-                    ));
+        let (crypto_ctx, group_salt, generation) = if let Some(ref passphrase) = config.encryption_passphrase {
+            let enc_manifest = match load_verified_manifest(&manifest_path, passphrase)? {
+                (_, Some(manifest)) => {
+                    // Anti-rollback: the manifest must be at least as new as the newest one this
+                    // device has accepted before (persisted locally, per sync group).
+                    let seen = storage
+                        .with_write_conn(|conn| state::get_manifest_generation(conn, &manifest.salt))?;
+                    check_generation(&manifest, seen)?;
+                    manifest
                 }
-
-                manifest
-            } else {
-                // First time: generate salt and write to manifest
-                let mut new_manifest = crypto::new_encryption_manifest();
-
-                // Compute HMAC for new manifest
-                let manifest_json_bytes = serde_json::to_vec(&new_manifest)
-                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
-                let (hmac_value, hmac_salt) = crypto::compute_manifest_hmac(&manifest_json_bytes, passphrase)?;
-                new_manifest.hmac = Some(hmac_value);
-                new_manifest.hmac_salt = Some(hmac_salt);
-
-                let mut updated = manifest_json.clone();
-                updated["encryption"] = serde_json::to_value(&new_manifest)
-                    .map_err(|e| CortexError::Serialization(e.to_string()))?;
-                fs::write(&manifest_path, serde_json::to_string_pretty(&updated).unwrap())
-                    .map_err(|e| CortexError::Storage(format!("Failed to write manifest: {}", e)))?;
-                new_manifest
+                // First time: generate salt and write an HMAC-protected encryption block.
+                (manifest_json, None) => write_encryption_manifest(
+                    &manifest_path,
+                    manifest_json,
+                    crypto::new_encryption_manifest(),
+                    passphrase,
+                )?,
             };
-
+            let generation = enc_manifest.generation.unwrap_or(0);
+            storage.with_write_conn(|conn| {
+                state::raise_manifest_generation(conn, &enc_manifest.salt, generation)
+            })?;
             let ctx = crypto::derive_key(passphrase, &enc_manifest)?;
-            Some(std::sync::Arc::new(ctx))
+            (Some(std::sync::Arc::new(ctx)), Some(enc_manifest.salt), generation)
         } else {
-            None
+            (None, None, 0)
         };
 
         let hlc = HlcClock::new(&config.device_id);
         let writer = OpLogWriter::new(my_dir, crypto_ctx.clone())?;
 
-        Ok(Self { config, hlc, writer, crypto: crypto_ctx })
+        Ok(Self {
+            config,
+            hlc,
+            writer,
+            crypto: crypto_ctx,
+            group_salt,
+            manifest_generation: std::sync::atomic::AtomicU64::new(generation),
+        })
+    }
+
+    /// Load + verify the manifest and enforce the generation high-water mark (raising the
+    /// in-memory mark on success). See [`load_verified_manifest`].
+    fn load_manifest_checked(
+        &self,
+        passphrase: &str,
+    ) -> Result<(serde_json::Value, Option<crypto::EncryptionManifest>), CortexError> {
+        let manifest_path = self.config.sync_dir.join("manifest.json");
+        let (json, manifest) = load_verified_manifest(&manifest_path, passphrase)?;
+        if let Some(m) = &manifest {
+            if self.group_salt.as_deref() != Some(m.salt.as_str()) {
+                return Err(CortexError::Storage(
+                    "Encryption manifest now belongs to a different sync group (salt changed) — refusing; \
+                     re-enable sync to join it"
+                        .into(),
+                ));
+            }
+            check_generation(m, self.manifest_generation.load(Ordering::Acquire))?;
+            self.manifest_generation
+                .fetch_max(m.generation.unwrap_or(0), Ordering::AcqRel);
+        }
+        Ok((json, manifest))
+    }
+
+    /// Sign and write the manifest (bumping its generation) and raise the in-memory mark.
+    fn write_manifest(
+        &self,
+        manifest_json: serde_json::Value,
+        manifest: crypto::EncryptionManifest,
+        passphrase: &str,
+    ) -> Result<crypto::EncryptionManifest, CortexError> {
+        let manifest_path = self.config.sync_dir.join("manifest.json");
+        let manifest = write_encryption_manifest(&manifest_path, manifest_json, manifest, passphrase)?;
+        self.manifest_generation
+            .fetch_max(manifest.generation.unwrap_or(0), Ordering::AcqRel);
+        Ok(manifest)
+    }
+
+    /// Persist the in-memory generation mark to the local database (never lowers it).
+    fn persist_manifest_generation(&self, storage: &SqliteStorage) -> Result<(), CortexError> {
+        if let Some(salt) = &self.group_salt {
+            let generation = self.manifest_generation.load(Ordering::Acquire);
+            storage.with_write_conn(|conn| state::raise_manifest_generation(conn, salt, generation))?;
+        }
+        Ok(())
     }
 
     /// Rotate the sync encryption key forward by one version.
@@ -244,38 +266,31 @@ impl SyncEngine {
     /// manifest, recomputes the manifest HMAC, re-derives the crypto context, and rebuilds the
     /// writer to encrypt under the new version. Returns the new active version. Requires sync
     /// encryption to be enabled.
-    pub fn rotate_key(&mut self) -> Result<u32, CortexError> {
+    ///
+    /// This takes no storage handle, so the bumped manifest generation is enforced in memory
+    /// immediately and persisted to the local database on the next `pull_remote`,
+    /// `create_snapshot` or `restore_from_snapshot` (or the next `new`, which re-reads it).
+    /// Takes the local storage so the new manifest generation is persisted immediately: a
+    /// crash right after rotating must not leave a window where the pre-rotation manifest
+    /// could be replayed.
+    pub fn rotate_key(&mut self, storage: &SqliteStorage) -> Result<u32, CortexError> {
         let passphrase = self.config.encryption_passphrase.clone().ok_or_else(|| {
             CortexError::Storage("Cannot rotate key: sync encryption is not enabled".into())
         })?;
-        let manifest_path = self.config.sync_dir.join("manifest.json");
         let my_dir = self.config.my_device_dir();
 
-        let content = fs::read_to_string(&manifest_path)
-            .map_err(|e| CortexError::Storage(format!("Failed to read manifest: {}", e)))?;
-        let mut manifest_json: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| CortexError::Serialization(e.to_string()))?;
-        let enc = manifest_json.get("encryption").ok_or_else(|| {
+        // Verify before bumping: re-signing an unverified manifest would launder tampering.
+        let (manifest_json, manifest) = self.load_manifest_checked(&passphrase)?;
+        let mut manifest = manifest.ok_or_else(|| {
             CortexError::Storage("Cannot rotate key: manifest has no encryption block".into())
         })?;
-        let mut manifest = serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
-            .map_err(|e| CortexError::Serialization(e.to_string()))?;
 
-        // Bump the active version and recompute the manifest HMAC over its hmac-free form.
+        // Bump the active version and re-sign. Every other field — including the snapshot
+        // pointer — is carried over unchanged.
         let new_version = manifest.key_version.unwrap_or(0) + 1;
         manifest.key_version = Some(new_version);
-        manifest.hmac = None;
-        manifest.hmac_salt = None;
-        let manifest_bytes = serde_json::to_vec(&manifest)
-            .map_err(|e| CortexError::Serialization(e.to_string()))?;
-        let (hmac_value, hmac_salt) = crypto::compute_manifest_hmac(&manifest_bytes, &passphrase)?;
-        manifest.hmac = Some(hmac_value);
-        manifest.hmac_salt = Some(hmac_salt);
-
-        manifest_json["encryption"] = serde_json::to_value(&manifest)
-            .map_err(|e| CortexError::Serialization(e.to_string()))?;
-        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest_json).unwrap())
-            .map_err(|e| CortexError::Storage(format!("Failed to write manifest: {}", e)))?;
+        let manifest = self.write_manifest(manifest_json, manifest, &passphrase)?;
+        self.persist_manifest_generation(storage)?;
 
         // Re-derive at the new version and rebuild the writer so new lines use the new key.
         let ctx = std::sync::Arc::new(crypto::derive_key(&passphrase, &manifest)?);
@@ -361,6 +376,9 @@ impl SyncEngine {
         storage: &SqliteStorage,
         index: &MemoryIndex,
     ) -> Result<usize, CortexError> {
+        // Flush any in-memory manifest generation (e.g. from `rotate_key`) to the local mark.
+        self.persist_manifest_generation(storage)?;
+
         let devices_dir = self.config.devices_dir();
         if !devices_dir.exists() {
             return Ok(0);
@@ -513,18 +531,66 @@ impl SyncEngine {
     }
 
     /// Create a compressed snapshot for new-device bootstrap.
-    pub fn create_snapshot(&self, storage: &dyn StorageBackend) -> Result<std::path::PathBuf, CortexError> {
+    ///
+    /// In encryption mode the snapshot is also pinned in the manifest (`latest_snapshot`,
+    /// HMAC-protected), which is what [`Self::restore_from_snapshot`] restores — so a stale
+    /// snapshot can't be replayed and a newer one can't be suppressed into a fallback.
+    pub fn create_snapshot(&self, storage: &SqliteStorage) -> Result<std::path::PathBuf, CortexError> {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
-        snapshot::create_snapshot(storage, &snapshots_dir, self.crypto.as_deref())
+        let (path, mac) =
+            snapshot::create_snapshot_with_mac(storage, &snapshots_dir, self.crypto.as_deref())?;
+        if let (Some(mac), Some(passphrase)) = (mac, self.config.encryption_passphrase.as_deref()) {
+            let (manifest_json, manifest) = self.load_manifest_checked(passphrase)?;
+            let mut manifest = manifest.ok_or_else(|| {
+                CortexError::Storage("Encryption manifest disappeared — cannot pin snapshot".into())
+            })?;
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            manifest.latest_snapshot = Some(crypto::SnapshotPointer { file, mac });
+            self.write_manifest(manifest_json, manifest, passphrase)?;
+            self.persist_manifest_generation(storage)?;
+        }
+        Ok(path)
     }
 
-    /// Restore from the latest snapshot. Returns None if no snapshot exists.
+    /// Restore from the authoritative snapshot. Returns None if no snapshot exists.
+    ///
+    /// Encryption mode: the manifest is re-read, verified, and checked against this device's
+    /// generation high-water mark (anti-rollback); if it pins a snapshot, exactly
+    /// that file is restored and its HMAC line must equal the pinned one. Any failure is an
+    /// error — there is deliberately no fallback to an older snapshot (that would let an
+    /// attacker resurrect deleted data by corrupting the newest one). Legacy groups without a
+    /// pointer, and plaintext mode, use the newest validly-named snapshot, also without
+    /// fallback.
     pub fn restore_from_snapshot(
         &self,
-        storage: &dyn StorageBackend,
+        storage: &SqliteStorage,
         index: &MemoryIndex,
     ) -> Result<Option<crate::export::ImportReport>, CortexError> {
         let snapshots_dir = self.config.sync_dir.join("snapshots");
+        if let (Some(ctx), Some(passphrase)) =
+            (self.crypto.as_deref(), self.config.encryption_passphrase.as_deref())
+        {
+            // Verified, and not older than any manifest this device has accepted.
+            let (_, manifest) = self.load_manifest_checked(passphrase)?;
+            self.persist_manifest_generation(storage)?;
+            let manifest = manifest.ok_or_else(|| {
+                CortexError::Storage(
+                    "Encryption manifest is missing — refusing to restore (possible downgrade)".into(),
+                )
+            })?;
+            if let Some(ptr) = manifest.latest_snapshot {
+                // The pointer is authenticated, but still only accept a plain snapshot name.
+                if snapshot::snapshot_date(&ptr.file, true).is_none() {
+                    return Err(CortexError::Storage("Manifest snapshot pointer has an invalid file name".into()));
+                }
+                let (report, _) =
+                    snapshot::restore_pinned(&snapshots_dir.join(&ptr.file), storage, index, ctx, &ptr.mac)?;
+                return Ok(Some(report));
+            }
+        }
         match snapshot::find_latest_snapshot(&snapshots_dir, self.crypto.is_some())? {
             Some(path) => {
                 let (report, _) =
@@ -621,6 +687,152 @@ impl SyncEngine {
     }
 }
 
+/// Read `manifest.json` and, if it has an `encryption` block, verify that block's HMAC.
+///
+/// Returns the whole manifest JSON (so callers can rewrite it preserving other fields) and
+/// the verified encryption manifest with `hmac`/`hmac_salt` stripped. A missing file is an
+/// empty manifest; an unreadable or unparsable one is an error. The HMAC is mandatory: the
+/// manifest sits in plaintext on untrusted storage and the HMAC is the only thing binding
+/// `salt`, `kdf_params`, `key_version` and the snapshot pointer (a stripped HMAC would
+/// otherwise allow key-version rollback, defeating forward secrecy).
+fn load_verified_manifest(
+    manifest_path: &std::path::Path,
+    passphrase: &str,
+) -> Result<(serde_json::Value, Option<crypto::EncryptionManifest>), CortexError> {
+    let manifest_json: serde_json::Value = match fs::read_to_string(manifest_path) {
+        Ok(content) => serde_json::from_str(&content).map_err(|e| CortexError::Serialization(e.to_string()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(CortexError::Storage(format!("Failed to read manifest: {}", e))),
+    };
+    let Some(enc) = manifest_json.get("encryption") else {
+        return Ok((manifest_json, None));
+    };
+    let mut manifest = serde_json::from_value::<crypto::EncryptionManifest>(enc.clone())
+        .map_err(|e| CortexError::Serialization(e.to_string()))?;
+    let stored_hmac = manifest.hmac.take().ok_or_else(|| {
+        CortexError::Storage(
+            "Encryption manifest is missing its integrity HMAC — refusing to load. \
+             This indicates tampering or a downgrade attack on the sync directory."
+                .into(),
+        )
+    })?;
+    let stored_salt = manifest.hmac_salt.take();
+    let manifest_without_hmac =
+        serde_json::to_vec(&manifest).map_err(|e| CortexError::Serialization(e.to_string()))?;
+    if !crypto::verify_manifest_integrity(&manifest_without_hmac, &stored_hmac, passphrase, stored_salt.as_deref())? {
+        return Err(CortexError::Storage(
+            "Manifest integrity check failed: HMAC mismatch. Data may be corrupted or tampered.".into(),
+        ));
+    }
+    Ok((manifest_json, Some(manifest)))
+}
+
+/// Reject a manifest older than the newest generation this device has accepted (`seen`).
+/// Legacy manifests without a generation count as 0, so once a device has seen a
+/// generation, a replayed pre-generation manifest is also rejected.
+fn check_generation(manifest: &crypto::EncryptionManifest, seen: u64) -> Result<(), CortexError> {
+    let found = manifest.generation.unwrap_or(0);
+    if found < seen {
+        return Err(CortexError::Storage(format!(
+            "Manifest rollback detected: sync manifest generation {found} is older than generation \
+             {seen} already accepted by this device — refusing to use a replayed manifest"
+        )));
+    }
+    Ok(())
+}
+
+/// Sign `manifest` (HMAC over its hmac-free serialization, generation bumped), store it as the `encryption`
+/// block of `manifest_json`, and atomically replace `manifest.json` (temp file + rename).
+/// Returns the signed manifest.
+fn write_encryption_manifest(
+    manifest_path: &std::path::Path,
+    mut manifest_json: serde_json::Value,
+    mut manifest: crypto::EncryptionManifest,
+    passphrase: &str,
+) -> Result<crypto::EncryptionManifest, CortexError> {
+    manifest.hmac = None;
+    manifest.hmac_salt = None;
+    // Every write is a new generation (first creation: None → 1).
+    manifest.generation = Some(manifest.generation.unwrap_or(0) + 1);
+    let bytes = serde_json::to_vec(&manifest).map_err(|e| CortexError::Serialization(e.to_string()))?;
+    let (hmac_value, hmac_salt) = crypto::compute_manifest_hmac(&bytes, passphrase)?;
+    manifest.hmac = Some(hmac_value);
+    manifest.hmac_salt = Some(hmac_salt);
+    manifest_json["encryption"] =
+        serde_json::to_value(&manifest).map_err(|e| CortexError::Serialization(e.to_string()))?;
+    let text = serde_json::to_string_pretty(&manifest_json)
+        .map_err(|e| CortexError::Serialization(e.to_string()))?;
+
+    let dir = manifest_path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp = dir.join(format!(".manifest.json.tmp-{}", Uuid::new_v4()));
+    fs::write(&tmp, text)
+        .and_then(|_| fs::rename(&tmp, manifest_path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            CortexError::Storage(format!("Failed to write manifest: {}", e))
+        })?;
+    Ok(manifest)
+}
+
+/// Refuse to run in plaintext mode in a sync folder that belongs to an encrypted group.
+///
+/// Signals, any of which is enough: the manifest has an `encryption` block; the manifest
+/// exists but can't be read or parsed (fail closed — can't tell); any device's oplog starts
+/// with an encrypted line; or an encrypted snapshot exists. The last two catch an attacker
+/// who deletes `manifest.json` to trick a key-less device into writing plaintext into the
+/// group.
+fn ensure_plaintext_group(sync_dir: &std::path::Path) -> Result<(), CortexError> {
+    let refuse = |why: &str| {
+        Err(CortexError::InvalidInput(format!(
+            "This sync folder appears to be encrypted ({why}); a passphrase is required to join it."
+        )))
+    };
+
+    let manifest_path = sync_dir.join("manifest.json");
+    match fs::read_to_string(&manifest_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(m) if m.get("encryption").is_some() => return refuse("manifest has an encryption block"),
+            Ok(_) => {}
+            Err(_) => return refuse("manifest.json is unparsable"),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return refuse("manifest.json is unreadable"),
+    }
+
+    let devices_dir = sync_dir.join("devices");
+    if let Ok(entries) = fs::read_dir(&devices_dir) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            for file in oplog::list_oplog_files(&entry.path())? {
+                if oplog_starts_encrypted(&file) {
+                    return refuse("a device oplog contains encrypted lines");
+                }
+            }
+        }
+    }
+
+    let snapshots_dir = sync_dir.join("snapshots");
+    if !snapshot::list_snapshots(&snapshots_dir, true)?.is_empty() {
+        return refuse("an encrypted snapshot is present");
+    }
+    Ok(())
+}
+
+/// Whether the first non-empty line of an oplog file is an encrypted envelope. Reads at most
+/// a few KiB. Unreadable files count as not encrypted (they can't be replayed either).
+fn oplog_starts_encrypted(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let Ok(file) = fs::File::open(path) else { return false };
+    if file.take(4096).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&head);
+    crypto::is_encrypted_line(text.trim_start())
+}
+
 /// Handle for stopping background sync (polling + filesystem watcher).
 pub struct BackgroundSyncHandle {
     stop_flag: Arc<AtomicBool>,
@@ -683,5 +895,76 @@ impl Drop for BackgroundSyncHandle {
         } else {
             self.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Write a correctly-encrypted, correctly-HMAC'd snapshot under an arbitrary (older) name —
+    /// i.e. a genuine older snapshot an attacker kept and can put back.
+    fn plant_valid_snapshot(engine: &SyncEngine, source: &crate::Cortex, name: &str) {
+        use base64::Engine;
+        let ctx = engine.crypto.as_deref().unwrap();
+        let json = serde_json::to_vec(&crate::export::export_for_sync(source.storage()).unwrap()).unwrap();
+        let line = crypto::encrypt_line(ctx, &zstd::encode_all(&json[..], 3).unwrap()).unwrap();
+        let mac = base64::engine::general_purpose::STANDARD
+            .encode(ctx.compute_operation_hmac(&snapshot::snapshot_mac_input(name, &line)));
+        let dir = engine.config.sync_dir.join("snapshots");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), format!("{line}\nHMAC:{mac}\n")).unwrap();
+    }
+
+    fn cortex_with(text: &str) -> crate::Cortex {
+        let c = crate::Cortex::in_memory().unwrap();
+        let mem = MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text(text.into()), MemSource::new("t"))
+            .privacy(PrivacyLevel::Public)
+            .build();
+        c.storage().store_memory(&mem).unwrap();
+        c
+    }
+
+    #[test]
+    fn corrupted_pinned_snapshot_does_not_fall_back_to_an_older_valid_one() {
+        let tmp = TempDir::new().unwrap();
+        let sync_dir = tmp.path().join("sync");
+        let cfg = |dev: &str| SyncConfig::new(sync_dir.clone(), dev.into(), dev.into()).with_encryption("pass-123");
+
+        let a = cortex_with("current");
+        let engine_a = SyncEngine::new(cfg("a"), a.sqlite_storage()).unwrap();
+        let pinned = engine_a.create_snapshot(a.sqlite_storage()).unwrap();
+        plant_valid_snapshot(&engine_a, &cortex_with("deleted long ago"), "snapshot-2001-01-01.json.zst.enc");
+
+        let b = crate::Cortex::in_memory().unwrap();
+        let engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
+
+        // Intact pin: exactly the pinned snapshot is restored.
+        let report = engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).unwrap().unwrap();
+        assert_eq!(report.memories, 1);
+
+        // Corrupted pin: error, and the older (genuine) snapshot is NOT used.
+        fs::write(&pinned, "ENC1:garbage\nHMAC:AAAA\n").unwrap();
+        let c = crate::Cortex::in_memory().unwrap();
+        assert!(engine_b.restore_from_snapshot(c.sqlite_storage(), c.index()).is_err());
+        assert_eq!(c.stats().unwrap().total, 0);
+    }
+
+    #[test]
+    fn legacy_unpinned_group_uses_newest_snapshot_without_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let sync_dir = tmp.path().join("sync");
+        let cfg = |dev: &str| SyncConfig::new(sync_dir.clone(), dev.into(), dev.into()).with_encryption("pass-123");
+        let a = cortex_with("old");
+        let engine_a = SyncEngine::new(cfg("a"), a.sqlite_storage()).unwrap();
+        plant_valid_snapshot(&engine_a, &a, "snapshot-2001-01-01.json.zst.enc");
+        // Newest-named snapshot is junk: no fallback to the valid older one.
+        fs::write(sync_dir.join("snapshots/snapshot-2002-01-01.json.zst.enc"), "ENC1:x\nHMAC:AAAA\n").unwrap();
+
+        let b = crate::Cortex::in_memory().unwrap();
+        let engine_b = SyncEngine::new(cfg("b"), b.sqlite_storage()).unwrap();
+        assert!(engine_b.restore_from_snapshot(b.sqlite_storage(), b.index()).is_err());
+        assert_eq!(b.stats().unwrap().total, 0);
     }
 }

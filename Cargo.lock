@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-core"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-http"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "axum",
  "chrono",
@@ -623,13 +623,14 @@ dependencies = [
 
 [[package]]
 name = "cortex-mcp-server"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "axum",
  "chrono",
  "clap",
  "cortex-core",
  "hostname",
+ "libc",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -643,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-python"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "cortex-core",
  "pyo3",
@@ -652,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "cortex-wasm"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "js-sys",

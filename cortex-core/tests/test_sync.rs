@@ -1136,7 +1136,7 @@ fn test_key_rotation_end_to_end() {
         .unwrap();
 
     // Rotate the encryption key.
-    let new_version = engine_a.rotate_key().unwrap();
+    let new_version = engine_a.rotate_key(cortex_a.sqlite_storage()).unwrap();
     assert_eq!(new_version, 1);
 
     // Post-rotation op (version 1 / ENC2 envelope).

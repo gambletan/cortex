@@ -1,6 +1,6 @@
 # Design: `remember` — let Muse save to *your* memory instead of Meta's (v2.4)
 
-Status: PLAN (2026-10-06) · Builds on [`muse-gateway.md`](muse-gateway.md) · Codex consulted
+Status: SHIPPED v2.4.0 (2026-10-06) · Builds on [`muse-gateway.md`](muse-gateway.md) · Codex consulted
 
 ## Goal
 

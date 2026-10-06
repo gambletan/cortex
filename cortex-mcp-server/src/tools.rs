@@ -508,17 +508,13 @@ fn list_tools_builtin() -> Value {
         },
         {
             "name": "sync_enable",
-            "description": "Enable cross-device cloud sync. Auto-detects cloud provider (iCloud/Google Drive/OneDrive/Dropbox), generates device ID, and starts syncing. Optionally encrypts with AES-256-GCM. Returns the passphrase (user must save it for other devices).",
+            "description": "Enable cross-device cloud sync. Auto-detects cloud provider (iCloud/Google Drive/OneDrive/Dropbox), generates device ID, and starts syncing. Encrypts with AES-256-GCM. The passphrase never passes through the assistant: it comes from CORTEX_SYNC_PASSPHRASE, or a generated one is stored in the OS keychain.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "provider": {
                         "type": "string",
                         "description": "Cloud provider: 'icloud', 'gdrive', 'onedrive', 'dropbox'. If omitted, auto-detects the first available."
-                    },
-                    "passphrase": {
-                        "type": "string",
-                        "description": "Encryption passphrase for AES-256-GCM. If omitted, a random one is generated and returned."
                     },
                     "device_name": {
                         "type": "string",
@@ -555,6 +551,25 @@ fn list_tools_builtin() -> Value {
 }
 
 /// Execute a tool call and return the result as a string.
+fn scrub(r: Result<String, String>) -> Result<String, String> {
+    r.map(|s| redact_local(&s)).map_err(|e| redact_local(&e))
+}
+
+/// `redact_emails` plus the user's home directory (it carries the OS login name),
+/// in both raw and JSON-escaped form.
+pub(crate) fn redact_local(input: &str) -> String {
+    let mut out = redact_emails(input);
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = home.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+        if home.len() > 1 {
+            let escaped = home.replace('\\', "\\\\");
+            out = out.replace(&escaped, "~");
+            out = out.replace(&home, "~");
+        }
+    }
+    out
+}
+
 pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "memory_ingest" => tool_memory_ingest(cortex, args),
@@ -583,10 +598,12 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_restore" => tool_memory_restore(cortex, args),
         "namespace_list" => tool_namespace_list(cortex),
         "person_merge" => tool_person_merge(cortex, args),
-        "sync_enable" => tool_sync_enable(cortex, args),
-        "sync_pull" => tool_sync_pull(cortex),
-        "sync_status" => tool_sync_status(cortex),
-        "sync_providers" => tool_sync_providers(),
+        // Sync tools touch local paths and account identifiers: every result *and* error
+        // string is scrubbed before it reaches the model.
+        "sync_enable" => scrub(tool_sync_enable(cortex, args)),
+        "sync_pull" => scrub(tool_sync_pull(cortex)),
+        "sync_status" => scrub(tool_sync_status(cortex)),
+        "sync_providers" => scrub(tool_sync_providers()),
         _ => {
             // Fallback to plugin-registered tools
             let ctx = cortex.plugin_context();
@@ -1313,18 +1330,34 @@ fn tool_sync_enable(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String
     // Device ID: random UUID
     let device_id = Uuid::new_v4().to_string();
 
-    // Passphrase: arg or generate random 48-char hex
-    let passphrase = get_str(args, "passphrase")
-        .map(String::from)
-        .unwrap_or_else(|| {
+    // Passphrase: arg, or generate one — but the master key must NEVER enter the model's
+    // context (it decrypts and can forge everything in the sync folder). A generated key is
+    // only acceptable if it can be kept in the OS keychain; otherwise the human must set
+    // it up in a terminal, where it is shown to them directly.
+    if get_str(args, "passphrase").is_some() {
+        return Err("Don't pass the sync passphrase through the assistant — it would end up in \
+            the conversation. Set CORTEX_SYNC_PASSPHRASE for this server, or run \
+            `cortex-mcp-server sync enable` in a terminal."
+            .into());
+    }
+    let passphrase = match std::env::var("CORTEX_SYNC_PASSPHRASE").ok().filter(|p| !p.is_empty()) {
+        Some(p) => p,
+        None => {
             use std::fmt::Write;
             let bytes: [u8; 24] = std::array::from_fn(|_| rand::random::<u8>());
             let mut s = String::with_capacity(48);
             for b in &bytes {
                 let _ = write!(s, "{:02x}", b);
             }
+            if !cortex_core::sync::secret::store_passphrase(&device_id, &s) {
+                return Err("Cannot store a generated passphrase securely on this machine (no OS \
+                    keychain). Run `cortex-mcp-server sync enable` in a terminal — it shows the \
+                    passphrase to you directly — or set CORTEX_SYNC_PASSPHRASE."
+                    .into());
+            }
             s
-        });
+        }
+    };
 
     let config = SyncConfig::new(detected.sync_dir.clone(), device_id.clone(), device_name.clone())
         .with_encryption(&passphrase);
@@ -1344,11 +1377,10 @@ fn tool_sync_enable(cortex: &Arc<Cortex>, args: &Value) -> Result<String, String
         "provider": detected.provider.as_str(),
         "sync_dir": redact_emails(&detected.sync_dir.display().to_string()),
         "device_id": device_id,
-        "device_name": device_name,
         "encryption": true,
-        "passphrase": passphrase,
         "remote_changes_applied": pulled,
-        "message": "Sync enabled! IMPORTANT: Save the passphrase — you need it on other devices."
+        "message": "Sync enabled. The passphrase is in this machine's OS keychain (service \
+            'cortex-sync') and is deliberately not shown here; you need it on other devices."
     }).to_string())
 }
 
@@ -1366,7 +1398,6 @@ fn tool_sync_status(cortex: &Arc<Cortex>) -> Result<String, String> {
             Ok(json!({
                 "enabled": true,
                 "device_id": status.device_id,
-                "device_name": status.device_name,
                 "provider": status.provider,
                 "sync_dir": redact_emails(&status.sync_dir),
                 "remote_devices": status.remote_devices,
@@ -1432,14 +1463,20 @@ pub(crate) fn redact_emails(input: &str) -> String {
     redact_bare_emails(&redact_provider_accounts(input))
 }
 
-const PROVIDER_PREFIXES: &[&str] = &["GoogleDrive-"];
+/// Cloud-storage folder names that embed an account (`GoogleDrive-<email>`) or an
+/// organisation (`OneDrive-<Tenant>`, `Dropbox-<Team>`, `Box-<Org>`).
+const PROVIDER_PREFIXES: &[&str] = &["GoogleDrive-", "OneDrive-", "Dropbox-", "Box-"];
 
 fn redact_provider_accounts(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
+    // Only at the start of a path segment, so e.g. "Inbox-…" or "XBox-…" don't match.
+    let at_segment_start = |s: &str, pos: usize| pos == 0 || s[..pos].ends_with(['/', '\\']);
     while let Some((pos, prefix)) = PROVIDER_PREFIXES
         .iter()
-        .filter_map(|p| rest.find(p).map(|pos| (pos, *p)))
+        .filter_map(|p| {
+            rest.match_indices(p).find(|(pos, _)| at_segment_start(rest, *pos)).map(|(pos, _)| (pos, *p))
+        })
         .min_by_key(|(pos, _)| *pos)
     {
         let account_start = pos + prefix.len();
@@ -1450,6 +1487,8 @@ fn redact_provider_accounts(input: &str) -> String {
         out.push_str(&rest[..account_start]);
         if account.contains('@') {
             out.push_str("[redacted-email]");
+        } else if prefix != "GoogleDrive-" && !account.is_empty() {
+            out.push_str("[redacted-account]");
         } else {
             out.push_str(account);
         }
@@ -1470,7 +1509,9 @@ fn redact_bare_emails(input: &str) -> String {
                     | b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'-'
             )
     };
-    let is_domain = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-');
+    // Non-ASCII bytes cover IDN domains (u@例え.jp); a run of them always ends at an ASCII
+    // byte or the end of input, so slicing stays on char boundaries.
+    let is_domain = |c: u8| c.is_ascii_alphanumeric() || c >= 0x80 || matches!(c, b'.' | b'-');
 
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
@@ -1478,21 +1519,32 @@ fn redact_bare_emails(input: &str) -> String {
     let mut copied = 0;
     while i < bytes.len() {
         if bytes[i] == b'@' {
-            // Expand left over the local-part.
+            // Expand left over the local-part. A quoted local-part (`"a b"@x.com`) may
+            // contain any character, so take everything back to the opening quote.
             let mut start = i;
-            while start > copied && is_local(bytes[start - 1]) {
-                start -= 1;
+            if start > copied && bytes[start - 1] == b'"' {
+                if let Some(open) = input[copied..start - 1].rfind('"') {
+                    start = copied + open;
+                }
+            } else {
+                while start > copied && is_local(bytes[start - 1]) {
+                    start -= 1;
+                }
             }
             // Expand right over the domain.
             let mut end = i + 1;
             while end < bytes.len() && is_domain(bytes[end]) {
                 end += 1;
             }
+            // Sentence punctuation ("mail a@x.com.") is not part of the domain.
+            while end > i + 1 && bytes[end - 1] == b'.' {
+                end -= 1;
+            }
             // Only treat it as an email if there is a non-empty local-part and a domain that
             // contains a dot (so a bare `foo@bar` or `@` alone is left untouched).
             let has_local = start < i;
             let domain = &input[i + 1..end];
-            let looks_like_email = has_local && domain.contains('.') && !domain.ends_with('.');
+            let looks_like_email = has_local && domain.contains('.') && !domain.starts_with('.');
             if looks_like_email {
                 out.push_str(&input[copied..start]);
                 out.push_str("[redacted-email]");
@@ -1591,5 +1643,36 @@ mod tests {
     fn keeps_provider_folder_without_email() {
         let p = "/CloudStorage/GoogleDrive-Shared/x";
         assert_eq!(redact_emails(p), p);
+    }
+
+    #[test]
+    fn redacts_trailing_dot_and_idn_emails() {
+        assert_eq!(redact_emails("mail a@x.com."), "mail [redacted-email].");
+        assert_eq!(redact_emails("to u@例え.jp now"), "to [redacted-email] now");
+        assert_eq!(redact_emails("u@mail.例え.jp"), "[redacted-email]");
+    }
+
+    #[test]
+    fn redacts_org_named_provider_folders_at_segment_start_only() {
+        assert_eq!(
+            redact_emails("/CloudStorage/OneDrive-AcmeCorp/x"),
+            "/CloudStorage/OneDrive-[redacted-account]/x"
+        );
+        assert_eq!(redact_emails("/d/Dropbox-Team Blue/x"), "/d/Dropbox-[redacted-account]/x");
+        assert_eq!(redact_emails("/mail/Inbox-2024/x"), "/mail/Inbox-2024/x");
+    }
+
+    #[test]
+    fn redact_local_hides_home_directory() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.len() > 1 {
+            let s = format!("{home}/Library/CloudStorage/x");
+            assert_eq!(redact_local(&s), "~/Library/CloudStorage/x");
+        }
+    }
+
+    #[test]
+    fn redacts_quoted_local_part() {
+        assert_eq!(redact_emails(r#"x "a b"@x.com y"#), "x [redacted-email] y");
     }
 }

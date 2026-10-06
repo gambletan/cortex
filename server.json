@@ -7,11 +7,11 @@
     "url": "https://github.com/gambletan/cortex",
     "source": "github"
   },
-  "version": "2.3.0",
+  "version": "2.4.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/gambletan/cortex/cortex-http:2.3.0",
+      "identifier": "ghcr.io/gambletan/cortex/cortex-http:2.4.0",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
@@ -21,6 +21,14 @@
           "name": "CORTEX_DB_PATH",
           "description": "Path to the SQLite memory database inside the container",
           "default": "/data/memory.db"
+        }
+      ],
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-v",
+          "value": "cortex-data:/data",
+          "description": "Named volume so memories persist across sessions"
         }
       ]
     }

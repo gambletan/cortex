@@ -113,6 +113,25 @@ pub struct EncryptionManifest {
     pub hmac_salt: Option<String>, // base64-encoded salt for HMAC key derivation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hmac: Option<String>, // base64-encoded HMAC of manifest content (computed without hmac and hmac_salt fields)
+    /// The snapshot new devices must bootstrap from. Covered by the manifest HMAC, so an
+    /// attacker without the passphrase can neither replay an older snapshot (same name, older
+    /// content) nor make restore fall back to one. Omitted when `None`, which keeps the HMAC
+    /// input of manifests written before this field existed byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_snapshot: Option<SnapshotPointer>,
+    /// Monotonic counter bumped on every manifest write (first creation = 1). Covered by the
+    /// HMAC; devices remember the highest value they accepted and reject lower ones, so a
+    /// replayed older manifest (with its older snapshot pointer or key version) is detected.
+    /// Absent in legacy manifests (treated as 0); omitted when `None` for HMAC compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// Names the authoritative encrypted snapshot: its file name and its `HMAC:` line value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPointer {
+    pub file: String,
+    pub mac: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +159,8 @@ pub fn new_encryption_manifest() -> EncryptionManifest {
         key_version: Some(0), // Start at version 0; higher versions for rotated keys
         hmac_salt: None,      // Will be computed during sync initialization
         hmac: None,           // HMAC will be computed during sync initialization
+        latest_snapshot: None,
+        generation: None,
     }
 }
 
@@ -283,6 +304,19 @@ pub fn decrypt_line(ctx: &CryptoContext, encrypted_line: &str) -> Result<Vec<u8>
     } else {
         Err(CortexError::Storage("Missing ENC1:/ENC2: prefix".into()))
     }
+}
+
+/// Key version of an envelope: `ENC1` is version 0; `ENC2` carries it in its first two
+/// payload bytes. `None` if the line is not a well-formed envelope header. Only the first
+/// base64 quantum is decoded, so this is cheap even for a large snapshot envelope.
+pub fn envelope_version(line: &str) -> Option<u32> {
+    if line.starts_with(ENC_PREFIX) {
+        return Some(0);
+    }
+    let head = line.strip_prefix(ENC2_PREFIX)?.get(..4)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(head).ok()?;
+    let version = bytes.get(..VERSION_LEN)?;
+    Some(u16::from_le_bytes([version[0], version[1]]) as u32)
 }
 
 /// Check if a line is encrypted (either envelope version).
@@ -587,5 +621,49 @@ mod tests {
     fn test_is_encrypted_line() {
         assert!(is_encrypted_line("ENC1:abc123"));
         assert!(!is_encrypted_line("{\"op_id\":\"...\"}"));
+    }
+    #[test]
+    fn test_envelope_version() {
+        let m = test_manifest();
+        let ctx0 = derive_key("pass", &m).unwrap();
+        let ctx3 = derive_key("pass", &manifest_at_version(&m, 3)).unwrap();
+        assert_eq!(envelope_version(&encrypt_line(&ctx0, b"x").unwrap()), Some(0));
+        assert_eq!(envelope_version(&encrypt_line(&ctx3, b"x").unwrap()), Some(3));
+        assert_eq!(envelope_version("ENC2:"), None);
+        assert_eq!(envelope_version("ENC2:!!!!"), None);
+        assert_eq!(envelope_version("{\"op\":1}"), None);
+    }
+
+    /// Adding `latest_snapshot` must not change the HMAC input of manifests that lack it:
+    /// a manifest written before the field existed still verifies after a parse/re-serialize.
+    #[test]
+    fn test_legacy_manifest_without_pointer_still_verifies() {
+        let mut legacy = new_encryption_manifest();
+        legacy.hmac = None;
+        legacy.hmac_salt = None;
+        // Legacy wire form: exactly the pre-pointer field set.
+        let legacy_bytes = format!(
+            r#"{{"algorithm":"{}","kdf":"{}","salt":"{}","kdf_params":{{"time_cost":{},"mem_cost":{},"parallelism":{}}},"key_version":0}}"#,
+            legacy.algorithm,
+            legacy.kdf,
+            legacy.salt,
+            legacy.kdf_params.time_cost,
+            legacy.kdf_params.mem_cost,
+            legacy.kdf_params.parallelism,
+        )
+        .into_bytes();
+        let (hmac, salt) = compute_manifest_hmac(&legacy_bytes, "pass").unwrap();
+
+        let parsed: EncryptionManifest = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(parsed.latest_snapshot.is_none());
+        let reserialized = serde_json::to_vec(&parsed).unwrap();
+        assert_eq!(reserialized, legacy_bytes);
+        assert!(verify_manifest_integrity(&reserialized, &hmac, "pass", Some(&salt)).unwrap());
+
+        // With a pointer the bytes (and so the HMAC) change — the pointer is authenticated.
+        let mut pinned = parsed.clone();
+        pinned.latest_snapshot = Some(SnapshotPointer { file: "f".into(), mac: "m".into() });
+        let pinned_bytes = serde_json::to_vec(&pinned).unwrap();
+        assert!(!verify_manifest_integrity(&pinned_bytes, &hmac, "pass", Some(&salt)).unwrap());
     }
 }

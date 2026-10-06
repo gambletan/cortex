@@ -244,9 +244,17 @@ pub fn read_oplog(
                     }
                 }
                 None => {
-                    tracing::warn!("Encrypted line but no decryption key at offset {}", offset);
-                    offset += bytes_read as u64;
-                    continue;
+                    // Not corrupt, just unreadable *now*: stop here without advancing, so the
+                    // line is read once a key is configured instead of being skipped forever.
+                    // SyncEngine refuses to start key-less in an encrypted group, so reaching
+                    // this means the file is stuck — say so loudly rather than stall silently.
+                    tracing::error!(
+                        path = %path.display(),
+                        offset,
+                        "Encrypted oplog line but no decryption key configured: this oplog is \
+                         blocked at this offset until a sync passphrase is configured"
+                    );
+                    break;
                 }
             }
         } else if crypto.is_some() {
@@ -291,7 +299,8 @@ pub fn read_oplog(
                     continue;
                 }
 
-                // Verify HMAC if present (backward compatible: old operations lack HMAC field)
+                // Verify the HMAC. Encrypted ops without one were already rejected above; only
+                // plaintext-mode ops (no crypto) may lack it.
                 if let Some(hmac_str) = &op.hmac {
                     if let Some(ctx) = crypto {
                         // Reconstruct the operation without the HMAC field for verification

@@ -78,9 +78,46 @@ pub fn init_sync_tables(conn: &Connection) -> Result<(), CortexError> {
             config_json TEXT NOT NULL,
             encryption INTEGER NOT NULL,
             updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_manifest_generation (
+            group_salt TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL
         );",
     )
     .map_err(|e| CortexError::Storage(format!("Failed to init sync tables: {}", e)))
+}
+
+// ── Manifest generation high-water mark ──────────────────────────────────────
+//
+// The highest encryption-manifest `generation` this device has accepted, per sync group
+// (keyed by the manifest's KDF salt, which identifies the group and survives rotation).
+// A manifest with a lower generation is a replay of an older, validly-signed manifest.
+
+/// The highest manifest generation accepted for this group (0 if none recorded).
+pub fn get_manifest_generation(conn: &Connection, group_salt: &str) -> Result<u64, CortexError> {
+    let g = conn
+        .query_row(
+            "SELECT generation FROM sync_manifest_generation WHERE group_salt = ?1",
+            params![group_salt],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(g.map(|g| g.max(0) as u64).unwrap_or(0))
+}
+
+/// Raise the recorded generation to `generation` (never lowers it).
+pub fn raise_manifest_generation(conn: &Connection, group_salt: &str, generation: u64) -> Result<(), CortexError> {
+    let generation = i64::try_from(generation)
+        .map_err(|_| CortexError::Storage("manifest generation out of range".into()))?;
+    conn.execute(
+        "INSERT INTO sync_manifest_generation (group_salt, generation) VALUES (?1, ?2)
+         ON CONFLICT(group_salt) DO UPDATE SET generation = MAX(generation, excluded.generation)",
+        params![group_salt, generation],
+    )
+    .map_err(|e| CortexError::Storage(e.to_string()))?;
+    Ok(())
 }
 
 // ── Persistent sync settings ─────────────────────────────────────────────────

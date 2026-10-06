@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.4.0 — `remember`: Muse saves to your memory, you approve
+
+### New
+- `gateway serve --enable-remember` adds a `remember` tool. Muse can only **append** to a quarantined review inbox, and gets an acknowledgement with no id and no echo. Inbox items stay out of search, embeddings and sync until you `gateway approve` them; approval creates a Private memory plus an export copy. Use `gateway inbox` / `approve` / `reject [--all]`. Limits: 1000 chars per item, 20 per day, 200 pending. Inbox output escapes terminal control and bidi characters
+
+### Security & privacy (full review of v2.2.1–v2.3.0)
+- **The sync passphrase never passes through the model.** `sync_enable` doesn't return it, and it no longer accepts one as an argument (use `CORTEX_SYNC_PASSPHRASE` or the terminal CLI). A generated passphrase goes to the OS keychain; without a keychain the tool refuses
+- Sync tool results **and errors** are scrubbed: account emails (incl. quoted local parts), home directory, OneDrive/Dropbox/Box org folder names, IDN and trailing-dot emails. Device names are no longer echoed
+- Encrypted snapshots carry an **HMAC** bound to the file name, and the HMAC-protected manifest **pins the latest snapshot**, so restore loads exactly that file or fails closed. A replayed older snapshot, or corrupting a newer one to force an older restore, no longer works. The manifest carries a **generation** counter: a device that has synced before rejects a rolled-back manifest. Snapshots under rotated-out key versions are rejected, and restore caps file and decompressed size
+- ⚠️ **Mixed versions:** once a v2.4 device pins a snapshot, older Cortex versions refuse that sync folder's manifest. Upgrade all devices together. After `rotate_key`, create a new snapshot; the pinned one uses the retired key
+- Residual (documented): a brand-new device has no anchor against a fully rolled-back manifest + snapshot pair. `SyncEngine::rotate_key` now takes the local storage, so it persists the generation immediately (library API change)
+- Joining an encrypted sync folder without its passphrase is refused (it used to write plaintext ops). An encrypted oplog line with no key available no longer advances the cursor
+- Muse gateway: state files opened without following symlinks, with exclusive random temp files; the kill switch fails closed; terminal output escapes invisible and bidi characters on every display path; a full inbox gives the same reply as success (no activity oracle); no shared-cache staleness; stopword-only matches don't disclose; CJK keyword matching; the near-dedup, privacy-change and import paths can't touch the export; body-read timeout and bounded worker pool; over-budget refusals audited once per day
+- `server.json`: named volume so the Docker MCP server keeps memories across sessions. `release-docker` works from `workflow_dispatch`. MSRV declared: Rust 1.89
+
 ## v2.3.0 — Meta Muse gateway: share a slice of memory, keep the rest on your device
 
 ### New: `cortex-mcp-server gateway` ([guide](docs/muse.md))
@@ -15,7 +30,8 @@
 ## v2.2.1 — Sync hardening, MCP Registry fix
 
 ### Security & privacy
-- Encrypted sync rejects **plaintext snapshot downgrade** (keyless forged-memory injection on bootstrap) and **un-HMAC'd encrypted oplog ops**
+- Encrypted sync rejects **plaintext snapshot downgrade** (library-API hardening: `restore_from_snapshot` had no production caller yet) and **un-HMAC'd encrypted oplog ops**
+- ⚠️ **Migration:** encrypted ops written before v2.2.0 have no per-op HMAC and are now rejected (logged, skipped). If a device still depends on such old ops, re-export from a device that has the data (`export` → `import`) or re-create the sync group
 - `sync_status` / `sync_providers` / `sync_enable` no longer leak the cloud account email: the whole `GoogleDrive-<account>` path segment is redacted, plus any bare email
 
 ### Packaging
