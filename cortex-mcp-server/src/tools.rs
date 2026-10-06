@@ -1428,7 +1428,11 @@ fn tool_sync_providers() -> Result<String, String> {
 /// `[A-Za-z0-9.-]` containing at least one dot. Any match is replaced with `[redacted-email]`.
 fn redact_emails(input: &str) -> String {
     let bytes = input.as_bytes();
-    let is_local = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'%');
+    // `-` is valid in a local-part (`alice-smith@`), so it must be included or the part before
+    // the hyphen leaks. Cloud-storage folder prefixes like `GoogleDrive-` are stripped below.
+    let is_local =
+        |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'+' | b'%' | b'-');
+    const PROVIDER_PREFIXES: &[&str] = &["GoogleDrive-"];
     let is_domain = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-');
 
     let mut out = String::with_capacity(input.len());
@@ -1441,6 +1445,13 @@ fn redact_emails(input: &str) -> String {
             let mut start = i;
             while start > copied && is_local(bytes[start - 1]) {
                 start -= 1;
+            }
+            // Keep a known provider folder prefix visible; redact only the email after it.
+            if let Some(p) = PROVIDER_PREFIXES
+                .iter()
+                .find(|p| input[start..i].starts_with(**p))
+            {
+                start += p.len();
             }
             // Expand right over the domain.
             let mut end = i + 1;
@@ -1506,5 +1517,27 @@ mod tests {
         let s = "from a@x.com to b@y.org";
         let r = redact_emails(s);
         assert_eq!(r, "from [redacted-email] to [redacted-email]");
+    }
+
+    #[test]
+    fn redacts_hyphenated_local_part_in_sync_path() {
+        let path = "/Users/a/Library/CloudStorage/GoogleDrive-alice-smith@example.com/My Drive";
+        assert_eq!(
+            redact_emails(path),
+            "/Users/a/Library/CloudStorage/GoogleDrive-[redacted-email]/My Drive"
+        );
+    }
+
+    #[test]
+    fn redacts_trailing_hyphen_local_part() {
+        let path = "/CloudStorage/GoogleDrive-alice-@example.com/x";
+        let r = redact_emails(path);
+        assert!(!r.contains("alice"), "local part must not survive: {r}");
+        assert!(!r.contains("example.com"), "domain must not survive: {r}");
+    }
+
+    #[test]
+    fn redacts_bare_hyphenated_email() {
+        assert_eq!(redact_emails("x mary-jane@ex.org y"), "x [redacted-email] y");
     }
 }
