@@ -343,10 +343,18 @@ fn old_unpinned_snapshots_are_pruned_but_the_pinned_one_is_kept() {
     let a = Cortex::in_memory().unwrap();
     a.storage().store_memory(&public_mem("x")).unwrap();
     let mut engine_a = SyncEngine::new(config(&sync_dir, "a", Some("pass-123")), a.sqlite_storage()).unwrap();
-    let mut last = None;
-    for _ in 0..6 {
-        last = Some(engine_a.create_snapshot(a.sqlite_storage()).unwrap());
+    for _ in 0..5 {
+        engine_a.create_snapshot(a.sqlite_storage()).unwrap();
     }
+    // Fresh snapshots are never pruned (another device may be mid-publish): all 5 remain.
+    assert_eq!(std::fs::read_dir(sync_dir.join("snapshots")).unwrap().count(), 5);
+    // Once they are old, the next snapshot prunes down to the newest 3 + never the pinned one.
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    for e in std::fs::read_dir(sync_dir.join("snapshots")).unwrap() {
+        let f = std::fs::File::options().write(true).open(e.unwrap().path()).unwrap();
+        f.set_modified(two_hours_ago).unwrap();
+    }
+    let last = Some(engine_a.create_snapshot(a.sqlite_storage()).unwrap());
     let count = std::fs::read_dir(sync_dir.join("snapshots")).unwrap().count();
     assert!(count <= 3, "old snapshots pruned, found {count}");
     assert!(last.as_ref().unwrap().exists());

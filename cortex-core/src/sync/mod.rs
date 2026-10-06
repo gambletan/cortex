@@ -652,6 +652,12 @@ impl SyncEngine {
                 "Sync key was rotated while the snapshot was being written — retry".into(),
             ));
         }
+        // Never publish a pointer to a file that isn't there (e.g. removed by another device).
+        if !path.is_file() {
+            return Err(CortexError::Storage(
+                "Snapshot disappeared before it could be published — retry".into(),
+            ));
+        }
         let file = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

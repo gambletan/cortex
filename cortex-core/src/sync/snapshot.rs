@@ -171,10 +171,33 @@ pub fn list_snapshots(snapshots_dir: &Path, encrypted: bool) -> Result<Vec<PathB
 
 /// Delete all but the newest `keep` snapshots of the given mode, never touching `protect`
 /// (the pinned snapshot). Best effort: failures are logged, not returned.
+/// Unpinned snapshots younger than this are never pruned: another device may have written
+/// one and not yet published its pointer (publication takes milliseconds to seconds).
+pub(crate) const PRUNE_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 pub(crate) fn prune_snapshots(snapshots_dir: &Path, encrypted: bool, keep: usize, protect: &Path) {
+    prune_snapshots_older_than(snapshots_dir, encrypted, keep, protect, PRUNE_MIN_AGE)
+}
+
+pub(crate) fn prune_snapshots_older_than(
+    snapshots_dir: &Path,
+    encrypted: bool,
+    keep: usize,
+    protect: &Path,
+    min_age: std::time::Duration,
+) {
     let Ok(all) = list_snapshots(snapshots_dir, encrypted) else { return };
     for old in all.into_iter().skip(keep) {
         if old == protect {
+            continue;
+        }
+        // Unknown age counts as "too young" (fail safe: keep it).
+        let old_enough = fs::metadata(&old)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if !old_enough {
             continue;
         }
         if let Err(e) = fs::remove_file(&old) {
@@ -671,5 +694,28 @@ mod tests {
     fn test_non_ascii_snapshot_names_are_rejected_not_panicking() {
         assert!(snapshot_date("snapshot-123456789\u{e9}12345678.json.zst.enc", true).is_none());
         assert!(snapshot_date("snapshot-2026-03-2\u{e9}.json.zst.enc", true).is_none());
+    }
+
+    #[test]
+    fn test_prune_never_removes_young_unpinned_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("snapshots");
+        fs::create_dir_all(&dir).unwrap();
+        let names = [
+            "snapshot-2026-03-20-00000001.json.zst.enc",
+            "snapshot-2026-03-21-00000002.json.zst.enc",
+            "snapshot-2026-03-22-00000003.json.zst.enc",
+            "snapshot-2026-03-23-00000004.json.zst.enc",
+            "snapshot-2026-03-24-00000005.json.zst.enc",
+        ];
+        for n in names {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        // All files are brand new (e.g. another device's in-flight snapshot): nothing pruned.
+        prune_snapshots(&dir, true, 3, &dir.join(names[4]));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 5);
+        // With no age requirement, the two oldest go.
+        prune_snapshots_older_than(&dir, true, 3, &dir.join(names[4]), std::time::Duration::ZERO);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
     }
 }
