@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.2.1 — Sync hardening, MCP Registry fix
+
+### Security & privacy
+- Encrypted sync rejects **plaintext snapshot downgrade** (keyless forged-memory injection on bootstrap) and **un-HMAC'd encrypted oplog ops**
+- `sync_status` / `sync_providers` / `sync_enable` no longer leak the cloud account email: the whole `GoogleDrive-<account>` path segment is redacted, plus any bare email
+
+### Packaging
+- `server.json` now validates against the MCP Registry 2025-12-11 schema (#15)
+- Docker image builds again (builder `rust:1.94`; 2.2.0 image was never published)
+- Clippy clean on Linux + current stable
+
 ## v2.2.0 — Security hardening, privacy opt-in, retrieval quality
 
 ### Security & crypto

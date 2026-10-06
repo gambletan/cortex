@@ -7,11 +7,11 @@
     "url": "https://github.com/gambletan/cortex",
     "source": "github"
   },
-  "version": "2.2.0",
+  "version": "2.2.1",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/gambletan/cortex/cortex-http:2.2.0",
+      "identifier": "ghcr.io/gambletan/cortex/cortex-http:2.2.1",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
