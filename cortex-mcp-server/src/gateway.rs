@@ -231,6 +231,18 @@ fn read_private(path: &Path) -> std::io::Result<String> {
     Ok(s)
 }
 
+/// fsync the directory holding `path`, so a rename/create survives power loss.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// A fresh, unpredictable temp path next to `path`, created exclusively (no clobbering of a
 /// pre-planted file or link).
 fn create_temp_beside(path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
@@ -246,7 +258,8 @@ fn save_budget(path: &Path, b: &Budget) -> Result<(), String> {
         let (tmp, mut f) = create_temp_beside(path)?;
         f.write_all(&data)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path)
     };
     write().map_err(|e| e.to_string())
 }
@@ -688,7 +701,8 @@ fn append_inbox(path: &Path, item: &InboxItem) -> Result<(), String> {
     let line = serde_json::to_string(item).map_err(|e| e.to_string())?;
     let mut f = private_options().create(true).append(true).open(path).map_err(|e| e.to_string())?;
     writeln!(f, "{line}").map_err(|e| e.to_string())?;
-    f.sync_data().map_err(|e| e.to_string())
+    f.sync_data().map_err(|e| e.to_string())?;
+    sync_parent(path).map_err(|e| e.to_string()) // the file may have just been created
 }
 
 fn write_inbox(path: &Path, items: &[InboxItem]) -> Result<(), String> {
@@ -698,7 +712,8 @@ fn write_inbox(path: &Path, items: &[InboxItem]) -> Result<(), String> {
             writeln!(f, "{}", serde_json::to_string(item).map_err(std::io::Error::other)?)?;
         }
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path)
     };
     write().map_err(|e| e.to_string())
 }

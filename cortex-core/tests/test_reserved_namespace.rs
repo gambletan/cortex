@@ -82,3 +82,31 @@ fn import_never_recreates_muse_export_rows() {
     assert_eq!(report.memories, 1);
     assert!(c.list_namespaces().unwrap().iter().all(|(ns, _)| ns != MUSE_EXPORT_NAMESPACE));
 }
+
+#[test]
+fn near_dedup_still_finds_an_ordinary_duplicate_behind_an_export_copy() {
+    use cortex_core::types::{DeduplicationConfig, MemContent, MemObjectBuilder, MemSource, MemoryTier, PrivacyLevel};
+    let c = Cortex::in_memory()
+        .unwrap()
+        .with_dedup_config(DeduplicationConfig { near_dedup: true, ..DeduplicationConfig::default() });
+    // Nearest neighbour is an export copy; an ordinary near-identical memory is right behind it.
+    let mut export = MemObjectBuilder::new(MemoryTier::Semantic, MemContent::Text("likes sushi".into()), MemSource::new("t"))
+        .privacy(PrivacyLevel::Private)
+        .namespace(MUSE_EXPORT_NAMESPACE)
+        .embedding(vec![1.0, 0.0, 0.0, 0.0])
+        .build();
+    export.content_hash = export.content_hash.map(|h| format!("{MUSE_EXPORT_NAMESPACE}:{h}"));
+    c.storage().store_memory(&export).unwrap();
+    c.index().insert(export.id, vec![1.0, 0.0, 0.0, 0.0]);
+    let ordinary = c
+        .ingest_with_options("really likes sushi", "test", None, None, Some(vec![0.999, 0.02, 0.0, 0.0]), None, None)
+        .unwrap();
+    let again = c
+        .ingest_with_options("likes sushi a lot", "test", None, None, Some(vec![1.0, 0.0, 0.0, 0.0]), None, None)
+        .unwrap();
+    assert!(c.storage().get_memory(ordinary.id).unwrap().is_some());
+    assert!(
+        c.storage().get_memory(again.id).unwrap().is_none(),
+        "near-duplicate of the ordinary memory must be merged, not stored again"
+    );
+}

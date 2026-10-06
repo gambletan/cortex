@@ -817,14 +817,19 @@ impl Cortex {
             return None;
         }
         let emb = embedding.as_ref()?;
-        if let Some((existing_id, sim)) = self.index.search(emb, 1).first().copied() {
-            // A Muse export copy is not the user's memory: merging into it would drop the
-            // new ingest, and a later `gateway revoke` would then lose the only copy.
-            let is_export_copy = || {
-                matches!(self.storage.get_memory(existing_id),
-                    Ok(Some(m)) if m.namespace.as_deref() == Some(crate::types::MUSE_EXPORT_NAMESPACE))
-            };
-            if sim >= self.dedup_config.near_dedup_threshold && !is_export_copy() {
+        // A Muse export copy is not the user's memory: merging into it would drop the new
+        // ingest (and a later `gateway revoke` would lose the only copy). Skip export copies
+        // and keep looking at the next-nearest neighbours instead of giving up.
+        const NEAR_DEDUP_CANDIDATES: usize = 8;
+        let is_export_copy = |id: Uuid| {
+            matches!(self.storage.get_memory(id),
+                Ok(Some(m)) if m.namespace.as_deref() == Some(crate::types::MUSE_EXPORT_NAMESPACE))
+        };
+        for (existing_id, sim) in self.index.search(emb, NEAR_DEDUP_CANDIDATES) {
+            if sim < self.dedup_config.near_dedup_threshold {
+                break; // results are ordered by similarity
+            }
+            if !is_export_copy(existing_id) {
                 return Some(NearDup::Existing(existing_id));
             }
         }
