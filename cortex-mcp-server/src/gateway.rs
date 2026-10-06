@@ -226,7 +226,7 @@ fn export_rows(cortex: &Cortex) -> Result<Vec<MemObject>, String> {
     // Defense in depth: never trust the query layer alone, and only serve rows that
     // `allow` itself created (Private + hash marker), whatever else reached the namespace.
     rows.retain(is_export_row);
-    rows.sort_by(|a, b| b.temporal.ingestion_time.cmp(&a.temporal.ingestion_time));
+    rows.sort_by_key(|m| std::cmp::Reverse(m.temporal.ingestion_time));
     rows.truncate(MAX_EXPORT);
     Ok(rows)
 }
