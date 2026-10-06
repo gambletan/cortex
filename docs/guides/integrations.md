@@ -258,7 +258,7 @@ print(f"Consolidated: {promoted} memories promoted, {swept} stale swept")
 
 ## LangGraph
 
-Cortex integrates with [LangGraph](https://github.com/langchain-ai/langgraph) via [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters). All 29 Cortex MCP tools become available to your LangGraph agent automatically.
+Cortex integrates with [LangGraph](https://github.com/langchain-ai/langgraph) via [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters). All 30 Cortex MCP tools become available to your LangGraph agent automatically.
 
 ### Install
 

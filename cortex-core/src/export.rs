@@ -117,6 +117,13 @@ pub fn import_all(
     };
 
     if let Some(memories) = data.memories {
+        // The Muse export is consent given on this device. Import never recreates it:
+        // a crafted file could otherwise plant rows Muse would serve. After a restore, the
+        // user re-exports with `gateway allow`.
+        let memories: Vec<_> = memories
+            .into_iter()
+            .filter(|m| m.namespace.as_deref() != Some(crate::types::MUSE_EXPORT_NAMESPACE))
+            .collect();
         report.memories = memories.len();
         for mem in &memories {
             storage.store_memory(mem)?;

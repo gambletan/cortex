@@ -61,7 +61,7 @@ Muse (Meta cloud) ──HTTPS──▶ tunnel (TLS ends on device) ──▶ 127
   - `cortex-mcp-server gateway allow --from <memory-id>` → copies an existing memory's text into
     `export_ns` (copy, not move: the original keeps its privacy/namespace).
   - `cortex-mcp-server gateway list` / `cortex-mcp-server gateway revoke <id>` (deletes the export copy).
-  - The namespace is **reserved**: core rejects ordinary ingest (single, batch, MCP, HTTP, bindings) and sync-peer writes into it. The gateway additionally serves only rows `allow` created (Private + content-hash marker). `import` of a user's own backup restores it as-is.
+  - The namespace is **reserved**: core rejects ordinary ingest (single, batch, MCP, HTTP, bindings), sync-peer writes, privacy changes that would make an export row syncable, and near-dedup merges into it. `import` skips export rows (re-export with `gateway allow` after a restore). The gateway additionally serves only rows `allow` created (Private + content-hash marker).
 
 ### MCP surface (streamable HTTP, JSON responses only)
 

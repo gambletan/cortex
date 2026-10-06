@@ -222,6 +222,7 @@ println!("Applied {} remote changes", applied);
 | **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
 | **Zero telemetry** | No analytics, no phone-home, no user data ever leaves the device — **enforced in CI** (`scripts/check-no-network-egress.sh`): the build fails if any network/telemetry crate enters `cortex-core`'s default tree, and the check also proves the `--no-default-features` binary is completely zero-network. |
 | **Embedding model fetch (one-time)** | The default `cortex-mcp-server` enables on-device semantic search, which **downloads a ~30 MB model (all-MiniLM-L6-v2) from the Hugging Face CDN on first ingest**, then runs fully offline and sends none of your data. For a 100%-offline setup: run with `CORTEX_NO_EMBEDDINGS=1` (keyword/FTS recall, zero network) or build `--no-default-features`. A one-time stderr notice is printed before any download — nothing is ever fetched silently. |
+| **Muse gateway (opt-in)** | `gateway serve` is the only component that accepts remote requests. It serves a single read-only tool over an explicit per-memory export only. Every request needs a bearer token, and there are daily request and disclosure budgets, a kill switch, and a metadata-only audit log. The export namespace is reserved, so ordinary ingest and sync peers cannot write it. It is left out of the `-lite` build. [docs/muse.md](docs/muse.md) |
 | **No accounts** | No API key, no registration, no cloud dependency |
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
@@ -381,7 +382,7 @@ println!("Promoted: {}, Decayed: {}", report.promoted, report.decayed);
 
 ## Python Bindings
 
-Coming soon via [PyO3](https://pyo3.rs). The `cortex-python` crate will expose the full API as a native Python module:
+Native module built with [PyO3](https://pyo3.rs), published on PyPI as **`cortex-ai-memory`** (`pip install cortex-ai-memory`):
 
 ```python
 from cortex import Cortex
@@ -461,6 +462,8 @@ Commands:
   export  Export all data as JSON
   import  Import data from JSON file
   info    Show version, DB path, and capabilities
+  digest  Show weekly memory digest
+  gateway Muse gateway: share an explicit slice of memory with Meta Muse over remote MCP
   help    Print this message or the help of the given subcommand(s)
 
 Arguments:
@@ -497,6 +500,13 @@ cortex-mcp-server ~/.cortex/new.db import backup.json
 
 # Version & capabilities
 cortex-mcp-server ~/.cortex/memory.db info
+
+# Meta Muse gateway (see docs/muse.md)
+cortex-mcp-server gateway allow "I prefer aisle seats"   # export one memory to Muse
+cortex-mcp-server gateway preview "booking a flight"      # exactly what Muse would get
+export CORTEX_GATEWAY_TOKEN=$(cortex-mcp-server gateway token)
+cortex-mcp-server gateway serve                           # http://127.0.0.1:3316/mcp
+cortex-mcp-server gateway off                             # kill switch
 ```
 
 **No subcommand = MCP stdio mode** (for Claude Code / Claude Desktop integration).

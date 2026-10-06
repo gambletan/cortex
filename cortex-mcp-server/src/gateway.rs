@@ -37,6 +37,7 @@ use uuid::Uuid;
 use cortex_core::types::{
     MemContent, MemObject, MemObjectBuilder, MemSource, MemoryTier, PrivacyLevel, MUSE_EXPORT_NAMESPACE,
 };
+use cortex_core::storage::memory_index::cosine_similarity;
 use cortex_core::Cortex;
 
 use crate::tools::{content_to_string, redact_emails};
@@ -149,6 +150,10 @@ struct Budget {
     day: String,
     requests: u32,
     disclosed: BTreeSet<String>,
+    /// Over-budget refusals are audited once per day, not per call: they are unmetered,
+    /// and auditing each one would let a caller rotate real disclosure records away.
+    #[serde(default)]
+    over_budget_logged: bool,
 }
 
 fn today() -> String {
@@ -237,21 +242,48 @@ fn is_export_row(m: &MemObject) -> bool {
         && m.content_hash.as_deref().is_some_and(|h| h.starts_with(EXPORT_HASH_PREFIX))
 }
 
-fn tokens(s: &str) -> BTreeSet<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().count() >= 2)
-        .map(|t| t.to_lowercase())
-        .collect()
+/// Han / Kana / Hangul: scripts written without spaces between words.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0x20000..=0x2FFFF)
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
+/// Lowercased word tokens (2+ chars). CJK runs have no word boundaries, so they are
+/// split into character bigrams (a lone CJK char is kept as-is).
+/// Function words that would otherwise make any question match any memory
+/// ("what is my name" must not disclose "my coffee is black").
+const STOPWORDS: &[&str] = &[
+    "a", "about", "am", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for",
+    "from", "have", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our", "so",
+    "that", "the", "their", "this", "to", "was", "we", "what", "when", "where", "which", "who",
+    "why", "will", "with", "you", "your", "的", "了", "是", "我", "你", "吗", "什么",
+];
+
+/// Query terms that carry meaning: tokens minus stopwords.
+fn query_terms(query: &str) -> BTreeSet<String> {
+    tokens(query).into_iter().filter(|t| !STOPWORDS.contains(&t.as_str())).collect()
+}
+
+fn tokens(s: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for seg in s.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let chars: Vec<char> = seg.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let cjk = is_cjk(chars[i]);
+            let start = i;
+            while i < chars.len() && is_cjk(chars[i]) == cjk {
+                i += 1;
+            }
+            let run = &chars[start..i];
+            if cjk && run.len() > 1 {
+                out.extend(run.windows(2).map(|w| w.iter().collect::<String>()));
+            } else if cjk || run.len() >= 2 {
+                out.insert(run.iter().collect::<String>().to_lowercase());
+            }
+        }
     }
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt() * nb.sqrt()) }
+    out
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -263,14 +295,14 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Pure ranking + shaping over already-gated rows.
 fn rank(rows: &[MemObject], query: &str, query_emb: Option<&[f32]>, limit: usize) -> Vec<Disclosed> {
-    let q_tokens = tokens(query);
+    let q_tokens = query_terms(query);
     let mut scored: Vec<(f32, &MemObject)> = rows
         .iter()
         .filter(|m| is_export_row(m))
         .filter_map(|m| {
             let text = content_to_string(&m.content);
             let semantic = match (query_emb, m.embedding.as_deref()) {
-                (Some(q), Some(e)) if q.len() == e.len() => Some(cosine(q, e)),
+                (Some(q), Some(e)) if q.len() == e.len() => Some(cosine_similarity(q, e)),
                 _ => None,
             };
             let keyword = if q_tokens.is_empty() {
@@ -280,7 +312,9 @@ fn rank(rows: &[MemObject], query: &str, query_emb: Option<&[f32]>, limit: usize
                 q_tokens.iter().filter(|w| t.contains(*w)).count() as f32 / q_tokens.len() as f32
             };
             let score = match semantic {
-                Some(s) if s >= MIN_COSINE || keyword > 0.0 => s.max(0.0) + keyword,
+                // A keyword hit only rescues a weak semantic match if it covers half the
+                // meaningful query terms.
+                Some(s) if s >= MIN_COSINE || keyword >= 0.5 => s.max(0.0) + keyword,
                 Some(_) => return None,
                 None if keyword > 0.0 => keyword,
                 None => return None,
@@ -387,7 +421,13 @@ impl Gateway {
             Err(e) => return self.deny("denied:budget_state", &format!("Refusing to disclose: {e}.")),
         };
         if budget.requests >= self.daily_requests {
-            return self.deny("denied:request_budget", "Daily request budget exhausted.");
+            const MSG: &str = "Daily request budget exhausted.";
+            if budget.over_budget_logged {
+                return tool_error(MSG);
+            }
+            budget.over_budget_logged = true;
+            let _ = save_budget(&self.paths.budget, &budget);
+            return self.deny("denied:request_budget", MSG);
         }
         budget.requests += 1;
         if save_budget(&self.paths.budget, &budget).is_err() {
@@ -486,6 +526,9 @@ struct HttpState {
     gw: Gateway,
     token: String,
     origins: Vec<String>,
+    /// Bounds the blocking work actually in flight. The permit moves into the blocking
+    /// task, so it is held for as long as the work runs, even if the client goes away.
+    workers: Arc<tokio::sync::Semaphore>,
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -501,8 +544,10 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
     let authorized = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| ct_eq(t.as_bytes(), st.token.as_bytes()));
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, t)| t)
+        .is_some_and(|t: &str| ct_eq(t.as_bytes(), st.token.as_bytes()));
     if !authorized {
         return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Bearer")]).into_response();
     }
@@ -523,8 +568,15 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
         Ok(r) => r,
         Err(_) => return rpc_error_response(StatusCode::BAD_REQUEST, -32600, "Invalid request"),
     };
+    let Ok(permit) = st.workers.clone().try_acquire_owned() else {
+        return rpc_error_response(StatusCode::SERVICE_UNAVAILABLE, -32000, "Server busy");
+    };
     let st2 = st.clone();
-    let resp = tokio::task::spawn_blocking(move || st2.gw.handle(&req)).await;
+    let resp = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        st2.gw.handle(&req)
+    })
+    .await;
     match resp {
         Ok(Some(r)) => (
             StatusCode::OK,
@@ -545,12 +597,13 @@ fn router(state: Arc<HttpState>) -> Router {
         )
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        // Bound slow clients (incl. slow bodies) and parallel load. Header-phase slowloris
-        // is absorbed by the HTTPS tunnel in front of this loopback listener.
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        ))
+        // Bound slow request bodies. Deliberately NOT a whole-request timeout: that would
+        // drop the response while the blocking disclosure keeps running (charging budget,
+        // auditing "ok") — the work itself is short and bounded by `workers`.
+        // Header-phase slowloris is absorbed by the tunnel in front of this loopback listener.
+        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(std::time::Duration::from_secs(
+            REQUEST_TIMEOUT_SECS,
+        )))
         .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
         .with_state(state)
 }
@@ -698,6 +751,7 @@ pub fn run(action: GatewayAction, db_path: &str) {
                 gw: Gateway { cortex, paths, daily_requests, daily_disclosures, lock: Mutex::new(()) },
                 token,
                 origins: allow_origin,
+                workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             });
             let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(&e.to_string()));
             rt.block_on(async move {
@@ -807,13 +861,50 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("b.json");
         assert_eq!(load_budget(&p, "2026-01-01").unwrap().requests, 0);
-        let b = Budget { day: "2026-01-01".into(), requests: 7, disclosed: ["a".to_string()].into() };
+        let b = Budget { day: "2026-01-01".into(), requests: 7, disclosed: ["a".to_string()].into(), ..Budget::default() };
         save_budget(&p, &b).unwrap();
         assert_eq!(load_budget(&p, "2026-01-01").unwrap(), b);
         assert_eq!(load_budget(&p, "2026-01-02").unwrap().requests, 0);
         std::fs::write(&p, "{not json").unwrap();
         assert!(load_budget(&p, "2026-01-01").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn over_budget_refusals_are_audited_once_per_day() {
+        let dir = std::env::temp_dir().join(format!("gw-audit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_db(dir.join("db.sqlite").to_str().unwrap());
+        let audit = paths.audit.clone();
+        let gw = Gateway {
+            cortex: Cortex::in_memory().unwrap(),
+            paths,
+            daily_requests: 1,
+            daily_disclosures: 5,
+            lock: Mutex::new(()),
+        };
+        for _ in 0..20 {
+            gw.call_recall(&json!({"query": "zebra"}));
+        }
+        let lines = std::fs::read_to_string(&audit).unwrap();
+        assert_eq!(lines.lines().count(), 2, "one ok + one denial: {lines}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stopword_only_overlap_discloses_nothing() {
+        let rows = [mem("my coffee is black", Some(EXPORT_NS), PrivacyLevel::Private)];
+        assert!(rank(&rows, "what is my name", None, 5).is_empty());
+        assert_eq!(rank(&rows, "what is my coffee", None, 5).len(), 1);
+    }
+
+    #[test]
+    fn tokens_split_cjk_into_bigrams() {
+        let t = tokens("我喜欢吃寿司 and Sushi");
+        assert!(t.contains("寿司") && t.contains("喜欢") && t.contains("sushi") && t.contains("and"));
+        assert!(tokens("猫").contains("猫"));
+        let out = rank(&[mem("我喜欢吃寿司", Some(EXPORT_NS), PrivacyLevel::Private)], "寿司", None, 5);
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

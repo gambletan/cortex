@@ -8,8 +8,8 @@
 |--------|-----------|
 | **Cloud storage breach** | Oplog files are AES-256-GCM encrypted (opt-in). An attacker with access to your iCloud/Google Drive/OneDrive/Dropbox cannot read synced memories. |
 | **Memory forensics** | Sensitive data (text, facts, preferences) is zeroized on drop via the `zeroize` crate. Encryption keys are securely cleared from memory. |
-| **Accidental sync of private data** | Private memories (the default) never leave the local SQLite database. Only memories explicitly marked as Shared or Public are written to the sync oplog. |
-| **Man-in-the-middle** | No network calls. Sync happens through local filesystem only. Cloud providers handle transport encryption. |
+| **Accidental sync of private data** | Private memories (the default) never leave the local SQLite database. Only memories explicitly marked Shared or Public are written to the sync oplog, and demoting one back to Private retracts it from other devices. Peers cannot push Private memories. |
+| **Man-in-the-middle** | Cortex makes no outbound network calls (one-time embedding-model download aside, see README). Sync happens through the local filesystem; cloud providers handle transport. The only inbound listeners are local (`cortex-http` on loopback by default; the opt-in Muse gateway, see below). |
 | **Telemetry/tracking** | Zero telemetry. Zero analytics. Zero phone-home. Verify: `grep -r "reqwest\|hyper\|TcpStream\|UdpSocket" cortex-core/src/` returns nothing. |
 
 ### What Cortex Does NOT Protect Against
@@ -37,7 +37,8 @@
   - Parameters: time_cost=3, mem_cost=64MB, parallelism=1
   - 16-byte random salt (stored in manifest.json)
 - **Per-line nonce**: 12-byte random nonce per oplog line (never reused)
-- **Format**: `ENC1:<base64(nonce[12] || ciphertext || tag[16])>`
+- **Format**: `ENC1:<base64(nonce[12] || ciphertext || tag[16])>`; since v2.2, versioned `ENC2` envelopes with per-version keys (key rotation, forward secrecy against AES-key exfiltration)
+- **Integrity**: HMAC on the manifest (mandatory) and on every operation; encrypted ops without an HMAC, plaintext oplog lines, and plaintext snapshots are all rejected while encryption is on
 - **Key storage**: Derived at runtime from passphrase, never persisted. Zeroized on drop.
 
 ## Privacy Levels
@@ -47,6 +48,26 @@
 | **Private** | Never leaves local device | Yes |
 | **Shared** | Syncs to devices in specified scope | No |
 | **Public** | Syncs to all connected devices | No |
+
+## Meta Muse Gateway (opt-in, v2.3+)
+
+`cortex-mcp-server gateway serve` lets Meta Muse, which runs in Meta's cloud, read a slice of
+memory that the user explicitly chose. It is the only Cortex component meant to be reached
+from the internet, through a tunnel the user runs. Full design and threat model:
+[docs/design/muse-gateway.md](docs/design/muse-gateway.md).
+
+| Control | Detail |
+|---|---|
+| Scope | One read-only MCP tool. Only memories added with `gateway allow` (namespace `muse-export`, which is reserved: core rejects ordinary ingest and sync-peer writes to it). |
+| Freshness | Each request reads the export straight from SQLite, with no shared index or cache, so `revoke` takes effect on the next request. |
+| Auth | Bearer token (≥ 32 chars, random), constant-time compare; `Origin` allowlist; 64 KiB body; 10 s timeout; 16 concurrent requests; one server per database. |
+| Budgets | Per UTC day: requests and **distinct** memories disclosed. Every call is charged first. Over the disclosure budget, unseen matches are withheld silently, so no search oracle. |
+| Kill switch | `gateway off` takes effect immediately and fails closed on I/O errors. |
+| Audit | Local JSONL with metadata only (ids, counts, outcome), never the query or text. 0600, rotated. |
+
+**Not protected:** anything returned to Muse is in Meta's cloud and cannot be recalled. Use a
+tunnel that terminates TLS on your machine (e.g. Tailscale Funnel). Edge-terminating tunnels
+can read traffic. Whoever controls the gateway host can read the database.
 
 ## Zero Telemetry Verification
 
@@ -58,7 +79,9 @@ grep -r "reqwest\|hyper\|TcpStream\|UdpSocket\|connect\|dns" cortex-core/src/
 # Result: no matches
 
 # The HTTP server (cortex-http) and MCP server are local-only listeners
-# They do not make outbound connections
+# They do not make outbound connections. The opt-in Muse gateway accepts inbound
+# requests (through your tunnel) but also never connects out.
+# CI enforces this: scripts/check-no-network-egress.sh
 ```
 
 ## Responsible Disclosure

@@ -559,15 +559,14 @@ impl Cortex {
         Ok(())
     }
 
-    /// Auto-generate embedding if embedder is available and none provided.
-    /// Lazily initializes the embedding model on first call.
-    #[allow(unused_variables)]
     /// Embed `text` with the local model, or `None` when embeddings are compiled out,
     /// disabled via `CORTEX_NO_EMBEDDINGS`, or the model failed to load.
     pub fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
         self.auto_embed(text, None)
     }
 
+    /// Auto-generate embedding if embedder is available and none provided.
+    /// Lazily initializes the embedding model on first call.
     fn auto_embed(&self, text: &str, embedding: Option<Vec<f32>>) -> Option<Vec<f32>> {
         #[cfg(not(feature = "embeddings"))]
         let _ = text;
@@ -819,7 +818,13 @@ impl Cortex {
         }
         let emb = embedding.as_ref()?;
         if let Some((existing_id, sim)) = self.index.search(emb, 1).first().copied() {
-            if sim >= self.dedup_config.near_dedup_threshold {
+            // A Muse export copy is not the user's memory: merging into it would drop the
+            // new ingest, and a later `gateway revoke` would then lose the only copy.
+            let is_export_copy = || {
+                matches!(self.storage.get_memory(existing_id),
+                    Ok(Some(m)) if m.namespace.as_deref() == Some(crate::types::MUSE_EXPORT_NAMESPACE))
+            };
+            if sim >= self.dedup_config.near_dedup_threshold && !is_export_copy() {
                 return Some(NearDup::Existing(existing_id));
             }
         }
@@ -1456,6 +1461,13 @@ impl Cortex {
             .storage
             .get_memory(id)?
             .ok_or_else(|| CortexError::NotFound(format!("memory {id}")))?;
+        // Muse export copies are local-only consent records; they must never reach sync.
+        if privacy.is_syncable() && mem.namespace.as_deref() == Some(crate::types::MUSE_EXPORT_NAMESPACE) {
+            return Err(CortexError::InvalidInput(format!(
+                "memories in the reserved '{}' namespace cannot be made syncable",
+                crate::types::MUSE_EXPORT_NAMESPACE
+            )));
+        }
         let was_syncable = mem.privacy.is_syncable();
         mem.privacy = privacy;
         self.storage.update_memory(&mem)?;

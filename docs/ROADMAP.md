@@ -32,6 +32,17 @@ This is the prioritized forward plan. The per-iteration security audits
   macOS-version warnings are cosmetic.
 
 ### Shipped this cycle
+- ✅ **v2.3.0 — Meta Muse gateway (privacy, 2026-10-06).** `cortex-mcp-server gateway`: a
+  remote MCP tool with one read-only `recall_memory`, serving only an explicit per-memory export
+  (reserved `muse-export` namespace). It has daily request and distinct-disclosure budgets, a
+  kill switch, preview, and a metadata-only audit log, and is excluded from `-lite`. Design:
+  `docs/design/muse-gateway.md`. Also v2.2.1: sync downgrade fixes + account-email redaction
+  landed on main, `server.json` is valid against the MCP Registry schema, the Docker build is
+  fixed, and Clippy CI is green.
+- ⏭ **Next (v2.4):** `remember` (Muse writes into a quarantined inbox; the user approves
+  locally) — `docs/design/muse-remember.md`. **OAuth 2.1 + DCR for the gateway**: Muse may
+  not accept a static bearer token (Hindsight's self-hosted Muse path uses OAuth), so this
+  must be verified with a real Muse account and is likely a blocker for real-world use.
 - ✅ **Iteration 21 — Unify single & batch ingest into one lifecycle (data-integrity, 2026-06-16).**
   `ingest_batch` had silently diverged from single ingest — it skipped near-dedup,
   fact-contradiction resolution, relationship extraction, the `on_post_ingest` hook, and

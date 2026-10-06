@@ -5,8 +5,9 @@
 > please [open an issue](https://github.com/gambletan/cortex/issues) — OAuth is next.
 
 Muse is far more useful when it knows you: your kid's peanut allergy, that you always take
-the aisle seat, which coffee you like. Other memory connectors for Muse handle this by
-putting **your whole memory on their servers.**
+the aisle seat, which coffee you like. Typical memory connectors for Muse keep your memory
+on a hosted service, or on a self-hosted server. Muse can then read whole memory banks, and
+an LLM processes everything you store.
 
 Cortex works the other way round: **your memory archive stays on your device, and synced
 copies are encrypted in your own cloud drive (iCloud / Google Drive / Dropbox / OneDrive)
@@ -18,16 +19,17 @@ Connect Cortex instead, and Muse gets only what you put in the export.
 
 ## Why this is different
 
-| | Cortex gateway | Hosted memory connectors |
+| | Cortex gateway | Typical hosted/self-hosted memory connector |
 |---|---|---|
-| Where your memory lives | Your own disk (SQLite) | Their cloud |
-| What Muse can read | Only memories you add to the export | Everything in the account |
-| Daily cap on what leaves | Yes: requests per day + distinct memories per day | No |
-| Turn it off | `gateway off` takes effect on the next request; no restart, no ticket | Revoke OAuth and hope |
-| Proof of what was shared | Local audit log (ids, counts, outcome; never your query or text) | Their dashboard, if any |
-| Preview before sharing | `gateway preview "<question>"` shows exactly what Muse would get | — |
-| Emails in shared text | Redacted automatically | Stored as-is |
-| Cost | Free, MIT, no account | Subscription |
+| Where your memory lives | Your devices (SQLite). Synced copies are encrypted in your own drive | Vendor cloud or your server (plaintext DB) |
+| Is your memory sent to an LLM to process? | No. No LLM in the pipeline | Yes, every save is processed by an LLM provider |
+| What Muse can read | Only the memories you add to the export, one by one | Whole memory banks (scoping is per bank) |
+| Can Muse write or delete? | No. It gets one read-only tool | Usually yes (retain, bank tools) |
+| Daily cap on what leaves | Yes: requests and distinct memories per day | No |
+| Kill switch | `gateway off` takes effect on the next request | Revoke the OAuth grant |
+| Record of what was shared | Local audit log (ids, counts, outcome; never your query or text) | Vendor-side, often an enterprise feature |
+| Preview before sharing | `gateway preview "<question>"` | — |
+| Cost | Free, MIT, no account | Usage-based pricing or your own LLM bill |
 
 Your private memories are never put into a response. The gateway's database query only
 asks for the `muse-export` namespace, so other rows are never loaded at all. Revoking an
