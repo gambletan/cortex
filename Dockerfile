@@ -13,6 +13,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY cortex-core/ cortex-core/
 COPY cortex-http/ cortex-http/
 COPY cortex-mcp-server/ cortex-mcp-server/
+COPY cortex-cloud/ cortex-cloud/
 
 # Stub out cortex-python and cortex-wasm so workspace resolves without their deps
 RUN mkdir -p cortex-python/src && \
