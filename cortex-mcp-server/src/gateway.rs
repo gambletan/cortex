@@ -50,6 +50,8 @@ pub mod oauth;
 /// The only namespace the gateway ever reads. Membership is the user's explicit consent;
 /// core rejects ordinary ingest and sync writes into it.
 pub const EXPORT_NS: &str = MUSE_EXPORT_NAMESPACE;
+/// Most memories one export may hold.
+pub const MAX_EXPORT_ITEMS: usize = MAX_EXPORT;
 /// Prefix `allow` puts on the content hash — a marker no ingest path can produce.
 const EXPORT_HASH_PREFIX: &str = "muse-export:";
 const MAX_AUDIT_BYTES: u64 = 10 * 1024 * 1024;
@@ -1259,7 +1261,8 @@ pub fn run(action: GatewayAction, db_path: &str) {
 // everything above unchanged. See docs/design/muse-cloud.md.
 
 const SEALED_PREFIX: &str = "enc1:";
-const MAX_EXPORT_TEXT_CHARS: usize = 2000;
+/// Longest text one shared memory may have (the cloud refuses longer ones).
+pub const MAX_EXPORT_TEXT_CHARS: usize = 2000;
 /// all-MiniLM-L6-v2, the model devices and the cloud share.
 pub const EMBED_DIM: usize = 384;
 
@@ -1341,9 +1344,10 @@ pub struct ExportItem {
     pub embedding: Option<Vec<f32>>,
 }
 
-/// Replace the whole export with `items` (a device push). Old rows are deleted first, so
-/// an item the user stopped sharing is never served again, even if the push fails midway
-/// (the device simply pushes again).
+/// Make the export equal `items` (a device push). Rows whose text is no longer shared are
+/// deleted first, so an item the user stopped sharing is never served again even if the
+/// push fails midway (the device pushes again). Unchanged rows keep their ids, so the
+/// daily distinct-disclosure budget doesn't count them again.
 pub fn replace_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> {
     if items.len() > MAX_EXPORT {
         return Err(format!("at most {MAX_EXPORT} items"));
@@ -1354,12 +1358,18 @@ pub fn replace_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, St
     if items.iter().any(|i| i.embedding.as_ref().is_some_and(|e| e.len() != EMBED_DIM || e.iter().any(|x| !x.is_finite()))) {
         return Err("invalid embedding".into());
     }
+    let wanted: BTreeSet<&str> = items.iter().map(|i| i.text.as_str()).collect();
+    let mut kept = BTreeSet::new();
     for m in export_rows(cortex)? {
+        let text = content_to_string(&m.content);
+        if wanted.contains(text.as_str()) && kept.insert(text) {
+            continue;
+        }
         cortex.delete_memory(m.id).map_err(|e| e.to_string())?;
     }
     let mut seen = BTreeSet::new();
     for item in items {
-        if !seen.insert(item.text.as_str()) {
+        if !seen.insert(item.text.as_str()) || kept.contains(&item.text) {
             continue;
         }
         let source = MemSource {
@@ -1432,7 +1442,9 @@ mod tests {
         let c = Cortex::in_memory().unwrap();
         let item = |t: &str| ExportItem { text: t.into(), embedding: Some(vec![0.05; EMBED_DIM]) };
         assert_eq!(replace_export(&c, &[item("a"), item("b"), item("a")]).unwrap(), 2);
+        let id_b = export_rows(&c).unwrap().into_iter().find(|m| content_to_string(&m.content) == "b").unwrap().id;
         assert_eq!(replace_export(&c, &[item("b")]).unwrap(), 1);
+        assert_eq!(export_rows(&c).unwrap()[0].id, id_b, "unchanged item keeps its id (disclosure budget)");
         let texts: Vec<String> = export_rows(&c).unwrap().iter().map(|m| content_to_string(&m.content)).collect();
         assert_eq!(texts, vec!["b".to_string()]);
         assert!(replace_export(&c, &[item(" ")]).is_err());

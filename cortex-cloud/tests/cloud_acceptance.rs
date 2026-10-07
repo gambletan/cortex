@@ -1366,3 +1366,29 @@ fn review_client_recovers_when_the_cloud_lost_its_tenant() {
     let out = dev.call("muse_disconnect", json!({}));
     assert!(!out.is_error, "{}", out.text);
 }
+
+#[test]
+fn review_unshare_with_a_bad_id_changes_nothing() {
+    let tmp = TempDir::new("rv-unshare-bad");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["Keep A", "Keep B"]);
+    let id = dev.status()["shared"][0]["id"].as_str().unwrap().to_string();
+    let out = dev.call("muse_unshare", json!({ "shared_ids": [id, "not-an-id"] }));
+    assert!(out.is_error, "{}", out.text);
+    assert_eq!(dev.status()["shared"].as_array().map(Vec::len), Some(2), "nothing removed locally");
+}
+
+#[test]
+fn review_too_long_memory_is_refused_before_it_wedges_sync() {
+    let tmp = TempDir::new("rv-toolong");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["Short one"]);
+    let long = "x".repeat(2001);
+    let out = dev.call_confirmed("muse_share", json!({ "texts": [long] }));
+    assert!(out.is_error, "{}", out.text);
+    let st = dev.status();
+    assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "{st}");
+    assert!(st["sync_error"].is_null(), "sync still healthy: {st}");
+}

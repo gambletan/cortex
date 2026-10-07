@@ -60,6 +60,11 @@ const WRITE_TOOLS: &[&str] = &[
 /// Cloud-sync tools: enabling sync moves (encrypted) data off the local store.
 const SYNC_TOOLS: &[&str] = &["sync_enable", "sync_pull", "sync_status", "sync_providers"];
 
+/// Muse tools: share chosen memories with a hosted service that Meta Muse reads. Their
+/// own group (`muse`): never implied by `read`, `write`, `sync` or `plugins`.
+const MUSE_TOOLS: &[&str] =
+    &["muse_connect", "muse_share", "muse_unshare", "muse_status", "muse_inbox", "muse_disconnect"];
+
 /// Capability policy for one server instance, loaded once at startup.
 pub enum CapabilityPolicy {
     /// No policy file present: legacy behavior, every tool allowed.
@@ -107,12 +112,18 @@ impl GrantSet {
         (self.atoms.contains("read") && READ_TOOLS.contains(&tool))
             || (self.atoms.contains("write") && WRITE_TOOLS.contains(&tool))
             || (self.atoms.contains("sync") && SYNC_TOOLS.contains(&tool))
+            || (self.atoms.contains("muse") && MUSE_TOOLS.contains(&tool))
     }
 }
 
 /// Whether a tool name is one of the built-in tools (vs. plugin-registered).
 pub fn is_builtin(tool: &str) -> bool {
-    READ_TOOLS.contains(&tool) || WRITE_TOOLS.contains(&tool) || SYNC_TOOLS.contains(&tool)
+    READ_TOOLS.contains(&tool)
+        || WRITE_TOOLS.contains(&tool)
+        || SYNC_TOOLS.contains(&tool)
+        || MUSE_TOOLS.contains(&tool)
+        // Any future muse_* tool is built-in too: a plugin grant must never reach it.
+        || tool.starts_with("muse_")
 }
 
 impl CapabilityPolicy {
@@ -231,6 +242,7 @@ mod tests {
     fn sync_group_grants_sync_tools() {
         let policy = grants(&["sync"]);
         assert!(policy.is_allowed("sync_status"));
+        assert!(!policy.is_allowed("muse_share"));
         assert!(policy.is_allowed("sync_enable"));
         assert!(!policy.is_allowed("memory_search"));
     }
@@ -282,5 +294,19 @@ mod tests {
         for t in WRITE_TOOLS {
             assert!(!SYNC_TOOLS.contains(t));
         }
+    }
+
+    #[test]
+    fn muse_tools_need_their_own_grant() {
+        for g in ["plugins", "read", "write", "sync"] {
+            let policy = grants(&[g]);
+            for t in MUSE_TOOLS {
+                assert!(!policy.is_allowed(t), "{g} must not grant {t}");
+            }
+            assert!(!policy.is_allowed("muse_future_tool"), "{g}");
+        }
+        let policy = grants(&["muse"]);
+        assert!(MUSE_TOOLS.iter().all(|t| policy.is_allowed(t)));
+        assert!(!policy.is_allowed("memory_search"));
     }
 }

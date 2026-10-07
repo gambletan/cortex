@@ -25,7 +25,7 @@ use cortex_core::types::PrivacyLevel;
 use cortex_core::Cortex;
 
 use super::cloud::{Device, DEFAULT_CLOUD_URL, GONE};
-use super::{allow, export_rows, private_options, read_private};
+use super::{allow, export_rows, private_options, read_private, MAX_EXPORT_ITEMS, MAX_EXPORT_TEXT_CHARS};
 use crate::tools::content_to_string;
 
 const STATE_FILE: &str = "muse-cloud.json";
@@ -158,6 +158,18 @@ fn planned(cortex: &Cortex, args: &Value) -> Result<Vec<String>, String> {
         texts.push(content_to_string(&mem.content));
     }
     texts.extend(ids_arg(args, "texts").into_iter().filter(|t| !t.trim().is_empty()));
+    // Check everything the cloud would refuse BEFORE touching the local list, so one bad
+    // item can never wedge every later sync.
+    if let Some(t) = texts.iter().find(|t| t.chars().count() > MAX_EXPORT_TEXT_CHARS) {
+        return Err(format!(
+            "A memory is too long to share ({} characters, at most {MAX_EXPORT_TEXT_CHARS}). Share a shorter summary as text instead.",
+            t.chars().count()
+        ));
+    }
+    let current = export_rows(cortex)?.len();
+    if current + texts.len() > MAX_EXPORT_ITEMS {
+        return Err(format!("At most {MAX_EXPORT_ITEMS} memories can be shared; {current} already are."));
+    }
     Ok(texts)
 }
 
@@ -334,17 +346,27 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if ids.is_empty() {
         return Err("Give shared_ids (from muse_status).".into());
     }
+    // Validate the whole list first: never a partial unshare.
     let export: Vec<Uuid> = export_rows(cortex)?.into_iter().map(|m| m.id).collect();
-    let mut removed = 0;
+    let mut targets = Vec::new();
     for id in &ids {
         let id = Uuid::parse_str(id).map_err(|_| format!("not a shared id: {id}"))?;
         if !export.contains(&id) {
             return Err(format!("{id} is not in the shared list (see muse_status)"));
         }
-        cortex.delete_memory(id).map_err(|e| e.to_string())?;
-        removed += 1;
+        targets.push(id);
     }
     let dev = device(cortex)?;
+    if dev.rid.is_some() {
+        // Record "cloud is behind" before deleting, so a crash or failed push is retried.
+        let mut st = load_state(cortex)?;
+        st.dirty = true;
+        save_state(cortex, &st)?;
+    }
+    for id in &targets {
+        cortex.delete_memory(*id).map_err(|e| e.to_string())?;
+    }
+    let removed = targets.len();
     if dev.rid.is_some() {
         push(cortex, &dev)?;
     }
@@ -357,7 +379,8 @@ fn status(cortex: &Cortex) -> Result<Value, String> {
     if dev.rid.is_none() {
         return Ok(json!({ "connected": false, "shared": shared }));
     }
-    settle(cortex, &dev)?;
+    // A pending sync must not hide the shared list the user may need to fix it.
+    let sync_error = settle(cortex, &dev).err();
     let cloud = match dev.status() {
         Err(e) if e.starts_with(GONE) => {
             return Ok(json!({ "connected": false, "shared": shared, "note": "The cloud connection expired; muse_connect starts a new one." }))
@@ -374,6 +397,7 @@ fn status(cortex: &Cortex) -> Result<Value, String> {
         "check_with_user": "If the user didn't connect Muse at muse_connected_at, run muse_connect again: it cancels every earlier connection.",
         "shared": shared,
         "waiting_in_inbox": inbox,
+        "sync_error": sync_error,
     }))
 }
 
