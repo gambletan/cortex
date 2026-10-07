@@ -152,6 +152,9 @@ fn device(cortex: &Cortex) -> Result<Device, String> {
 /// Push the whole shared list. On failure the state is marked dirty and every later
 /// muse_* call retries first, so an unshare can't silently stay visible in the cloud.
 fn push(cortex: &Cortex, dev: &Device) -> Result<u64, String> {
+    // The local list is the source of truth: it must survive power loss before the cloud
+    // is told and the retry marker cleared (covers share, connect, unshare, inbox keep).
+    cortex.flush_durable().map_err(|e| e.to_string())?;
     // Strictly increasing per database (pushes run under the per-database lock), so a
     // slower, older push can never win and a clock set back can't wedge syncing.
     let mut st = load_state(cortex)?;
@@ -424,9 +427,6 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     for id in &targets {
         cortex.delete_memory(*id).map_err(|e| e.to_string())?;
     }
-    // The local deletion must outlive a power loss before the cloud is told (otherwise the
-    // row could come back and be uploaded again).
-    cortex.flush_durable().map_err(|e| e.to_string())?;
     if dev.rid.is_some() {
         push(cortex, &dev)?;
     }
@@ -501,8 +501,7 @@ fn inbox(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         }
     }
     if done.iter().any(|id| keep.contains(id)) {
-        // Kept memories must be durable here before the cloud deletes its inbox copy.
-        cortex.flush_durable().map_err(|e| e.to_string())?;
+        // push() makes the kept memories durable before the cloud deletes its inbox copy.
         push(cortex, &dev)?;
     }
     let removed = dev.inbox_ack(&done)?;
