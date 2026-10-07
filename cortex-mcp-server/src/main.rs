@@ -4,87 +4,28 @@
 //! Tools: memory_ingest, memory_search, memory_context, belief_observe, belief_list,
 //!        person_resolve, fact_add, preference_set
 
-// The built-in tool schema is one large `serde_json::json!([...])` literal; with 30 tools
-// it expands past the default macro recursion limit (128). Raise it for this crate.
-#![recursion_limit = "512"]
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
 
 use cortex_core::Cortex;
 
-mod capabilities;
 #[cfg(feature = "gateway")]
-mod gateway;
-mod tools;
+use cortex_mcp_server::gateway;
+use cortex_mcp_server::{capabilities, tools};
+use cortex_mcp_server::{JsonRpcRequest, JsonRpcResponse, SERVER_VERSION};
 
 use capabilities::CapabilityPolicy;
-
-// ── JSON-RPC types ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
-
-impl JsonRpcResponse {
-    fn success(id: Value, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-        }
-    }
-
-    fn error(id: Value, code: i64, message: String) -> Self {
-        Self {
-            jsonrpc: "2.0".into(),
-            id,
-            result: None,
-            error: Some(JsonRpcError {
-                code,
-                message,
-                data: None,
-            }),
-        }
-    }
-}
 
 // ── MCP Protocol constants ──────────────────────────────────────────────────
 
 fn server_name() -> String {
     std::env::var("CORTEX_SERVER_NAME").unwrap_or_else(|_| "cortex-memory".into())
 }
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
