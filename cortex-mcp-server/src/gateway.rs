@@ -698,7 +698,7 @@ impl Gateway {
                     json!({
                         "protocolVersion": version,
                         "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "cortex-muse-gateway", "version": SERVER_VERSION },
+                        "serverInfo": { "name": "cortex-memory", "title": oauth::PRODUCT_NAME, "version": SERVER_VERSION },
                         "instructions": "Personal memory the user explicitly exported for you. \
                             Call recall_memory when the user's own facts, preferences, or history would help."
                     }),

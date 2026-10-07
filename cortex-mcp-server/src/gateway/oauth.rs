@@ -38,6 +38,11 @@ use super::{
 
 pub(super) const MUSE_CALLBACK: &str = "https://agent.meta.ai/api/hatch/oauth/callback";
 pub(super) const SCOPE: &str = "memory";
+/// How clients (Muse's connector dialog) should name us. Without it they guess from the
+/// host name, and an unfamiliar name reads like spam.
+pub const PRODUCT_NAME: &str = "Cortex Privacy Memory";
+const DOCS_URL: &str = "https://github.com/gambletan/cortex/blob/main/docs/muse.md";
+const PRIVACY_URL: &str = "https://github.com/gambletan/cortex/blob/main/docs/muse.md#what-meta-can-and-cannot-see";
 const MAX_CLIENTS: usize = 50;
 const MAX_PENDING: usize = 10;
 const MAX_REDIRECTS: usize = 5;
@@ -635,6 +640,9 @@ pub(super) async fn protected_resource(State(st): State<Arc<HttpState>>) -> Resp
         StatusCode::OK,
         json!({
             "resource": c.resource,
+            "resource_name": PRODUCT_NAME,
+            "resource_documentation": DOCS_URL,
+            "resource_policy_uri": PRIVACY_URL,
             "authorization_servers": [c.issuer],
             "bearer_methods_supported": ["header"],
             "scopes_supported": [SCOPE],
@@ -648,6 +656,8 @@ pub(super) async fn authorization_server(State(st): State<Arc<HttpState>>) -> Re
         StatusCode::OK,
         json!({
             "issuer": c.issuer,
+            "service_documentation": DOCS_URL,
+            "op_policy_uri": PRIVACY_URL,
             "authorization_endpoint": format!("{}/authorize", c.issuer),
             "token_endpoint": format!("{}/token", c.issuer),
             "registration_endpoint": format!("{}/register", c.issuer),
@@ -843,9 +853,10 @@ fn consent_page(c: &OAuthConfig, shared: usize, client_name: &str, redirect_uri:
     let csrf = random_token();
     let mut r = html_page(
         StatusCode::OK,
-        "Connect your memory",
+        "Cortex Privacy Memory",
         &format!(
-            "<h1>Connect your memory</h1>\
+            "<h1>Cortex Privacy Memory</h1>\
+             <p class=\"muted\">Your personal memory, kept on your own devices.</p>\
              <p>Allow <b>{name}</b> (unverified; sends you back to <code>{host}</code>) to read the \
              <b>{shared}</b> memories you chose to share?</p>\
              <form method=\"post\" action=\"{action}\">\
@@ -1087,6 +1098,7 @@ pub(super) async fn authorize_approve(
         o.to_str().is_ok_and(|o| c.issuer.starts_with(o) && c.issuer[o.len()..].starts_with('/'))
     });
     if !origin_ok {
+        tracing::warn!(origin = ?headers.get("origin"), "consent approve refused: origin");
         return bad_request_page("Request refused (cross-site).");
     }
     let body = match read_body(&headers, body, MAX_FORM_BYTES).await {
@@ -1105,11 +1117,14 @@ pub(super) async fn authorize_approve(
         .next()
         .map(str::to_string);
     let (Some(req), Some(csrf), Some(cookie)) = (p.get("req").cloned(), p.get("csrf"), cookie_csrf) else {
+        tracing::warn!(has_cookie = headers.get("cookie").is_some(), "consent approve refused: missing token");
         return bad_request_page("Request refused (missing token). Reload the page and try again.");
     };
     if !is_token_shaped(&req) || !is_token_shaped(csrf) || !ct_eq(csrf.as_bytes(), cookie.as_bytes()) {
+        tracing::warn!("consent approve refused: csrf mismatch");
         return bad_request_page("Request refused (bad token). Reload the page and try again.");
     }
+    tracing::info!("consent approve received");
     let st2 = st.clone();
     blocking(&st, move || {
         let c = cfg(&st2);

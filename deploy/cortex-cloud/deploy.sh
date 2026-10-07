@@ -34,7 +34,7 @@ cd ~/cortex-cloud
 install -d -m 700 data secrets
 docker build -q -f src-tree/deploy/cortex-cloud/Dockerfile -t "cortex-cloud:$sha" -t cortex-cloud:latest src-tree
 docker rm -f cortex-cloud >/dev/null 2>&1 || true
-docker run -d --name cortex-cloud --restart unless-stopped --network host \
+docker run -d --name cortex-cloud --restart unless-stopped --network host -e RUST_LOG=cortex_cloud=info,cortex_mcp_server=info \
   -v "$HOME/cortex-cloud/data:/data" -v "$HOME/cortex-cloud/secrets:/secrets" \
   "cortex-cloud:$sha" --base-url "$base" --listen "$listen" >/dev/null
 for i in $(seq 1 60); do

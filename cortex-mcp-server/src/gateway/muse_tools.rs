@@ -435,7 +435,7 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         "newly_shared": added,
         "expires_in_minutes": expires / 60,
         "tell_the_user": format!(
-            "Open Muse on your phone and send it this: \"Add a custom connector (MCP) with this URL: {link}\". \
+            "Open Muse on your phone and send it this: \"Add a custom connector (MCP) named Cortex Privacy Memory with this URL: {link}\". \
              When a Cortex page opens, tap Allow. The link works once, for the next {} minutes. \
              Muse will see only the {shared} memories you shared.",
             expires / 60
