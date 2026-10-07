@@ -1110,7 +1110,9 @@ pub(super) async fn token(State(st): State<Arc<HttpState>>, headers: HeaderMap, 
                         return (oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token is required"), false);
                     };
                     let h = sha256_hex(rt);
-                    let live = |g: &Grant| g.refresh_exp > t && t - g.created < GRANT_MAX_AGE;
+                    // Same audience too: after a `--public-url` change the old grant can't
+                    // mint usable tokens, so the client must sign in again.
+                    let live = |g: &Grant| g.refresh_exp > t && t - g.created < GRANT_MAX_AGE && g.resource == c.resource;
                     if let Some(g) = s.grants.iter_mut().find(|g| ct_eq(g.refresh_hash.as_bytes(), h.as_bytes())) {
                         if g.client_id != client.id || !live(g) {
                             return (invalid_grant("Invalid refresh token"), false);

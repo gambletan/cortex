@@ -1912,3 +1912,18 @@ fn review_rate_limited_wait_page_keeps_polling() {
         r.dump()
     );
 }
+
+#[test]
+fn review_refresh_refused_after_public_url_change() {
+    let env = Env::new("rv-audience");
+    let (cid, t) = {
+        let srv = env.serve_oauth();
+        let cid = register_public(srv.port, "RvClient");
+        let t = grant(&env, srv.port, &cid);
+        (cid, t)
+    }; // server stops here
+    let srv = env.serve(&["--oauth", "--public-url", "https://other.example.test"], None);
+    // No `resource` parameter, so only the grant's stored audience can refuse it.
+    let r = token(srv.port, &[("grant_type", "refresh_token"), ("refresh_token", &t.refresh), ("client_id", &cid)], &[]);
+    assert_eq!(r.oauth_error(), "invalid_grant", "grant for the old resource can't refresh: {}", r.dump());
+}
