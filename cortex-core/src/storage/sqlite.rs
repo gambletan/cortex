@@ -55,6 +55,15 @@ impl SqliteStorage {
         Self::open_with_key(path, None)
     }
 
+    /// Make everything committed so far durable now (checkpoint the WAL into the database
+    /// with fsyncs), regardless of the connection's `synchronous` level. For writes whose
+    /// acknowledgement must survive power loss, e.g. revoking a share.
+    pub fn flush_durable(&self) -> Result<(), CortexError> {
+        let conn = self.write_conn.lock();
+        conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |_| Ok(()))
+            .map_err(|e| CortexError::Storage(e.to_string()))
+    }
+
     /// The database file, or `None` for an in-memory database.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
         let conn = self.write_conn.lock();

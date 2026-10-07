@@ -1656,3 +1656,15 @@ fn review_in_flight_request_cannot_read_what_is_shared_after_revocation() {
     let _ = sock.read_to_string(&mut resp);
     assert!(!resp.contains("Freshly shared secret"), "revoked in-flight request read new data: {resp}");
 }
+
+#[test]
+fn review_status_still_lists_shares_when_the_cloud_is_down() {
+    let tmp = TempDir::new("rv-status-offline");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["Offline listing"]);
+    cloud.stop();
+    let st = dev.status();
+    assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "{st}");
+    assert!(st["cloud_error"].is_string(), "{st}");
+}

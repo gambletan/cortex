@@ -424,6 +424,9 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     for id in &targets {
         cortex.delete_memory(*id).map_err(|e| e.to_string())?;
     }
+    // The local deletion must outlive a power loss before the cloud is told (otherwise the
+    // row could come back and be uploaded again).
+    cortex.flush_durable().map_err(|e| e.to_string())?;
     if dev.rid.is_some() {
         push(cortex, &dev)?;
     }
@@ -442,7 +445,11 @@ fn status(cortex: &Cortex) -> Result<Value, String> {
         Err(e) if e.starts_with(GONE) => {
             return Ok(json!({ "connected": false, "shared": shared, "note": "The cloud connection expired; muse_connect starts a new one." }))
         }
-        other => other?,
+        // Offline: still return the shared list (its ids are what muse_unshare needs).
+        Err(e) => {
+            return Ok(json!({ "connected": Value::Null, "shared": shared, "cloud_error": e, "sync_error": sync_error }))
+        }
+        Ok(v) => v,
     };
     let inbox = dev.inbox().map(|i| i.len()).unwrap_or(0);
     Ok(json!({

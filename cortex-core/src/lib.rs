@@ -1598,6 +1598,11 @@ impl Cortex {
         &self.storage
     }
 
+    /// Make everything committed so far durable now (see `SqliteStorage::flush_durable`).
+    pub fn flush_durable(&self) -> Result<(), CortexError> {
+        self.storage.flush_durable()
+    }
+
     /// The database file, or `None` for an in-memory instance.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
         self.storage.db_path()
