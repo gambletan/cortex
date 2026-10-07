@@ -11,7 +11,9 @@ mod inner {
     use std::sync::Arc;
     use parking_lot::Mutex;
 
-    /// Local embedding engine — generates 384-dim vectors from text.
+    /// Local embedding engine — generates 384-dim vectors from text. Cloning shares the
+    /// loaded model (one copy in memory however many `Cortex` instances use it).
+    #[derive(Clone)]
     pub struct Embedder {
         model: Arc<Mutex<TextEmbedding>>,
         dimensions: usize,

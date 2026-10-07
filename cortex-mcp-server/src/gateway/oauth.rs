@@ -66,10 +66,24 @@ const RATE_TOKEN_PER_CLIENT: u32 = 60;
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-pub(super) struct OAuthConfig {
+/// Who approves a sign-in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Consent {
+    /// Self-hosted gateway: the owner runs `gateway connect <code>` on their machine.
+    LocalCli,
+    /// Cortex Cloud: the owner's device opened an enrollment window (via their AI agent);
+    /// inside it, one tap on the consent page approves. See `docs/design/muse-cloud.md`.
+    Enrollment,
+}
+
+pub struct OAuthConfig {
     pub issuer: String,
     pub resource: String,
     pub redirect_allowlist: Vec<String>,
+    pub consent: Consent,
+    /// Path part of the issuer (`""` self-hosted, `/t/<rid>` in the cloud); every URL this
+    /// module emits for its own endpoints is prefixed with it.
+    base_path: String,
     /// endpoint → (window start, requests in window): a fixed one-minute window.
     rate: Mutex<HashMap<String, (Instant, u32)>>,
 }
@@ -88,8 +102,32 @@ impl OAuthConfig {
             resource: format!("{issuer}/mcp"),
             issuer,
             redirect_allowlist,
+            consent: Consent::LocalCli,
+            base_path: String::new(),
             rate: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// One Cortex Cloud tenant: issuer `<base_url>/t/<rid>`, enrollment consent, Muse's
+    /// callback only.
+    pub fn for_tenant(base_url: &str, rid: &str) -> Result<Self, String> {
+        if !is_tenant_id(rid) {
+            return Err("invalid tenant id".into());
+        }
+        let base = validate_public_url(base_url)?;
+        let issuer = format!("{base}/t/{rid}");
+        Ok(Self {
+            resource: format!("{issuer}/mcp"),
+            issuer,
+            redirect_allowlist: vec![MUSE_CALLBACK.to_string()],
+            consent: Consent::Enrollment,
+            base_path: format!("/t/{rid}"),
+            rate: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn wait_url(&self, req: &str) -> String {
+        format!("{}/authorize/wait?req={req}", self.base_path)
     }
 
     fn prm_url(&self) -> String {
@@ -119,6 +157,16 @@ impl OAuthConfig {
         slot.1 += 1;
         slot.1 <= per_minute
     }
+}
+
+/// Tenant ids are 22 base64url chars (128 bits), like everything else we mint.
+pub fn is_tenant_id(s: &str) -> bool {
+    s.len() == 22 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A fresh tenant id.
+pub fn new_tenant_id() -> String {
+    random_token()[..22].to_string()
 }
 
 /// `https://host[:port]` with nothing after it (a trailing `/` is dropped).
@@ -179,6 +227,14 @@ pub(super) struct OAuthState {
     grants: Vec<Grant>,
     #[serde(default)]
     redeemed: Vec<Redeemed>,
+    /// Cloud only: the window the owner's device opened for one sign-in.
+    #[serde(default)]
+    enrollment: Option<Enrollment>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Enrollment {
+    expires: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -258,6 +314,9 @@ impl OAuthState {
         self.pending.retain(|p| now - p.created < PENDING_TTL);
         self.codes.retain(|c| c.expires > now);
         self.redeemed.retain(|r| r.expires > now);
+        if self.enrollment.as_ref().is_some_and(|e| e.expires <= now) {
+            self.enrollment = None;
+        }
         self.grants.retain(|g| g.refresh_exp > now && now - g.created < GRANT_MAX_AGE);
     }
 
@@ -734,12 +793,8 @@ fn is_pkce_value(s: &str) -> bool {
     (43..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
 }
 
-fn waiting_page(code: &str, client_name: &str, redirect_uri: &str, req: &str) -> Response {
-    let host = redirect_uri
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split(['/', '?']).next())
-        .unwrap_or(redirect_uri);
+fn waiting_page(c: &OAuthConfig, code: &str, client_name: &str, redirect_uri: &str, req: &str) -> Response {
+    let host = redirect_host(redirect_uri);
     html_page(
         StatusCode::OK,
         "Approve on your computer",
@@ -756,8 +811,48 @@ fn waiting_page(code: &str, client_name: &str, redirect_uri: &str, req: &str) ->
             host = html_escape(host),
             code = html_escape(code),
         ),
-        Some((3, &format!("/authorize/wait?req={req}"))),
+        Some((3, &c.wait_url(req))),
     )
+}
+
+fn redirect_host(redirect_uri: &str) -> &str {
+    redirect_uri.split("://").nth(1).and_then(|r| r.split(['/', '?']).next()).unwrap_or(redirect_uri)
+}
+
+/// Cloud consent: one tap. The form posts the request capability plus a CSRF token that
+/// must match the SameSite=Strict cookie set with this page.
+fn consent_page(c: &OAuthConfig, shared: usize, client_name: &str, redirect_uri: &str, req: &str) -> Response {
+    let csrf = random_token();
+    let mut r = html_page(
+        StatusCode::OK,
+        "Connect your memory",
+        &format!(
+            "<h1>Connect your memory</h1>\
+             <p>Allow <b>{name}</b> (unverified; sends you back to <code>{host}</code>) to read the \
+             <b>{shared}</b> memories you chose to share?</p>\
+             <form method=\"post\" action=\"{action}\">\
+             <input type=\"hidden\" name=\"req\" value=\"{req}\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+             <button type=\"submit\" style=\"font-size:1.2rem;padding:.6rem 1.6rem\">Allow</button></form>\
+             <p class=\"muted\">Only the memories you shared are visible. Everything else stays on your \
+             devices. To stop, tell your AI \"disconnect Muse\".</p>",
+            name = html_escape(client_name),
+            host = html_escape(redirect_host(redirect_uri)),
+            action = html_escape(&format!("{}/authorize/approve", c.base_path)),
+            req = html_escape(req),
+            csrf = html_escape(&csrf),
+        ),
+        None,
+    );
+    let cookie = format!("cx_csrf={csrf}; Path={}/authorize; Secure; HttpOnly; SameSite=Strict", c.base_path);
+    if let Ok(v) = cookie.parse() {
+        r.headers_mut().insert("set-cookie", v);
+    }
+    // The page has a form now: allow posting to ourselves only.
+    if let Ok(v) = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'".parse() {
+        r.headers_mut().insert("content-security-policy", v);
+    }
+    r
 }
 
 pub(super) async fn authorize(State(st): State<Arc<HttpState>>, RawQuery(q): RawQuery) -> Response {
@@ -803,11 +898,15 @@ pub(super) async fn authorize(State(st): State<Arc<HttpState>>, RawQuery(q): Raw
         if paths.is_disabled() {
             return fail("access_denied", "Memory access for Muse is turned off by the user");
         }
+        let enrollment = c.consent == Consent::Enrollment;
 
         let req = random_token();
         let created = with_state(paths, |s| {
+            if enrollment && s.enrollment.is_none() {
+                return Err(());
+            }
             if s.pending.len() >= MAX_PENDING {
-                return None;
+                return Ok(None);
             }
             let mut code = display_code();
             while s.pending.iter().any(|x| x.display_code == code) {
@@ -825,11 +924,18 @@ pub(super) async fn authorize(State(st): State<Arc<HttpState>>, RawQuery(q): Raw
                 created: now(),
                 status: Status::Waiting,
             });
-            Some(code)
+            Ok(Some(code))
         });
         match created {
-            Ok(Some(code)) => waiting_page(&code, &client.name, &redirect_uri, &req),
-            Ok(None) => fail("temporarily_unavailable", "Too many sign-ins in progress; try again in a few minutes"),
+            Ok(Ok(Some(_))) if enrollment => {
+                let shared = super::export_count(&st2.gw.cortex);
+                consent_page(c, shared, &client.name, &redirect_uri, &req)
+            }
+            Ok(Ok(Some(code))) => waiting_page(c, &code, &client.name, &redirect_uri, &req),
+            // No window open: never a redirect (nothing for the client to retry), just tell
+            // the human what to do.
+            Ok(Err(())) => bad_request_page("This link isn't active. Ask your AI to connect Muse again."),
+            Ok(Ok(None)) => fail("temporarily_unavailable", "Too many sign-ins in progress; try again in a few minutes"),
             Err(_) => fail("server_error", "Gateway state error"),
         }
     })
@@ -852,7 +958,7 @@ pub(super) async fn authorize_wait(State(st): State<Arc<HttpState>>, RawQuery(q)
     };
     // Busy or rate limited: keep polling (slower) with the same capability; never strand an
     // approval on a page that stopped refreshing.
-    let retry_url = format!("/authorize/wait?req={req}");
+    let retry_url = cfg(&st).wait_url(&req);
     let retry = move |status| {
         html_page(
             status,
@@ -910,7 +1016,10 @@ pub(super) async fn authorize_wait(State(st): State<Arc<HttpState>>, RawQuery(q)
         match outcome {
             WaitOutcome::Unknown => bad_request_page("This sign-in expired or was already used. Start again in Muse."),
             WaitOutcome::StateError => bad_request_page("Authorization is unavailable (gateway state error)."),
-            WaitOutcome::Waiting(pending, name) => waiting_page(&pending.display_code, &name, &pending.redirect_uri, &req),
+            WaitOutcome::Waiting(pending, name) if c.consent == Consent::Enrollment => {
+                consent_page(c, super::export_count(&st2.gw.cortex), &name, &pending.redirect_uri, &req)
+            }
+            WaitOutcome::Waiting(pending, name) => waiting_page(c, &pending.display_code, &name, &pending.redirect_uri, &req),
             WaitOutcome::Redirect(pending, params) => {
                 let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 redirect_with(c, &pending.redirect_uri, &params, pending.state.as_deref())
@@ -918,6 +1027,107 @@ pub(super) async fn authorize_wait(State(st): State<Arc<HttpState>>, RawQuery(q)
         }
     }, || retry(StatusCode::SERVICE_UNAVAILABLE))
     .await
+}
+
+/// `POST /authorize/approve` (cloud only): the one tap. Checks the CSRF token against the
+/// SameSite cookie and the Origin, then — in one locked step — requires the enrollment
+/// window to be open, approves exactly this request and closes the window. The browser
+/// continues to the wait URL, which mints the code as for a CLI approval.
+pub(super) async fn authorize_approve(
+    State(st): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let c = cfg(&st);
+    if c.consent != Consent::Enrollment {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !c.allow("approve", RATE_AUTHORIZE) {
+        return bad_request_page("Too many attempts. Wait a minute and try again.");
+    }
+    // Origin, when sent, must be us (scheme + host of the issuer).
+    let origin_ok = headers.get("origin").is_none_or(|o| {
+        o.to_str().is_ok_and(|o| c.issuer.starts_with(o) && c.issuer[o.len()..].starts_with('/'))
+    });
+    if !origin_ok {
+        return bad_request_page("Request refused (cross-site).");
+    }
+    let body = match read_body(&headers, body, MAX_FORM_BYTES).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let Ok(p) = std::str::from_utf8(&body).map_err(|_| ()).and_then(parse_params) else {
+        return bad_request_page("Malformed request.");
+    };
+    let cookie_csrf = headers
+        .get_all("cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|kv| kv.trim().strip_prefix("cx_csrf="))
+        .next()
+        .map(str::to_string);
+    let (Some(req), Some(csrf), Some(cookie)) = (p.get("req").cloned(), p.get("csrf"), cookie_csrf) else {
+        return bad_request_page("Request refused (missing token). Reload the page and try again.");
+    };
+    if !is_token_shaped(&req) || !is_token_shaped(csrf) || !ct_eq(csrf.as_bytes(), cookie.as_bytes()) {
+        return bad_request_page("Request refused (bad token). Reload the page and try again.");
+    }
+    let st2 = st.clone();
+    blocking(&st, move || {
+        let c = cfg(&st2);
+        let paths = &st2.gw.paths;
+        if paths.is_disabled() {
+            return bad_request_page("Memory access for Muse is turned off.");
+        }
+        let h = sha256_hex(&req);
+        let t = now();
+        let approved = with_state_read(paths, |s| {
+            let open = s.enrollment.as_ref().is_some_and(|e| e.expires > t);
+            let Some(p) = s.pending.iter_mut().find(|p| {
+                ct_eq(p.req_hash.as_bytes(), h.as_bytes()) && p.status == Status::Waiting && t - p.created < PENDING_TTL
+            }) else {
+                return (false, false);
+            };
+            if !open {
+                return (false, false);
+            }
+            p.status = Status::Approved;
+            s.enrollment = None; // one window, one sign-in
+            (true, true)
+        });
+        match approved {
+            Ok(true) => (
+                StatusCode::SEE_OTHER,
+                [("location", c.wait_url(&req)), ("cache-control", "no-store".to_string())],
+            )
+                .into_response(),
+            Ok(false) => bad_request_page("This link isn't active any more. Ask your AI to connect Muse again."),
+            Err(_) => bad_request_page("Authorization is unavailable (gateway state error)."),
+        }
+    })
+    .await
+}
+
+/// Cloud: open a one-sign-in window for `ttl_secs`. Every existing sign-in, pending
+/// request and unredeemed code is dropped first, so reconnecting always revokes whoever
+/// may have used an earlier link.
+pub fn open_enrollment(paths: &Paths, ttl_secs: i64) -> Result<(), String> {
+    with_state(paths, |s| {
+        s.grants.clear();
+        s.pending.clear();
+        s.codes.clear();
+        s.redeemed.clear();
+        s.enrollment = Some(Enrollment { expires: now() + ttl_secs });
+    })
+}
+
+/// Live sign-ins (count) and when the newest was last used.
+pub fn grant_summary(paths: &Paths) -> Result<(usize, Option<i64>), String> {
+    let st = read_shared(paths)?;
+    let t = now();
+    let live: Vec<&Grant> = st.grants.iter().filter(|g| g.refresh_exp > t).collect();
+    Ok((live.len(), live.iter().map(|g| g.last_used).max()))
 }
 
 // ── Token endpoint ───────────────────────────────────────────────────────────
@@ -1206,7 +1416,7 @@ pub(super) fn list_grants(paths: &Paths) -> Result<Vec<String>, String> {
     })
 }
 
-pub(super) fn disconnect(paths: &Paths, id: Option<&str>) -> Result<usize, String> {
+pub fn disconnect(paths: &Paths, id: Option<&str>) -> Result<usize, String> {
     with_state(paths, |s| {
         let before = s.grants.len();
         match id {

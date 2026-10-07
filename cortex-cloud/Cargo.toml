@@ -1,0 +1,31 @@
+[package]
+name = "cortex-cloud"
+version = "2.4.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Cortex Cloud for Muse: hosts only the memories a user chose to share, one encrypted directory per user"
+license = "MIT"
+publish = false
+
+[features]
+default = ["embeddings"]
+embeddings = ["cortex-core/embeddings", "cortex-mcp-server/embeddings"]
+
+[dependencies]
+cortex-core = { path = "../cortex-core" }
+cortex-mcp-server = { path = "../cortex-mcp-server", default-features = false, features = ["gateway"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["limit", "util"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+chrono = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

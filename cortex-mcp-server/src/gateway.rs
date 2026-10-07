@@ -43,7 +43,9 @@ use cortex_core::Cortex;
 use crate::tools::{content_to_string, redact_emails};
 use crate::{JsonRpcRequest, JsonRpcResponse, SERVER_VERSION};
 
-mod oauth;
+pub mod cloud;
+pub mod muse_tools;
+pub mod oauth;
 
 /// The only namespace the gateway ever reads. Membership is the user's explicit consent;
 /// core rejects ordinary ingest and sync writes into it.
@@ -162,8 +164,9 @@ pub enum GatewayAction {
 
 // ── State files ──────────────────────────────────────────────────────────────
 
+/// Every state file of one gateway (self-hosted: next to the DB; cloud: one tenant dir).
 #[derive(Clone)]
-struct Paths {
+pub struct Paths {
     disabled: PathBuf,
     budget: PathBuf,
     audit: PathBuf,
@@ -172,6 +175,8 @@ struct Paths {
     inbox_lock: PathBuf,
     oauth: PathBuf,
     oauth_lock: PathBuf,
+    /// Cloud: inbox text is encrypted at rest with this tenant key (AES-256-GCM).
+    inbox_key: Option<[u8; 32]>,
 }
 
 impl Paths {
@@ -181,6 +186,12 @@ impl Paths {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .to_path_buf();
+        Self::for_dir(&dir, None)
+    }
+
+    /// State files inside `dir` (a Cortex Cloud tenant directory).
+    pub fn for_dir(dir: &Path, inbox_key: Option<[u8; 32]>) -> Self {
+        let dir = dir.to_path_buf();
         Self {
             disabled: dir.join("gateway.disabled"),
             budget: dir.join("gateway-state.json"),
@@ -190,6 +201,7 @@ impl Paths {
             inbox_lock: dir.join("gateway-inbox.lock"),
             oauth: dir.join("gateway-oauth.json"),
             oauth_lock: dir.join("gateway-oauth.lock"),
+            inbox_key,
         }
     }
 
@@ -315,7 +327,7 @@ struct Disclosed {
 }
 
 /// Every memory in the export namespace (most recent first, capped at MAX_EXPORT).
-fn export_rows(cortex: &Cortex) -> Result<Vec<MemObject>, String> {
+pub fn export_rows(cortex: &Cortex) -> Result<Vec<MemObject>, String> {
     let mut rows = Vec::new();
     for tier in ALL_TIERS {
         let mut part = cortex
@@ -454,7 +466,7 @@ fn results_json(items: &[Disclosed]) -> String {
 // ── Tool call with budget + audit ────────────────────────────────────────────
 
 struct Gateway {
-    cortex: Cortex,
+    cortex: Arc<Cortex>,
     paths: Paths,
     daily_requests: u32,
     daily_disclosures: u32,
@@ -618,10 +630,17 @@ impl Gateway {
         if self.audit(REMEMBER_TOOL, 0, &[], text.len(), "accepted").is_err() {
             return tool_error("Refusing: could not record the request.");
         }
+        let stored_text = match &self.paths.inbox_key {
+            Some(key) => match seal(key, text) {
+                Ok(t) => t,
+                Err(_) => return self.deny(REMEMBER_TOOL, "error:inbox", "Could not save."),
+            },
+            None => text.to_string(),
+        };
         let item = InboxItem {
             id: Uuid::new_v4().to_string(),
             ts: chrono::Utc::now().to_rfc3339(),
-            text: text.to_string(),
+            text: stored_text,
             source: "muse".into(),
         };
         let stored = with_inbox_lock(&self.paths, || {
@@ -706,11 +725,11 @@ fn remember_schema() -> Value {
 // ── Remember inbox (quarantine) ──────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-struct InboxItem {
-    id: String,
-    ts: String,
-    text: String,
-    source: String,
+pub struct InboxItem {
+    pub id: String,
+    pub ts: String,
+    pub text: String,
+    pub source: String,
 }
 
 /// Exclusive lock shared by the server (append) and the CLI (approve/reject), so the two
@@ -957,6 +976,7 @@ fn router(state: Arc<HttpState>) -> Router {
             .route("/register", post(oauth::register))
             .route("/authorize", get(oauth::authorize))
             .route("/authorize/wait", get(oauth::authorize_wait))
+            .route("/authorize/approve", post(oauth::authorize_approve))
             .route("/token", post(oauth::token))
             .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_OAUTH_CONCURRENT));
         r = r.merge(oauth);
@@ -977,7 +997,7 @@ fn open(db_path: &str) -> Cortex {
     Cortex::open(db_path).unwrap_or_else(|e| die(&format!("failed to open database: {e}")))
 }
 
-fn allow(cortex: &Cortex, text: &str) -> Result<Uuid, String> {
+pub fn allow(cortex: &Cortex, text: &str) -> Result<Uuid, String> {
     let rows = export_rows(cortex)?;
     if let Some(existing) = rows.iter().find(|m| content_to_string(&m.content) == text) {
         return Ok(existing.id);
@@ -1199,7 +1219,7 @@ pub fn run(action: GatewayAction, db_path: &str) {
             }
             let state = Arc::new(HttpState {
                 gw: Gateway {
-                    cortex,
+                    cortex: Arc::new(cortex),
                     paths,
                     daily_requests,
                     daily_disclosures,
@@ -1233,9 +1253,205 @@ pub fn run(action: GatewayAction, db_path: &str) {
     }
 }
 
+// ── Cortex Cloud tenant API ──────────────────────────────────────────────────
+//
+// The hosted service (`cortex-cloud`) runs one gateway per tenant directory, reusing
+// everything above unchanged. See docs/design/muse-cloud.md.
+
+const SEALED_PREFIX: &str = "enc1:";
+const MAX_EXPORT_TEXT_CHARS: usize = 4000;
+
+/// AES-256-GCM, random 96-bit nonce: `enc1:` + base64(nonce ‖ ciphertext).
+fn seal(key: &[u8; 32], text: &str) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use base64::Engine as _;
+    use rand::RngCore;
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(aes_gcm::Nonce::from_slice(&nonce), text.as_bytes())
+        .map_err(|_| "encryption failed".to_string())?;
+    let mut blob = nonce.to_vec();
+    blob.extend_from_slice(&ct);
+    Ok(format!("{SEALED_PREFIX}{}", base64::engine::general_purpose::STANDARD.encode(blob)))
+}
+
+fn unseal(key: &[u8; 32], stored: &str) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use base64::Engine as _;
+    let b64 = stored.strip_prefix(SEALED_PREFIX).ok_or("inbox item is not sealed")?;
+    let blob = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|_| "inbox item is corrupt")?;
+    if blob.len() < 12 {
+        return Err("inbox item is corrupt".into());
+    }
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
+    let pt = cipher
+        .decrypt(aes_gcm::Nonce::from_slice(&blob[..12]), &blob[12..])
+        .map_err(|_| "inbox item failed authentication".to_string())?;
+    String::from_utf8(pt).map_err(|_| "inbox item is corrupt".into())
+}
+
+/// Per-tenant gateway settings (the self-hosted `serve` flags).
+pub struct TenantConfig {
+    pub daily_requests: u32,
+    pub daily_disclosures: u32,
+    pub enable_remember: bool,
+    pub daily_remembers: u32,
+}
+
+impl Default for TenantConfig {
+    fn default() -> Self {
+        Self { daily_requests: 100, daily_disclosures: 30, enable_remember: true, daily_remembers: 20 }
+    }
+}
+
+/// The complete gateway (MCP + OAuth) for one tenant, mounted at the tenant's root: the
+/// caller strips `/t/<rid>` before dispatching.
+pub fn tenant_router(cortex: Arc<Cortex>, paths: Paths, oauth: oauth::OAuthConfig, cfg: &TenantConfig) -> Router {
+    let state = Arc::new(HttpState {
+        gw: Gateway {
+            cortex,
+            paths,
+            daily_requests: cfg.daily_requests,
+            daily_disclosures: cfg.daily_disclosures,
+            remember_enabled: cfg.enable_remember,
+            daily_remembers: cfg.daily_remembers,
+            lock: Mutex::new(()),
+        },
+        token: None,
+        oauth: Some(oauth),
+        origins: Vec::new(),
+        workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+        oauth_workers: Arc::new(tokio::sync::Semaphore::new(MAX_OAUTH_WORKERS)),
+    });
+    router(state)
+}
+
+/// How many memories Muse can currently see.
+pub fn export_count(cortex: &Cortex) -> usize {
+    export_rows(cortex).map(|r| r.len()).unwrap_or(0)
+}
+
+/// One item of a device push: the text and (optionally) its embedding from the device.
+pub struct ExportItem {
+    pub text: String,
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// Replace the whole export with `items` (a device push). Old rows are deleted first, so
+/// an item the user stopped sharing is never served again, even if the push fails midway
+/// (the device simply pushes again).
+pub fn replace_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> {
+    if items.len() > MAX_EXPORT {
+        return Err(format!("at most {MAX_EXPORT} items"));
+    }
+    if let Some(bad) = items.iter().find(|i| i.text.trim().is_empty() || i.text.chars().count() > MAX_EXPORT_TEXT_CHARS) {
+        return Err(format!("each item must be 1..={MAX_EXPORT_TEXT_CHARS} characters (got {})", bad.text.chars().count()));
+    }
+    if items.iter().any(|i| i.embedding.as_ref().is_some_and(|e| e.is_empty() || e.iter().any(|x| !x.is_finite()))) {
+        return Err("invalid embedding".into());
+    }
+    for m in export_rows(cortex)? {
+        cortex.delete_memory(m.id).map_err(|e| e.to_string())?;
+    }
+    let mut seen = BTreeSet::new();
+    for item in items {
+        if !seen.insert(item.text.as_str()) {
+            continue;
+        }
+        let source = MemSource {
+            channel: "muse-export".into(),
+            identity_id: None,
+            chat_id: None,
+            thread_id: None,
+            message_id: None,
+        };
+        let mut builder = MemObjectBuilder::new(MemoryTier::Semantic, MemContent::Text(item.text.clone()), source)
+            .privacy(PrivacyLevel::Private)
+            .namespace(EXPORT_NS);
+        if let Some(e) = item.embedding.clone().or_else(|| cortex.embed_query(&item.text)) {
+            builder = builder.embedding(e);
+        }
+        let mut mem = builder.build();
+        mem.content_hash = mem.content_hash.map(|h| format!("{EXPORT_NS}:{h}"));
+        cortex.storage().store_memory(&mem).map_err(|e| e.to_string())?;
+    }
+    Ok(seen.len())
+}
+
+/// Pending `remember` items, decrypted.
+pub fn inbox_items(paths: &Paths) -> Result<Vec<InboxItem>, String> {
+    let items = with_inbox_lock(paths, || read_inbox(&paths.inbox))?;
+    items
+        .into_iter()
+        .map(|mut i| {
+            if let Some(key) = &paths.inbox_key {
+                i.text = unseal(key, &i.text)?;
+            }
+            Ok(i)
+        })
+        .collect()
+}
+
+/// Drop inbox items the device has taken (kept or discarded). Unknown ids are ignored.
+pub fn inbox_ack(paths: &Paths, ids: &[String]) -> Result<usize, String> {
+    with_inbox_lock(paths, || {
+        let mut items = read_inbox(&paths.inbox)?;
+        let before = items.len();
+        items.retain(|i| !ids.contains(&i.id));
+        if items.len() != before {
+            write_inbox(&paths.inbox, &items)?;
+        }
+        Ok(before - items.len())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_inbox_text_round_trips_and_detects_tampering() {
+        let key = [3u8; 32];
+        let sealed = seal(&key, "likes tea").unwrap();
+        assert!(sealed.starts_with(SEALED_PREFIX) && !sealed.contains("tea"));
+        assert_eq!(unseal(&key, &sealed).unwrap(), "likes tea");
+        assert!(unseal(&[4u8; 32], &sealed).is_err(), "wrong key");
+        let mut bad = sealed.clone();
+        bad.pop();
+        bad.push(if sealed.ends_with('A') { 'B' } else { 'A' });
+        assert!(unseal(&key, &bad).is_err(), "tampered");
+        assert!(unseal(&key, "plain").is_err(), "unsealed text refused");
+    }
+
+    #[test]
+    fn replace_export_drops_unshared_items_and_validates() {
+        let c = Cortex::in_memory().unwrap();
+        let item = |t: &str| ExportItem { text: t.into(), embedding: Some(vec![1.0, 0.0, 0.0, 0.0]) };
+        assert_eq!(replace_export(&c, &[item("a"), item("b"), item("a")]).unwrap(), 2);
+        assert_eq!(replace_export(&c, &[item("b")]).unwrap(), 1);
+        let texts: Vec<String> = export_rows(&c).unwrap().iter().map(|m| content_to_string(&m.content)).collect();
+        assert_eq!(texts, vec!["b".to_string()]);
+        assert!(replace_export(&c, &[item(" ")]).is_err());
+        assert!(replace_export(&c, &[ExportItem { text: "x".into(), embedding: Some(vec![f32::NAN]) }]).is_err());
+        assert!(replace_export(&c, &(0..=MAX_EXPORT).map(|i| item(&i.to_string())).collect::<Vec<_>>()).is_err());
+        assert_eq!(export_rows(&c).unwrap().len(), 1, "a refused push changes nothing");
+    }
+
+    #[test]
+    fn inbox_items_decrypt_and_ack_removes() {
+        let dir = std::env::temp_dir().join(format!("gw-sealed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_dir(&dir, Some([5u8; 32]));
+        let item = InboxItem { id: "i1".into(), ts: "t".into(), text: seal(&[5u8; 32], "vegetarian").unwrap(), source: "muse".into() };
+        append_inbox(&paths.inbox, &item).unwrap();
+        assert!(!std::fs::read_to_string(&paths.inbox).unwrap().contains("vegetarian"));
+        assert_eq!(inbox_items(&paths).unwrap()[0].text, "vegetarian");
+        assert_eq!(inbox_ack(&paths, &["nope".into()]).unwrap(), 0);
+        assert_eq!(inbox_ack(&paths, &["i1".into()]).unwrap(), 1);
+        assert!(inbox_items(&paths).unwrap().is_empty());
+    }
 
     fn mem(text: &str, ns: Option<&str>, privacy: PrivacyLevel) -> MemObject {
         let source = MemSource { channel: "t".into(), identity_id: None, chat_id: None, thread_id: None, message_id: None };
@@ -1340,7 +1556,7 @@ mod tests {
         let paths = Paths::for_db(dir.join("db.sqlite").to_str().unwrap());
         let audit = paths.audit.clone();
         let gw = Gateway {
-            cortex: Cortex::in_memory().unwrap(),
+            cortex: Arc::new(Cortex::in_memory().unwrap()),
             paths,
             daily_requests: 1,
             daily_disclosures: 5,
@@ -1410,7 +1626,7 @@ mod tests {
         let filler = InboxItem { id: "x".into(), ts: "t".into(), text: "x".into(), source: "muse".into() };
         write_inbox(&paths.inbox, &vec![filler; MAX_INBOX]).unwrap();
         let gw = Gateway {
-            cortex: Cortex::in_memory().unwrap(),
+            cortex: Arc::new(Cortex::in_memory().unwrap()),
             paths,
             daily_requests: 100,
             daily_disclosures: 5,
@@ -1435,7 +1651,7 @@ mod tests {
         std::fs::create_dir_all(&paths.audit).unwrap();
         let inbox = paths.inbox.clone();
         let gw = Gateway {
-            cortex: Cortex::in_memory().unwrap(),
+            cortex: Arc::new(Cortex::in_memory().unwrap()),
             paths,
             daily_requests: 100,
             daily_disclosures: 5,

@@ -559,6 +559,14 @@ impl Cortex {
         Ok(())
     }
 
+    /// Use an already-loaded embedder (shared model) instead of loading one lazily. For
+    /// processes that open many databases, e.g. one per Cortex Cloud tenant.
+    #[cfg(feature = "embeddings")]
+    pub fn with_embedder(self, embedder: crate::embedder::Embedder) -> Self {
+        *self.embedder.lock() = Some(Some(embedder));
+        self
+    }
+
     /// Embed `text` with the local model, or `None` when embeddings are compiled out,
     /// disabled via `CORTEX_NO_EMBEDDINGS`, or the model failed to load.
     pub fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
@@ -1572,6 +1580,11 @@ impl Cortex {
     /// Get the underlying storage as a trait object (for advanced use).
     pub fn storage(&self) -> &dyn StorageBackend {
         &self.storage
+    }
+
+    /// The database file, or `None` for an in-memory instance.
+    pub fn db_path(&self) -> Option<std::path::PathBuf> {
+        self.storage.db_path()
     }
 
     /// Get the underlying SQLite storage (for sync and advanced use).

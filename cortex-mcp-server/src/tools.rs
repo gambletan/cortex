@@ -17,6 +17,10 @@ const MAX_TAG_SCAN_PER_TIER: usize = 10_000;    // tag_list_taxonomy
 /// Includes built-in tools and any plugin-registered tools.
 pub fn list_tools_with_plugins(cortex: &Arc<Cortex>) -> Value {
     let mut tools = list_tools_builtin();
+    #[cfg(feature = "gateway")]
+    if let Some(list) = tools.as_array_mut() {
+        list.extend(crate::gateway::muse_tools::schemas());
+    }
 
     // Append plugin tools
     for pt in cortex.plugin_manager().list_tools() {
@@ -633,6 +637,9 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "sync_pull" => scrub(tool_sync_pull(cortex)),
         "sync_status" => scrub(tool_sync_status(cortex)),
         "sync_providers" => scrub(tool_sync_providers()),
+        #[cfg(feature = "gateway")]
+        n if n.starts_with("muse_") => crate::gateway::muse_tools::call(cortex, n, args)
+            .unwrap_or_else(|| Err(format!("Unknown tool: {n}"))),
         _ => {
             // Fallback to plugin-registered tools
             let ctx = cortex.plugin_context();

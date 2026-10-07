@@ -179,18 +179,28 @@ limits, timeouts, separate lane for unauthenticated endpoints.
 | Muse token theft | As in `muse-oauth.md` |
 | Cross-tenant leak | Every query keyed by account id from the authenticated token; tests per endpoint |
 
-## Link format (spike first, needs a real Muse account)
+## Link format and enrollment window
 
-How Muse carries a pasted link into OAuth decides the format:
-- Preferred: `https://<host>/mcp/<account-rid>?e=<enroll>`. `account-rid` is a durable,
-  public routing id (it appears in PRM and the token audience, grants nothing alone);
-  `e` is consumed at the first authorize and ignored afterwards. PRM at
-  `/.well-known/oauth-protected-resource/mcp/<account-rid>`; that exact URL is the resource
-  everywhere, and `resource` is **required** at `/authorize` and `/token`.
-- Fallback if Muse drops the query: put the enrollment in the authorize step via the
-  connect prompt.
-The spike tests: does Muse keep the path and query, which discovery URL it fetches, and
-what it sends at DCR.
+OAuth clients build `/authorize` from discovery metadata, not from the pasted URL, so a
+query secret in the link (`?e=`) would not reach the consent step. Instead:
+
+- The link is the tenant's MCP URL: `https://<host>/t/<rid>/mcp`. `rid` is 128-bit random,
+  shown only in the user's AI chat.
+- `muse_connect` asks the cloud (signed) to open an **enrollment window**: 30 min, one
+  grant, with a 4-digit pairing code the agent tells the user. Opening a window revokes
+  existing grants.
+- `/t/<rid>/authorize` outside a window → "Ask your AI for a new Muse link". Inside: the
+  consent page with the pairing code and **Allow** (POST, CSRF + Origin checked). Allow marks
+  the request approved and closes the window in one locked step; the existing wait/code
+  machinery then completes OAuth.
+- Discovery: issuer `https://<host>/t/<rid>`; metadata served at both the RFC 8414/9728
+  inserted forms (`/.well-known/oauth-authorization-server/t/<rid>`,
+  `/.well-known/oauth-protected-resource/t/<rid>/mcp`) and the appended forms under
+  `/t/<rid>/.well-known/...`.
+
+The Muse spike still checks: which discovery URLs it fetches, DCR body, and that path
+issuers work. Fallback if they don't: one shared issuer with the tenant bound in
+pending/code/grant.
 
 ## Multi-tenant OAuth (from `oauth.rs`)
 

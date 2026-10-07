@@ -48,6 +48,12 @@ impl SqliteStorage {
         Self::open_with_key(path, None)
     }
 
+    /// The database file, or `None` for an in-memory database.
+    pub fn db_path(&self) -> Option<std::path::PathBuf> {
+        let conn = self.write_conn.lock();
+        conn.path().filter(|p| !p.is_empty()).map(std::path::PathBuf::from)
+    }
+
     /// Open a Cortex database with optional encryption passphrase.
     /// Requires the `encrypted-db` feature (SQLCipher). Without the feature,
     /// the passphrase is ignored and the DB is opened without encryption.
