@@ -7,6 +7,9 @@ Wants=network-online.target
 User=cortex-cloud
 Group=cortex-cloud
 Environment=CORTEX_CLOUD_BASE_URL=https://studio.alvinsclub.ai
+# Embedding model cache (written once on first start).
+Environment=FASTEMBED_CACHE_DIR=/var/lib/cortex-cloud/models
+WorkingDirectory=/var/lib/cortex-cloud
 ExecStart=/usr/local/bin/cortex-cloud --listen 127.0.0.1:8787 --data-dir /var/lib/cortex-cloud --master-key /etc/cortex-cloud/master.key
 Restart=on-failure
 # Hardening

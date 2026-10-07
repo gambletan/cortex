@@ -28,8 +28,8 @@ use super::cloud::{Device, DEFAULT_CLOUD_URL, GONE};
 use super::{allow, export_rows, private_options, read_private, MAX_EXPORT_ITEMS, MAX_EXPORT_TEXT_CHARS};
 use crate::tools::content_to_string;
 
-const STATE_FILE: &str = "muse-cloud.json";
-const KEY_FILE: &str = "muse-device.key";
+// Per database (several databases may share one directory): `<stem>.muse-cloud.json`,
+// `<stem>.muse-device.key`, `<stem>.muse.lock`.
 
 const CONFIRM_TTL_SECS: i64 = 15 * 60;
 
@@ -45,9 +45,27 @@ struct State {
     confirm: Option<(String, String, i64)>,
 }
 
-fn dir(cortex: &Cortex) -> Result<PathBuf, String> {
+/// `<db dir>/<db file name>.<suffix>`: every Muse file belongs to exactly one database.
+fn file_for(cortex: &Cortex, suffix: &str) -> Result<PathBuf, String> {
     let db = cortex.db_path().ok_or("Muse needs an on-disk Cortex database")?;
-    Ok(db.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")))
+    let name = db.file_name().ok_or("Muse needs an on-disk Cortex database")?.to_string_lossy().to_string();
+    Ok(db.with_file_name(format!("{name}.{suffix}")))
+}
+
+/// Every muse_* call runs under this exclusive OS lock: two MCP processes on the same
+/// database never interleave a local change and its push (or clear each other's retry
+/// marker).
+fn with_lock<T>(cortex: &Cortex, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let lock = private_options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(file_for(cortex, "muse.lock")?)
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    let out = f();
+    let _ = lock.unlock();
+    out
 }
 
 fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
@@ -59,7 +77,7 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
 }
 
 fn load_state(cortex: &Cortex) -> Result<State, String> {
-    match read_private(&dir(cortex)?.join(STATE_FILE)) {
+    match read_private(&file_for(cortex, "muse-cloud.json")?) {
         Ok(s) => serde_json::from_str(&s).map_err(|_| "Muse connection state is corrupt".to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
         Err(e) => Err(e.to_string()),
@@ -67,7 +85,7 @@ fn load_state(cortex: &Cortex) -> Result<State, String> {
 }
 
 fn save_state(cortex: &Cortex, st: &State) -> Result<(), String> {
-    write_private(&dir(cortex)?.join(STATE_FILE), &serde_json::to_vec(st).map_err(|e| e.to_string())?)
+    write_private(&file_for(cortex, "muse-cloud.json")?, &serde_json::to_vec(st).map_err(|e| e.to_string())?)
 }
 
 fn parse_key(hex: &str) -> Result<[u8; 32], String> {
@@ -95,7 +113,7 @@ fn keychain_account(cortex: &Cortex) -> Result<String, String> {
 fn device(cortex: &Cortex) -> Result<Device, String> {
     use cortex_core::sync::secret::{load_secret, store_secret};
     let st = load_state(cortex)?;
-    let key_path = dir(cortex)?.join(KEY_FILE);
+    let key_path = file_for(cortex, "muse-device.key")?;
     let account = keychain_account(cortex)?;
     let secret: [u8; 32] = if let Some(hex) = load_secret(&account) {
         parse_key(&hex)?
@@ -267,15 +285,16 @@ pub fn schemas() -> Vec<Value> {
 }
 
 pub fn call(cortex: &Cortex, name: &str, args: &Value) -> Option<Result<String, String>> {
-    let out = match name {
-        "muse_connect" => connect(cortex, args),
-        "muse_share" => share(cortex, args),
-        "muse_unshare" => unshare(cortex, args),
-        "muse_status" => status(cortex),
-        "muse_inbox" => inbox(cortex, args),
-        "muse_disconnect" => disconnect(cortex),
+    let op: fn(&Cortex, &Value) -> Result<Value, String> = match name {
+        "muse_connect" => connect,
+        "muse_share" => share,
+        "muse_unshare" => unshare,
+        "muse_status" => |c, _| status(c),
+        "muse_inbox" => inbox,
+        "muse_disconnect" => |c, _| disconnect(c),
         _ => return None,
     };
+    let out = with_lock(cortex, || op(cortex, args));
     Some(out.map(|v| v.to_string()))
 }
 

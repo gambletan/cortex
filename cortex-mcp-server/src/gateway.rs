@@ -565,6 +565,9 @@ impl Gateway {
     /// (indistinguishable from "no match").
     fn call_recall(&self, args: &Value) -> Value {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(_file_guard) = budget_file_lock(&self.paths) else {
+            return tool_error("Refusing: could not lock the budget.");
+        };
         let mut budget = match self.charge(TOOL_NAME) {
             Ok(b) => b,
             Err(v) => return v,
@@ -606,6 +609,9 @@ impl Gateway {
     /// id and no echo; nothing here is readable by Muse until the user approves it.
     fn call_remember(&self, args: &Value) -> Value {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(_file_guard) = budget_file_lock(&self.paths) else {
+            return tool_error("Refusing: could not lock the budget.");
+        };
         let mut budget = match self.charge(REMEMBER_TOOL) {
             Ok(b) => b,
             Err(v) => return v,
@@ -732,6 +738,16 @@ pub struct InboxItem {
     pub ts: String,
     pub text: String,
     pub source: String,
+}
+
+/// Held (as an open, locked file) for the whole charge-disclose-record sequence. An OS file
+/// lock, not just the in-process mutex: two gateway instances for the same directory (e.g.
+/// a cloud tenant reopened after cache eviction while old requests still run) must never
+/// interleave budget updates.
+fn budget_file_lock(paths: &Paths) -> std::io::Result<std::fs::File> {
+    let f = private_options().create(true).truncate(false).write(true).open(paths.budget.with_extension("lock"))?;
+    f.lock()?;
+    Ok(f)
 }
 
 /// Exclusive lock shared by the server (append) and the CLI (approve/reject), so the two
@@ -1349,6 +1365,12 @@ pub struct ExportItem {
 /// push fails midway (the device pushes again). Unchanged rows keep their ids, so the
 /// daily distinct-disclosure budget doesn't count them again.
 pub fn replace_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> {
+    validate_export(items)?;
+    apply_export(cortex, items)
+}
+
+/// Everything `replace_export` would refuse, checked without touching storage.
+pub fn validate_export(items: &[ExportItem]) -> Result<(), String> {
     if items.len() > MAX_EXPORT {
         return Err(format!("at most {MAX_EXPORT} items"));
     }
@@ -1358,6 +1380,10 @@ pub fn replace_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, St
     if items.iter().any(|i| i.embedding.as_ref().is_some_and(|e| e.len() != EMBED_DIM || e.iter().any(|x| !x.is_finite()))) {
         return Err("invalid embedding".into());
     }
+    Ok(())
+}
+
+fn apply_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> {
     let wanted: BTreeSet<&str> = items.iter().map(|i| i.text.as_str()).collect();
     let mut kept = BTreeSet::new();
     for m in export_rows(cortex)? {

@@ -322,6 +322,7 @@ fn rand_b64url(n: usize) -> String {
 struct Dev {
     root: PathBuf,
     cloud_url: String,
+    db_name: String,
 }
 
 struct ToolOut {
@@ -340,7 +341,14 @@ impl Dev {
     fn new(root: &Path, cloud: &Cloud) -> Dev {
         let root = root.to_path_buf();
         std::fs::create_dir_all(root.join("dev")).unwrap();
-        Dev { root, cloud_url: cloud.url() }
+        Dev { root, cloud_url: cloud.url(), db_name: "memory.db".into() }
+    }
+
+    /// Another database in the same directory.
+    fn with_db(root: &Path, cloud: &Cloud, db_name: &str) -> Dev {
+        let mut d = Dev::new(root, cloud);
+        d.db_name = db_name.into();
+        d
     }
 
     fn db_dir(&self) -> PathBuf {
@@ -350,7 +358,7 @@ impl Dev {
     /// Run one `tools/call` in a fresh stdio session (state persists on disk).
     fn call(&self, tool: &str, args: Value) -> ToolOut {
         let mut child = Command::new(mcp_server_bin())
-            .env("CORTEX_DB_PATH", self.db_dir().join("memory.db"))
+            .env("CORTEX_DB_PATH", self.db_dir().join(&self.db_name))
             .env("CORTEX_CLOUD_URL", &self.cloud_url)
             .env("CORTEX_NO_EMBEDDINGS", "1")
             // Never touch the developer's real login keychain.
@@ -1391,4 +1399,19 @@ fn review_too_long_memory_is_refused_before_it_wedges_sync() {
     let st = dev.status();
     assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "{st}");
     assert!(st["sync_error"].is_null(), "sync still healthy: {st}");
+}
+
+#[test]
+fn review_two_databases_in_one_directory_have_separate_connections() {
+    let tmp = TempDir::new("rv-twodb");
+    let cloud = Cloud::start(tmp.path());
+    let a = Dev::with_db(tmp.path(), &cloud, "work.db");
+    let b = Dev::with_db(tmp.path(), &cloud, "home.db");
+    let ra = rid_of(a.connect_texts(&["Work memory"])["link"].as_str().unwrap());
+    let rb = rid_of(b.connect_texts(&["Home memory"])["link"].as_str().unwrap());
+    assert_ne!(ra, rb, "each database gets its own tenant");
+    let out = b.call("muse_disconnect", json!({}));
+    assert!(!out.is_error, "{}", out.text);
+    assert_eq!(a.status()["connected"], json!(false), "a is not signed in yet, but still has a tenant");
+    assert!(tmp.path().join("data").join("tenants").join(&ra).is_dir(), "b's disconnect left a's tenant alone");
 }

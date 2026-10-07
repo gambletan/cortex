@@ -541,15 +541,21 @@ async fn tenant_api(
                 }
                 let items: Vec<ExportItem> =
                     b.items.into_iter().map(|i| ExportItem { text: i.text, embedding: i.embedding }).collect();
+                if let Err(e) = gateway::validate_export(&items) {
+                    return api_error(StatusCode::BAD_REQUEST, &e);
+                }
+                // The watermark is persisted BEFORE the export changes: if we crash or fail
+                // midway, no older snapshot can be applied afterwards; the device simply
+                // retries with a newer one and converges.
+                if let Err(e) = private_write(&vpath, b.version.to_string().as_bytes()) {
+                    return internal(e);
+                }
                 match gateway::replace_export(&cortex, &items) {
                     Ok(n) => {
-                        if let Err(e) = private_write(&vpath, b.version.to_string().as_bytes()) {
-                            return internal(e);
-                        }
                         let _ = private_write(&dir.join("pushed"), b"1");
                         Json(json!({ "count": n })).into_response()
                     }
-                    Err(e) => api_error(StatusCode::BAD_REQUEST, &e),
+                    Err(e) => internal(e),
                 }
             }
             ("POST", "enroll") => match oauth::open_enrollment(&paths, ENROLL_SECS) {
@@ -714,7 +720,17 @@ fn build_app(args: &Args) -> Arc<App> {
         embedder: if std::env::var("CORTEX_NO_EMBEDDINGS").is_ok_and(|v| !v.is_empty()) {
             None
         } else {
-            cortex_core::embedder::Embedder::new().ok()
+            // A writable model cache: never the (read-only) working directory.
+            if std::env::var_os("FASTEMBED_CACHE_DIR").is_none() {
+                std::env::set_var("FASTEMBED_CACHE_DIR", args.data_dir.join("models"));
+            }
+            match cortex_core::embedder::Embedder::new() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("warning: embedding model unavailable ({e}); recall falls back to keywords");
+                    None
+                }
+            }
         },
         cache: Mutex::new(Cache::default()),
         opens: tokio::sync::Semaphore::new(MAX_CONCURRENT_OPENS),
