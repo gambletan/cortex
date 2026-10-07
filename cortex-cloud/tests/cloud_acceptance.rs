@@ -1668,3 +1668,26 @@ fn review_status_still_lists_shares_when_the_cloud_is_down() {
     assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "{st}");
     assert!(st["cloud_error"].is_string(), "{st}");
 }
+
+#[test]
+fn review_deleting_a_shared_memory_elsewhere_reaches_the_cloud() {
+    let tmp = TempDir::new("rv-elsewhere");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let pid = rid_of(dev.connect_texts(&["Zeta secret", "Eta public"])["link"].as_str().unwrap());
+    let token = Muse::new(&cloud, &pid).sign_in();
+    let id = dev.status()["shared"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["text"] == json!("Zeta secret"))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Deleted through the ordinary memory tool, not muse_unshare.
+    let out = dev.call("memory_delete", json!({ "id": id }));
+    assert!(!out.is_error, "{}", out.text);
+    let hits = Muse::new(&cloud, &pid).recall(&token, "Zeta secret");
+    assert!(hits.iter().all(|h| !h.contains("Zeta")), "cloud must follow: {hits:?}");
+}

@@ -46,6 +46,10 @@ struct State {
     /// Last export version sent: versions only ever increase, whatever the clock does.
     #[serde(default)]
     last_version: i64,
+    /// Hash of the export as last pushed successfully. Any difference from the current
+    /// local export (whatever changed it: CLI revoke, memory_delete, …) triggers a push.
+    #[serde(default)]
+    pushed_hash: Option<String>,
 }
 
 /// `<db dir>/<db file name>.<suffix>`: every Muse file belongs to exactly one database.
@@ -165,8 +169,16 @@ fn push(cortex: &Cortex, dev: &Device) -> Result<u64, String> {
         .into_iter()
         .map(|m| (content_to_string(&m.content), m.embedding.map(|e| e.as_ref().clone())))
         .collect();
+    let snapshot = plan_hash(&{
+        let mut t: Vec<String> = items.iter().map(|(t, _)| t.clone()).collect();
+        t.sort();
+        t
+    });
     let out = dev.push_export(version, &items);
     st.dirty = out.is_err();
+    if out.is_ok() {
+        st.pushed_hash = Some(snapshot);
+    }
     save_state(cortex, &st)?;
     out.map_err(|e| format!("{e}. Muse may still see the previous list until this is retried (automatically, on the next Muse action)."))
 }
@@ -197,10 +209,33 @@ fn check_capacity(cortex: &Cortex, texts: &[&String]) -> Result<(), String> {
 
 /// Retry a push that failed earlier.
 fn settle(cortex: &Cortex, dev: &Device) -> Result<(), String> {
-    if dev.rid.is_some() && load_state(cortex)?.dirty {
+    if dev.rid.is_none() {
+        return Ok(());
+    }
+    let st = load_state(cortex)?;
+    if st.dirty || st.pushed_hash != Some(current_hash(cortex)?) {
         push(cortex, dev)?;
     }
     Ok(())
+}
+
+fn current_hash(cortex: &Cortex) -> Result<String, String> {
+    let mut texts: Vec<String> = export_rows(cortex)?.iter().map(|m| content_to_string(&m.content)).collect();
+    texts.sort();
+    Ok(plan_hash(&texts))
+}
+
+/// Bring the cloud copy in line with the local export if it changed outside the muse_*
+/// tools (gateway allow/revoke, memory_delete). No-op when not connected. Called right
+/// after those changes; every muse_* call also checks.
+pub fn reconcile(cortex: &Cortex) -> Result<(), String> {
+    if cortex.db_path().is_none() || load_state(cortex)?.rid.is_none() {
+        return Ok(());
+    }
+    with_lock(cortex, || {
+        let dev = device(cortex)?;
+        settle(cortex, &dev)
+    })
 }
 
 /// Exactly what a share call would add: (memory id or text) → text.

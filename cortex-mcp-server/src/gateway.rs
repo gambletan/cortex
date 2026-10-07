@@ -1086,7 +1086,12 @@ pub fn run(action: GatewayAction, db_path: &str) {
                 die("text must not be empty");
             }
             match allow(&cortex, &text) {
-                Ok(id) => println!("{id}"),
+                Ok(id) => {
+                    println!("{id}");
+                    if let Err(e) = muse_tools::reconcile(&cortex) {
+                        eprintln!("warning: Cortex Cloud not updated yet ({e}); it syncs on the next Muse action");
+                    }
+                }
                 Err(e) => die(&e),
             }
         }
@@ -1103,6 +1108,9 @@ pub fn run(action: GatewayAction, db_path: &str) {
                 Ok(Some(m)) if m.namespace.as_deref() == Some(EXPORT_NS) => {
                     cortex.delete_memory(id).unwrap_or_else(|e| die(&e.to_string()));
                     println!("revoked {id}");
+                    if let Err(e) = muse_tools::reconcile(&cortex) {
+                        eprintln!("warning: Cortex Cloud still has the old list ({e}); it syncs on the next Muse action");
+                    }
                 }
                 _ => die("that id is not in the Muse export"),
             }

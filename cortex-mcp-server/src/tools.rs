@@ -627,7 +627,17 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_archive" => tool_memory_archive(cortex, args),
         "memory_ingest_batch" => tool_memory_ingest_batch(cortex, args),
         "tag_list_taxonomy" => tool_tag_list_taxonomy(cortex),
-        "memory_delete" => tool_memory_delete(cortex, args),
+        "memory_delete" => {
+            let out = tool_memory_delete(cortex, args);
+            // Deleting a shared memory must also stop Muse seeing it in Cortex Cloud.
+            #[cfg(feature = "gateway")]
+            if out.is_ok() {
+                if let Err(e) = crate::gateway::muse_tools::reconcile(cortex) {
+                    tracing::warn!(error = %e, "Cortex Cloud not updated yet; retried on the next Muse action");
+                }
+            }
+            out
+        }
         "memory_restore" => tool_memory_restore(cortex, args),
         "namespace_list" => tool_namespace_list(cortex),
         "person_merge" => tool_person_merge(cortex, args),
