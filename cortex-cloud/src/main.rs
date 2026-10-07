@@ -314,6 +314,12 @@ impl App {
         if !dir.join("device.pub").is_file() {
             return Ok(None);
         }
+        // Public id rotated while we were opening? This router carries the old issuer:
+        // never cache it (rotation evicts only AFTER writing the new id, so checking here,
+        // under the cache lock, closes the race).
+        if self.public_id(rid).as_deref() != Some(pid.as_str()) {
+            return Err("tenant changed while opening; retry".into());
+        }
         if let Some(existing) = cache.routers.get(rid).cloned() {
             cache.touch(rid);
             return Ok(Some(existing));
@@ -778,10 +784,17 @@ fn sweep(app: &App) {
             }
         }
     }
-    // Mappings that no longer point at a tenant's current public id.
+    // Mappings that no longer point at a tenant's current public id. Checked again under
+    // the tenant's lock (rotation holds it), and never touching in-progress temp files.
     if let Ok(entries) = std::fs::read_dir(&app.public_dir) {
         for e in entries.flatten() {
             let pid = e.file_name().to_string_lossy().to_string();
+            if !oauth::is_tenant_id(&pid) || app.resolve_public(&pid).is_some() {
+                continue;
+            }
+            let mid = std::fs::read_to_string(e.path()).unwrap_or_default().trim().to_string();
+            let lock = app.tenant_lock(&mid);
+            let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
             if app.resolve_public(&pid).is_none() {
                 let _ = std::fs::remove_file(e.path());
             }
