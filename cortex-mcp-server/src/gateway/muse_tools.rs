@@ -225,6 +225,11 @@ fn current_hash(cortex: &Cortex) -> Result<String, String> {
     Ok(plan_hash(&texts))
 }
 
+/// Whether this database is connected to Cortex Cloud.
+pub fn is_connected(cortex: &Cortex) -> bool {
+    cortex.db_path().is_some() && load_state(cortex).is_ok_and(|s| s.rid.is_some())
+}
+
 /// Bring the cloud copy in line with the local export if it changed outside the muse_*
 /// tools (gateway allow/revoke, memory_delete). No-op when not connected. Called right
 /// after those changes; every muse_* call also checks.
@@ -385,6 +390,18 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         if let Some(preview) = confirmed(cortex, args, &texts)? {
             return Ok(preview);
         }
+    }
+    // Items shared before the cloud limits existed would make every push fail: name them.
+    let too_long: Vec<String> = export_rows(cortex)?
+        .iter()
+        .filter(|m| content_to_string(&m.content).chars().count() > MAX_EXPORT_TEXT_CHARS)
+        .map(|m| m.id.to_string())
+        .collect();
+    if !too_long.is_empty() {
+        return Err(format!(
+            "These shared memories are longer than {MAX_EXPORT_TEXT_CHARS} characters; unshare them (muse_unshare) or share shorter versions first: {}",
+            too_long.join(", ")
+        ));
     }
     if texts.is_empty() && export_rows(cortex)?.is_empty() {
         return Err("Nothing is shared yet. Find memories with memory_search, ask the user which ones Muse may see, then call muse_connect with their memory_ids.".into());

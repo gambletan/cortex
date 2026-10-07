@@ -1691,3 +1691,15 @@ fn review_deleting_a_shared_memory_elsewhere_reaches_the_cloud() {
     let hits = Muse::new(&cloud, &pid).recall(&token, "Zeta secret");
     assert!(hits.iter().all(|h| !h.contains("Zeta")), "cloud must follow: {hits:?}");
 }
+
+#[test]
+fn review_delete_reports_when_the_cloud_could_not_be_updated() {
+    let tmp = TempDir::new("rv-delete-pending");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["Theta secret"]);
+    let id = dev.status()["shared"][0]["id"].as_str().unwrap().to_string();
+    cloud.stop();
+    let out = dev.call("memory_delete", json!({ "id": id })).json();
+    assert!(out["muse_cloud"].as_str().unwrap_or_default().contains("NOT updated"), "{out}");
+}

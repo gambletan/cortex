@@ -1085,6 +1085,14 @@ pub fn run(action: GatewayAction, db_path: &str) {
             if text.trim().is_empty() {
                 die("text must not be empty");
             }
+            // Connected to Cortex Cloud: refuse what the cloud would refuse, before storing it
+            // (an oversized item would block every later sync).
+            if muse_tools::is_connected(&cortex) && text.chars().count() > MAX_EXPORT_TEXT_CHARS {
+                die(&format!(
+                    "too long to share through Cortex Cloud ({} characters, at most {MAX_EXPORT_TEXT_CHARS}); share a shorter summary",
+                    text.chars().count()
+                ));
+            }
             match allow(&cortex, &text) {
                 Ok(id) => {
                     println!("{id}");

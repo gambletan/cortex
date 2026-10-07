@@ -628,12 +628,18 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_ingest_batch" => tool_memory_ingest_batch(cortex, args),
         "tag_list_taxonomy" => tool_tag_list_taxonomy(cortex),
         "memory_delete" => {
-            let out = tool_memory_delete(cortex, args);
-            // Deleting a shared memory must also stop Muse seeing it in Cortex Cloud.
+            #[allow(unused_mut)]
+            let mut out = tool_memory_delete(cortex, args);
+            // Deleting a shared memory must also stop Muse seeing it in Cortex Cloud — and if
+            // that can't happen right now, the caller is told, not just a log line.
             #[cfg(feature = "gateway")]
-            if out.is_ok() {
+            if let Ok(text) = &out {
                 if let Err(e) = crate::gateway::muse_tools::reconcile(cortex) {
-                    tracing::warn!(error = %e, "Cortex Cloud not updated yet; retried on the next Muse action");
+                    let mut v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+                    v["muse_cloud"] = json!(format!(
+                        "NOT updated yet ({e}): Muse may still see this memory until the next Muse action succeeds (e.g. muse_status)"
+                    ));
+                    out = Ok(v.to_string());
                 }
             }
             out
