@@ -938,11 +938,15 @@ async fn authenticate(st: &Arc<HttpState>, headers: &HeaderMap) -> Result<String
 async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body: axum::body::Body) -> Response {
     let caller = match authenticate(&st, &headers).await {
         Ok(c) => c,
-        Err(r) => return r,
+        Err(r) => {
+            tracing::info!(status = r.status().as_u16(), "mcp request unauthenticated");
+            return r;
+        }
     };
     if let Some(origin) = headers.get("origin") {
         let ok = origin.to_str().is_ok_and(|o| st.origins.iter().any(|a| a == o));
         if !ok {
+            tracing::warn!(origin = ?origin, "mcp request refused: origin not allowed");
             return StatusCode::FORBIDDEN.into_response();
         }
     }
@@ -971,11 +975,30 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
         return rpc_error_response(StatusCode::SERVICE_UNAVAILABLE, -32000, "Server busy");
     };
     let st2 = st.clone();
+    // Method/tool and timing only — never arguments or results.
+    let method = req.method.clone();
+    let tool = req.params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    if method == "initialize" {
+        tracing::info!(
+            protocol = %req.params.get("protocolVersion").and_then(Value::as_str).unwrap_or(""),
+            client = %req.params.get("clientInfo").map(|c| c.to_string()).unwrap_or_default(),
+            accept = ?headers.get("accept"),
+            "mcp initialize"
+        );
+    }
+    let started = std::time::Instant::now();
     let resp = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         st2.gw.handle_as(&caller, &req)
     })
     .await;
+    tracing::info!(
+        %method,
+        %tool,
+        ms = started.elapsed().as_millis() as u64,
+        bytes = resp.as_ref().ok().and_then(|r| r.as_ref()).map(|r| serde_json::to_string(r).map(|s| s.len()).unwrap_or(0)).unwrap_or(0),
+        "mcp request"
+    );
     match resp {
         Ok(Some(r)) => (
             StatusCode::OK,
