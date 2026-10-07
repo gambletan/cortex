@@ -397,22 +397,24 @@ async fn register(
 ) -> Response {
     let net = client_net(peer, &headers);
     {
+        // Per-network first: a network that is already over its allowance must not spend
+        // the service-wide budget.
         let now_i = Instant::now();
+        let mut rate = app.register_rate.lock().unwrap_or_else(|p| p.into_inner());
+        rate.retain(|_, (start, _)| now_i.duration_since(*start).as_secs() < 3600);
+        let slot = rate.entry(net).or_insert((now_i, 0));
+        if slot.1 >= REGISTER_PER_NET_PER_HOUR {
+            return api_error(StatusCode::TOO_MANY_REQUESTS, "too many registrations");
+        }
         let mut g = app.register_global.lock().unwrap_or_else(|p| p.into_inner());
         if now_i.duration_since(g.0).as_secs() >= 60 {
             *g = (now_i, 0);
         }
-        g.1 += 1;
-        if g.1 > REGISTER_GLOBAL_PER_MINUTE {
+        if g.1 >= REGISTER_GLOBAL_PER_MINUTE {
             return api_error(StatusCode::TOO_MANY_REQUESTS, "too many registrations");
         }
-        let mut rate = app.register_rate.lock().unwrap_or_else(|p| p.into_inner());
-        rate.retain(|_, (start, _)| now_i.duration_since(*start).as_secs() < 3600);
-        let slot = rate.entry(net).or_insert((now_i, 0));
         slot.1 += 1;
-        if slot.1 > REGISTER_PER_NET_PER_HOUR {
-            return api_error(StatusCode::TOO_MANY_REQUESTS, "too many registrations");
-        }
+        g.1 += 1;
     }
     let body = match read_body(&headers, body, MAX_SMALL_BODY).await {
         Ok(b) => b,

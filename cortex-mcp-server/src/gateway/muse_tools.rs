@@ -43,6 +43,9 @@ struct State {
     /// Pending confirmation: code, hash of exactly what will be shared, expiry.
     #[serde(default)]
     confirm: Option<(String, String, i64)>,
+    /// Last export version sent: versions only ever increase, whatever the clock does.
+    #[serde(default)]
+    last_version: i64,
 }
 
 /// `<db dir>/<db file name>.<suffix>`: every Muse file belongs to exactly one database.
@@ -147,14 +150,17 @@ fn device(cortex: &Cortex) -> Result<Device, String> {
 /// Push the whole shared list. On failure the state is marked dirty and every later
 /// muse_* call retries first, so an unshare can't silently stay visible in the cloud.
 fn push(cortex: &Cortex, dev: &Device) -> Result<u64, String> {
-    // Version = when the snapshot was taken, so a slower, older push can never win.
-    let version = chrono::Utc::now().timestamp_millis();
+    // Strictly increasing per database (pushes run under the per-database lock), so a
+    // slower, older push can never win and a clock set back can't wedge syncing.
+    let mut st = load_state(cortex)?;
+    let version = chrono::Utc::now().timestamp_millis().max(st.last_version + 1);
+    st.last_version = version;
+    save_state(cortex, &st)?;
     let items: Vec<(String, Option<Vec<f32>>)> = export_rows(cortex)?
         .into_iter()
         .map(|m| (content_to_string(&m.content), m.embedding.map(|e| e.as_ref().clone())))
         .collect();
     let out = dev.push_export(version, &items);
-    let mut st = load_state(cortex)?;
     st.dirty = out.is_err();
     save_state(cortex, &st)?;
     out.map_err(|e| format!("{e}. Muse may still see the previous list until this is retried (automatically, on the next Muse action)."))

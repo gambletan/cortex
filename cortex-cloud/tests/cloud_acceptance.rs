@@ -1509,3 +1509,22 @@ fn review_reconnect_works_after_the_master_key_is_replaced() {
     let token = Muse::new(&cloud2, &rid2).sign_in();
     assert_eq!(Muse::new(&cloud2, &rid2).recall(&token, "Master key check"), vec!["Master key check".to_string()]);
 }
+
+#[test]
+fn review_clock_set_back_does_not_wedge_syncing() {
+    let tmp = TempDir::new("rv-clock");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let link = dev.connect_texts(&["Clock one", "Clock two"]);
+    let rid = rid_of(link["link"].as_str().unwrap());
+    // As if the last push happened while the device clock ran an hour fast.
+    let future = now() * 1000 + 3_600_000;
+    std::fs::write(tmp.path().join("data/tenants").join(&rid).join("export.version"), future.to_string()).unwrap();
+    let state_path = dev.db_dir().join("memory.db.muse-cloud.json");
+    let mut st: Value = serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    st["last_version"] = json!(future);
+    std::fs::write(&state_path, st.to_string()).unwrap();
+    let id = dev.status()["shared"][0]["id"].as_str().unwrap().to_string();
+    let out = dev.call("muse_unshare", json!({ "shared_ids": [id] }));
+    assert!(!out.is_error, "unshare must still sync: {}", out.text);
+}
