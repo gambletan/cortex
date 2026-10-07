@@ -55,10 +55,12 @@ const LAST_USED_RESOLUTION: i64 = 60;
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const AUTH_METHODS: [&str; 3] = ["none", "client_secret_post", "client_secret_basic"];
 const MAX_STATE_CHARS: usize = 1024;
+const WORKER_WAIT_SECS: u64 = 3;
 const RATE_REGISTER: u32 = 10;
 const RATE_AUTHORIZE: u32 = 20;
-/// The sign-in page refreshes every 3 s; this leaves room for a few open tabs.
-const RATE_WAIT: u32 = 120;
+/// The sign-in page refreshes every 3 s (20/min): room for every allowed pending sign-in
+/// (MAX_PENDING) with headroom. Over it, the page keeps polling slower instead of stopping.
+const RATE_WAIT: u32 = 300;
 /// Per registered client (an attacker can't spend a client_id it doesn't know).
 const RATE_TOKEN_PER_CLIENT: u32 = 60;
 
@@ -452,9 +454,10 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-fn html_page(status: StatusCode, title: &str, body_html: &str, refresh: Option<&str>) -> Response {
+/// `refresh`: (seconds, URL) for a `<meta http-equiv="refresh">`.
+fn html_page(status: StatusCode, title: &str, body_html: &str, refresh: Option<(u32, &str)>) -> Response {
     let meta = refresh
-        .map(|u| format!("<meta http-equiv=\"refresh\" content=\"3;url={}\">", html_escape(u)))
+        .map(|(secs, u)| format!("<meta http-equiv=\"refresh\" content=\"{secs};url={}\">", html_escape(u)))
         .unwrap_or_default();
     let page = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -524,10 +527,20 @@ fn parse_params(raw: &str) -> Result<HashMap<String, String>, ()> {
     Ok(map)
 }
 
-/// Run state work off the async runtime (the file lock blocks), bounded like `/mcp`.
+/// Run state work off the async runtime (the file lock blocks), bounded by the OAuth lane's
+/// own worker pool. The work is short, so wait briefly for a worker instead of failing.
 async fn blocking(st: &Arc<HttpState>, f: impl FnOnce() -> Response + Send + 'static) -> Response {
-    let Ok(permit) = st.workers.clone().try_acquire_owned() else {
-        return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", "Server busy");
+    blocking_or(st, f, || oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", "Server busy")).await
+}
+
+async fn blocking_or(
+    st: &Arc<HttpState>,
+    f: impl FnOnce() -> Response + Send + 'static,
+    busy: impl FnOnce() -> Response,
+) -> Response {
+    let acquire = st.oauth_workers.clone().acquire_owned();
+    let Ok(Ok(permit)) = tokio::time::timeout(std::time::Duration::from_secs(WORKER_WAIT_SECS), acquire).await else {
+        return busy();
     };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -743,7 +756,7 @@ fn waiting_page(code: &str, client_name: &str, redirect_uri: &str, req: &str) ->
             host = html_escape(host),
             code = html_escape(code),
         ),
-        Some(&format!("/authorize/wait?req={req}")),
+        Some((3, &format!("/authorize/wait?req={req}"))),
     )
 }
 
@@ -837,11 +850,22 @@ pub(super) async fn authorize_wait(State(st): State<Arc<HttpState>>, RawQuery(q)
     let Some(req) = p.get("req").cloned().filter(|r| is_token_shaped(r)) else {
         return bad_request_page("This sign-in expired or was already used. Start again in Muse.");
     };
+    // Busy or rate limited: keep polling (slower) with the same capability; never strand an
+    // approval on a page that stopped refreshing.
+    let retry_url = format!("/authorize/wait?req={req}");
+    let retry = move |status| {
+        html_page(
+            status,
+            "Busy",
+            "<h1>Busy</h1><p>Too many requests right now. This page retries by itself.</p>",
+            Some((15, &retry_url)),
+        )
+    };
     if !cfg(&st).allow("wait", RATE_WAIT) {
-        return bad_request_page("Too many requests. Wait a minute; this page will retry.");
+        return retry(StatusCode::TOO_MANY_REQUESTS);
     }
     let st2 = st.clone();
-    blocking(&st, move || {
+    blocking_or(&st, move || {
         let c = cfg(&st2);
         let paths = &st2.gw.paths;
         let h = sha256_hex(&req);
@@ -892,7 +916,7 @@ pub(super) async fn authorize_wait(State(st): State<Arc<HttpState>>, RawQuery(q)
                 redirect_with(c, &pending.redirect_uri, &params, pending.state.as_deref())
             }
         }
-    })
+    }, || retry(StatusCode::SERVICE_UNAVAILABLE))
     .await
 }
 

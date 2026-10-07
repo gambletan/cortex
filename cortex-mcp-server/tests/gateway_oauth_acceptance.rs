@@ -1867,3 +1867,48 @@ fn review_omitted_grant_types_still_allow_refresh() {
     let t2 = grant(&env, port, &cid2);
     assert_eq!(token_refresh(port, &cid2, &t2.refresh).oauth_error(), "unauthorized_client");
 }
+
+#[test]
+fn review_trickled_oauth_bodies_dont_starve_mcp() {
+    use std::io::Write as _;
+    let env = Env::new("rv-lane");
+    let tok = "q7Lx9vR2mK4pT8wZ3nB6cF1hJ5sD0gY2uE7aW4iO9eV";
+    let srv = env.serve(&["--oauth", "--public-url", ISSUER], Some(tok));
+    let port = srv.port;
+    // Hold every OAuth slot (and more) with bodies that never finish.
+    let mut held = Vec::new();
+    for _ in 0..24 {
+        if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.write_all(
+                b"POST /token HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 4000\r\n\r\ngrant_type=",
+            );
+            held.push(s);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let r = tools_list(port, tok);
+    assert!(mcp_ok(&r), "static-token MCP must still be served: {}", r.dump());
+    drop(held);
+}
+
+#[test]
+fn review_rate_limited_wait_page_keeps_polling() {
+    let env = Env::new("rv-wait-rate");
+    let srv = env.serve_oauth();
+    let port = srv.port;
+    let unknown = "A".repeat(43);
+    let mut limited = None;
+    for _ in 0..400 {
+        let r = poll(port, &unknown);
+        if r.status == 429 {
+            limited = Some(r);
+            break;
+        }
+    }
+    let r = limited.expect("wait endpoint is rate limited");
+    assert!(
+        r.body.contains("http-equiv=\"refresh\"") && r.body.contains(&format!("req={unknown}")),
+        "a rate-limited poll must keep refreshing with the same req: {}",
+        r.dump()
+    );
+}

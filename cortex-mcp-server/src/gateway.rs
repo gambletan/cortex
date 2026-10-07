@@ -53,6 +53,10 @@ const EXPORT_HASH_PREFIX: &str = "muse-export:";
 const MAX_AUDIT_BYTES: u64 = 10 * 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// OAuth endpoints are unauthenticated by nature: they get their own, smaller lane so a
+/// flood (or trickled bodies) there can never take capacity from `/mcp`.
+const MAX_OAUTH_CONCURRENT: usize = 8;
+const MAX_OAUTH_WORKERS: usize = 4;
 const MIN_TOKEN_DISTINCT_CHARS: usize = 8;
 const MAX_EXPORT: usize = 1000;
 const MAX_LIMIT: u64 = 5;
@@ -808,6 +812,8 @@ struct HttpState {
     /// Bounds the blocking work actually in flight. The permit moves into the blocking
     /// task, so it is held for as long as the work runs, even if the client goes away.
     workers: Arc<tokio::sync::Semaphore>,
+    /// Blocking state work for the OAuth endpoints (separate from `workers`).
+    oauth_workers: Arc<tokio::sync::Semaphore>,
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -933,27 +939,30 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
 }
 
 fn router(state: Arc<HttpState>) -> Router {
-    let mut r = Router::new().route(
-        "/mcp",
-        post(handle_post).get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
-    );
+    // Body reads have an absolute deadline (`read_body`). Deliberately no whole-request
+    // timeout: that would drop the response while the blocking disclosure keeps running
+    // (charging budget, auditing "ok"); that work is short and bounded by `workers`.
+    // Header-phase slowloris is absorbed by the tunnel in front of this loopback listener.
+    let mut r = Router::new()
+        .route(
+            "/mcp",
+            post(handle_post).get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        )
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
     if state.oauth.is_some() {
-        r = r
+        let oauth = Router::new()
             .route("/.well-known/oauth-protected-resource", get(oauth::protected_resource))
             .route("/.well-known/oauth-protected-resource/mcp", get(oauth::protected_resource))
             .route("/.well-known/oauth-authorization-server", get(oauth::authorization_server))
             .route("/register", post(oauth::register))
             .route("/authorize", get(oauth::authorize))
             .route("/authorize/wait", get(oauth::authorize_wait))
-            .route("/token", post(oauth::token));
+            .route("/token", post(oauth::token))
+            .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_OAUTH_CONCURRENT));
+        r = r.merge(oauth);
     }
     r.fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        // Body reads have an absolute deadline in `handle_post`. Deliberately no whole-request
-        // timeout: that would drop the response while the blocking disclosure keeps running
-        // (charging budget, auditing "ok"); that work is short and bounded by `workers`.
-        // Header-phase slowloris is absorbed by the tunnel in front of this loopback listener.
-        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
         .with_state(state)
 }
 
@@ -1202,6 +1211,7 @@ pub fn run(action: GatewayAction, db_path: &str) {
                 oauth: oauth_cfg,
                 origins: allow_origin,
                 workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+                oauth_workers: Arc::new(tokio::sync::Semaphore::new(MAX_OAUTH_WORKERS)),
             });
             let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(&e.to_string()));
             rt.block_on(async move {

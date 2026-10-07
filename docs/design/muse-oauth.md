@@ -89,7 +89,7 @@ with the code and the command, `<meta http-equiv="refresh" content="3;url=/autho
 
 | Pending state | Response |
 |---|---|
-| malformed `req` (not 43-char base64url) / unknown / expired | HTML 400 "this request expired; start again in Muse" (no disk write; rate limit 120/min) |
+| malformed `req` (not 43-char base64url) / unknown / expired | HTML 400 "this request expired; start again in Muse" (no disk write). Rate limit 300/min (10 pending × 20/min + headroom); over it, a 429 page that keeps polling every 15 s |
 | waiting | same page (refresh) |
 | denied, or kill switch on | `302 redirect_uri?error=access_denied&state&iss`, request deleted |
 | approved | **atomically** (under the state lock): delete the pending request, mint the code, store its hash with the bound transaction, persist, then `302 redirect_uri?code&state&iss`. A later poll finds nothing (400). Code TTL 60 s starts here. If the response is lost, the user starts again. |
@@ -134,6 +134,12 @@ Blocks `/mcp` (every method), `/authorize`, code delivery on the wait page, `/to
 (all grants), and `gateway connect`. `off` also deletes all pending requests and
 unredeemed codes. Existing grants are **suspended** (unusable while off), not revoked;
 `disconnect --all` revokes them. The gateway has no long-lived streams (`GET /mcp` is 405).
+
+### Capacity
+
+The OAuth endpoints run in their own lane (8 concurrent requests, 4 blocking workers),
+separate from `/mcp` (16 / 16), so unauthenticated traffic there, including trickled
+request bodies, can never take capacity from MCP clients.
 
 ### Response hardening
 
