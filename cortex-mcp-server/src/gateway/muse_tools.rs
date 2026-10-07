@@ -333,13 +333,20 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if dev.rid.is_none() {
         register(cortex, &mut dev)?;
     }
-    let (link, expires) = match push(cortex, &dev).and_then(|_| dev.enroll()) {
+    // Enroll FIRST: it revokes every earlier connection before the (possibly new) list is
+    // published, so a connection being replaced never sees what is shared next. Fail closed:
+    // no revocation, no push.
+    let publish = |dev: &Device| -> Result<(String, u64), String> {
+        let enrolled = dev.enroll()?;
+        push(cortex, dev)?;
+        Ok(enrolled)
+    };
+    let (link, expires) = match publish(&dev) {
         Err(e) if e.starts_with(GONE) => {
             // The service lost this connection (expired or deleted): start a fresh one.
             dev.rid = None;
             register(cortex, &mut dev)?;
-            push(cortex, &dev)?;
-            dev.enroll()?
+            publish(&dev)?
         }
         other => other?,
     };

@@ -1530,3 +1530,16 @@ fn review_clock_set_back_does_not_wedge_syncing() {
     let out = dev.call("muse_unshare", json!({ "shared_ids": [id] }));
     assert!(!out.is_error, "unshare must still sync: {}", out.text);
 }
+
+#[test]
+fn review_reconnect_revokes_before_publishing_new_shares() {
+    let tmp = TempDir::new("rv-reconnect-order");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let rid = rid_of(dev.connect_texts(&["Old shared"])["link"].as_str().unwrap());
+    let intruder = Muse::new(&cloud, &rid).sign_in();
+    // Reconnecting with a new item: the earlier connection must never see it.
+    dev.connect_texts(&["Brand new secret"]);
+    let r = Muse::new(&cloud, &rid).mcp_at(&rid, &intruder, "tools/list", json!({}));
+    assert_eq!(r.status, 401, "earlier connection revoked: {}", r.dump());
+}
