@@ -166,6 +166,30 @@ fn push(cortex: &Cortex, dev: &Device) -> Result<u64, String> {
     out.map_err(|e| format!("{e}. Muse may still see the previous list until this is retried (automatically, on the next Muse action)."))
 }
 
+/// Before any change to the shared list of a connected database: record that the cloud
+/// is behind, so a crash or a failure midway is pushed on the next muse_* call.
+fn mark_stale(cortex: &Cortex, dev: &Device) -> Result<(), String> {
+    if dev.rid.is_some() {
+        let mut st = load_state(cortex)?;
+        st.dirty = true;
+        save_state(cortex, &st)?;
+    }
+    Ok(())
+}
+
+/// Would adding `texts` exceed the export cap? Counts only items not already shared
+/// (sharing the same thing twice is a no-op).
+fn check_capacity(cortex: &Cortex, texts: &[&String]) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let mut all: BTreeSet<String> = export_rows(cortex)?.iter().map(|m| content_to_string(&m.content)).collect();
+    let current = all.len();
+    all.extend(texts.iter().map(|t| (*t).clone()));
+    if all.len() > MAX_EXPORT_ITEMS {
+        return Err(format!("At most {MAX_EXPORT_ITEMS} memories can be shared; {current} already are."));
+    }
+    Ok(())
+}
+
 /// Retry a push that failed earlier.
 fn settle(cortex: &Cortex, dev: &Device) -> Result<(), String> {
     if dev.rid.is_some() && load_state(cortex)?.dirty {
@@ -195,10 +219,7 @@ fn planned(cortex: &Cortex, args: &Value) -> Result<Vec<String>, String> {
             t.chars().count()
         ));
     }
-    let current = export_rows(cortex)?.len();
-    if current + texts.len() > MAX_EXPORT_ITEMS {
-        return Err(format!("At most {MAX_EXPORT_ITEMS} memories can be shared; {current} already are."));
-    }
+    check_capacity(cortex, &texts.iter().collect::<Vec<_>>())?;
     Ok(texts)
 }
 
@@ -324,6 +345,10 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
             return Ok(preview);
         }
     }
+    let pre = device(cortex)?;
+    if !texts.is_empty() {
+        mark_stale(cortex, &pre)?;
+    }
     let added = add_to_export(cortex, &texts)?;
     let shared = export_rows(cortex)?.len();
     if shared == 0 {
@@ -374,6 +399,7 @@ fn share(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     }
     let dev = device(cortex)?;
     settle(cortex, &dev)?;
+    mark_stale(cortex, &dev)?;
     let added = add_to_export(cortex, &texts)?;
     let pushed = if dev.rid.is_some() { Some(push(cortex, &dev)?) } else { None };
     Ok(json!({ "added": added, "shared": export_rows(cortex)?.len(), "synced_to_cloud": pushed.is_some() }))
@@ -393,13 +419,9 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     // Ids already gone locally are fine (idempotent: e.g. retrying after a failed push).
     let targets: Vec<Uuid> = parsed.into_iter().filter(|id| export.contains(id)).collect();
     let dev = device(cortex)?;
-    if dev.rid.is_some() {
-        // Record "cloud is behind" BEFORE deleting, so a crash or a failed push is retried
-        // with the new list, whatever happens next.
-        let mut st = load_state(cortex)?;
-        st.dirty = true;
-        save_state(cortex, &st)?;
-    }
+    // Record "cloud is behind" BEFORE deleting, so a crash or a failed push is retried
+    // with the new list, whatever happens next.
+    mark_stale(cortex, &dev)?;
     for id in &targets {
         cortex.delete_memory(*id).map_err(|e| e.to_string())?;
     }
@@ -456,14 +478,9 @@ fn inbox(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if let Some(t) = keeping.iter().find(|t| t.chars().count() > MAX_EXPORT_TEXT_CHARS) {
         return Err(format!("An item is too long to keep shared ({} characters).", t.chars().count()));
     }
-    let current = export_rows(cortex)?.len();
-    if current + keeping.len() > MAX_EXPORT_ITEMS {
-        return Err(format!("At most {MAX_EXPORT_ITEMS} memories can be shared; {current} already are."));
-    }
+    check_capacity(cortex, &keeping)?;
     if !keeping.is_empty() {
-        let mut st = load_state(cortex)?;
-        st.dirty = true;
-        save_state(cortex, &st)?;
+        mark_stale(cortex, &dev)?;
     }
     let mut done = Vec::new();
     for (id, text) in &items {

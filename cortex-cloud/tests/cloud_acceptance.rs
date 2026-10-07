@@ -1543,3 +1543,17 @@ fn review_reconnect_revokes_before_publishing_new_shares() {
     let r = Muse::new(&cloud, &rid).mcp_at(&rid, &intruder, "tools/list", json!({}));
     assert_eq!(r.status, 401, "earlier connection revoked: {}", r.dump());
 }
+
+#[test]
+fn review_resharing_counts_only_new_items_against_the_cap() {
+    let tmp = TempDir::new("rv-cap");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["seed"]);
+    let texts: Vec<String> = (0..600).map(|i| format!("cap item {i}")).collect();
+    let first = dev.call_confirmed("muse_share", json!({ "texts": texts }));
+    assert!(!first.is_error, "{}", first.text);
+    let again = dev.call_confirmed("muse_share", json!({ "texts": texts }));
+    assert!(!again.is_error, "re-sharing the same 600 is a no-op, not over the cap: {}", again.text);
+    assert_eq!(dev.status()["shared"].as_array().map(Vec::len), Some(601));
+}
