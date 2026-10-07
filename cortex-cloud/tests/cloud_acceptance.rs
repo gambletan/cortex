@@ -706,6 +706,14 @@ fn new_tenant(cloud: &Cloud) -> ([u8; 32], String, Device) {
     (secret, rid, d)
 }
 
+/// The tenant directory behind a public (Muse-facing) id. Spec revision: the device manages
+/// its tenant by a stable management id; Muse's URL carries a public id that rotates on
+/// every enrollment (`data/public/<pid>` → management id).
+fn tenant_dir_of(data: &Path, pid: &str) -> PathBuf {
+    let mid = std::fs::read_to_string(data.join("public").join(pid)).unwrap_or_default();
+    data.join("tenants").join(mid.trim())
+}
+
 /// Export snapshots carry a strictly increasing version (spec revision after review).
 fn next_version() -> i64 {
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -1231,7 +1239,7 @@ fn disconnect_wipes_tenant() {
     let muse = Muse::new(&cloud, &rid);
     let token = muse.sign_in();
     assert!(mcp_ok(&muse.call(&token, "recall_memory", json!({"query":"disconnect"}))));
-    let tenant_dir = cloud.data.join("tenants").join(&rid);
+    let tenant_dir = tenant_dir_of(&cloud.data, &rid);
     let had_dir = tenant_dir.exists();
 
     let out = dev.call("muse_disconnect", json!({})).json();
@@ -1274,7 +1282,9 @@ fn push_limits() {
 fn unknown_and_malformed_tenant_paths_404() {
     let tmp = TempDir::new("paths");
     let cloud = Cloud::start(tmp.path());
-    let (_s, rid, _dev) = new_tenant(&cloud);
+    let (_s, _mid, dev) = new_tenant(&cloud);
+    // Muse-facing paths use the public id from the link.
+    let rid = rid_of(&dev.enroll().expect("enroll").0);
     let unknown = rand_b64url(16);
     let paths = [
         format!("/t/{unknown}/mcp"),
@@ -1381,7 +1391,7 @@ fn review_client_recovers_when_the_cloud_lost_its_tenant() {
     let first = dev.connect_texts(&["Recovery check memory"]);
     let rid = rid_of(first["link"].as_str().unwrap());
     // The service forgets the tenant (idle sweep, operator wipe, …).
-    std::fs::remove_dir_all(tmp.path().join("data").join("tenants").join(&rid)).unwrap();
+    std::fs::remove_dir_all(tenant_dir_of(&tmp.path().join("data"), &rid)).unwrap();
     assert_eq!(dev.status()["connected"], json!(false));
     let again = dev.call("muse_connect", json!({})).json();
     let rid2 = rid_of(again["link"].as_str().unwrap_or_else(|| panic!("reconnects: {again}")));
@@ -1451,12 +1461,13 @@ fn review_two_databases_in_one_directory_have_separate_connections() {
     let a = Dev::with_db(tmp.path(), &cloud, "work.db");
     let b = Dev::with_db(tmp.path(), &cloud, "home.db");
     let ra = rid_of(a.connect_texts(&["Work memory"])["link"].as_str().unwrap());
+    let a_dir = tenant_dir_of(&tmp.path().join("data"), &ra);
     let rb = rid_of(b.connect_texts(&["Home memory"])["link"].as_str().unwrap());
     assert_ne!(ra, rb, "each database gets its own tenant");
     let out = b.call("muse_disconnect", json!({}));
     assert!(!out.is_error, "{}", out.text);
     assert_eq!(a.status()["connected"], json!(false), "a is not signed in yet, but still has a tenant");
-    assert!(tmp.path().join("data").join("tenants").join(&ra).is_dir(), "b's disconnect left a's tenant alone");
+    assert!(a_dir.join("device.pub").is_file(), "b's disconnect left a's tenant alone");
 }
 
 #[test]
@@ -1529,7 +1540,7 @@ fn review_clock_set_back_does_not_wedge_syncing() {
     let rid = rid_of(link["link"].as_str().unwrap());
     // As if the last push happened while the device clock ran an hour fast.
     let future = now() * 1000 + 3_600_000;
-    std::fs::write(tmp.path().join("data/tenants").join(&rid).join("export.version"), future.to_string()).unwrap();
+    std::fs::write(tenant_dir_of(&tmp.path().join("data"), &rid).join("export.version"), future.to_string()).unwrap();
     let state_path = dev.db_dir().join("memory.db.muse-cloud.json");
     let mut st: Value = serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     st["last_version"] = json!(future);
@@ -1600,4 +1611,20 @@ fn review_blank_memory_is_refused_before_it_wedges_sync() {
     let st = dev.status();
     assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "{st}");
     assert!(st["sync_error"].is_null(), "{st}");
+}
+
+#[test]
+fn review_lost_enroll_response_leaves_the_tenant_manageable() {
+    let tmp = TempDir::new("rv-enroll-lost");
+    let cloud = Cloud::start(tmp.path());
+    let (_s, mid, dev) = new_tenant(&cloud);
+    dev.push_export(next_version(), &items(&["kept item"])).unwrap();
+    let (first, _) = dev.enroll().unwrap(); // pretend this response never arrived
+    let (second, _) = dev.enroll().expect("the device can always enroll again");
+    assert_ne!(rid_of(&first), rid_of(&second));
+    assert_eq!(get(cloud.port, &format!("/.well-known/oauth-authorization-server/t/{}", rid_of(&first))).status, 404);
+    assert_eq!(dev.status().unwrap()["shared"], json!(1), "data still reachable by the stable id");
+    dev.delete().expect("delete reaches the tenant");
+    assert!(!tmp.path().join("data/tenants").join(&mid).exists(), "nothing orphaned");
+    assert_eq!(std::fs::read_dir(tmp.path().join("data/public")).unwrap().count(), 0, "no stale public ids");
 }

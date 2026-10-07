@@ -368,12 +368,6 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         }
         other => other?,
     };
-    // The service moved the tenant to a new id with this enrollment: remember it.
-    {
-        let mut st = load_state(cortex)?;
-        st.rid = dev.rid.clone();
-        save_state(cortex, &st)?;
-    }
     // 2. Only now add and publish.
     if !texts.is_empty() {
         mark_stale(cortex, &dev)?;

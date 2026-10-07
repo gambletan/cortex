@@ -80,6 +80,9 @@ struct App {
     base_url: String,
     tenants_dir: PathBuf,
     trash_dir: PathBuf,
+    /// `public/<pid>` → management id. Muse only ever sees the public id, which rotates on
+    /// every enrollment; the device manages its tenant by the stable management id.
+    public_dir: PathBuf,
     master: [u8; 32],
     #[cfg(feature = "embeddings")]
     embedder: Option<cortex_core::embedder::Embedder>,
@@ -220,8 +223,41 @@ impl App {
         oauth::is_tenant_id(rid).then(|| self.tenants_dir.join(rid))
     }
 
-    fn mcp_url(&self, rid: &str) -> String {
-        format!("{}/t/{rid}/mcp", self.base_url)
+    fn mcp_url(&self, pid: &str) -> String {
+        format!("{}/t/{pid}/mcp", self.base_url)
+    }
+
+    /// The tenant's current public id (what Muse's URL carries).
+    fn public_id(&self, mid: &str) -> Option<String> {
+        let dir = self.tenant_dir(mid)?;
+        let pid = std::fs::read_to_string(dir.join("public_id")).ok()?.trim().to_string();
+        oauth::is_tenant_id(&pid).then_some(pid)
+    }
+
+    /// Public id → management id, only if that public id is still the tenant's current one.
+    fn resolve_public(&self, pid: &str) -> Option<String> {
+        if !oauth::is_tenant_id(pid) {
+            return None;
+        }
+        let mid = std::fs::read_to_string(self.public_dir.join(pid)).ok()?.trim().to_string();
+        (oauth::is_tenant_id(&mid) && self.public_id(&mid).as_deref() == Some(pid)).then_some(mid)
+    }
+
+    /// Give the tenant a fresh public id: new mapping first, then the tenant's pointer, then
+    /// drop the old mapping. At every step the device can still reach the tenant by its
+    /// management id, and at most the current public id resolves.
+    fn rotate_public_id(&self, mid: &str) -> std::io::Result<String> {
+        let dir = self.tenant_dir(mid).ok_or_else(|| std::io::Error::other("bad tenant id"))?;
+        let old = self.public_id(mid);
+        let new = oauth::new_tenant_id();
+        private_write(&self.public_dir.join(&new), mid.as_bytes())?;
+        private_write(&dir.join("public_id"), new.as_bytes())?;
+        if let Some(old) = old {
+            let _ = std::fs::remove_file(self.public_dir.join(old));
+            let _ = sync_dir(&self.public_dir);
+        }
+        self.evict(mid);
+        Ok(new)
     }
 
     fn evict(&self, rid: &str) {
@@ -257,11 +293,10 @@ impl App {
         let Ok(_permit) = self.opens.try_acquire() else {
             return Err("busy opening tenants".into());
         };
-        // Keys come from the tenant's internal id, not its public URL id (which rotates on
-        // every enrollment).
-        let key_id = std::fs::read_to_string(dir.join("key_id")).map(|k| k.trim().to_string()).unwrap_or_else(|_| rid.to_string());
+        // `rid` here is the stable management id: keys never change when the public id rotates.
+        let Some(pid) = self.public_id(rid) else { return Ok(None) };
         let db = dir.join("export.db");
-        let cortex = Cortex::open_with_raw_key(&db.to_string_lossy(), &derive(&self.master, "db", &key_id), 1)
+        let cortex = Cortex::open_with_raw_key(&db.to_string_lossy(), &derive(&self.master, "db", rid), 1)
             .map_err(|e| format!("tenant storage: {e}"))?;
         #[cfg(feature = "embeddings")]
         let cortex = match &self.embedder {
@@ -270,8 +305,8 @@ impl App {
             None => cortex.without_embedder(),
         };
         let cortex = Arc::new(cortex);
-        let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", &key_id)));
-        let cfg = oauth::OAuthConfig::for_tenant(&self.base_url, rid, self.oauth_rate.clone())?;
+        let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", rid)));
+        let cfg = oauth::OAuthConfig::for_tenant(&self.base_url, &pid, self.oauth_rate.clone())?;
         let router = gateway::tenant_router(cortex.clone(), paths.clone(), cfg, &TenantConfig::default());
         let entry: Tenant = (router, cortex, paths);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -296,6 +331,9 @@ impl App {
     /// resolve it any more), drop it from the cache, then delete it.
     fn remove_tenant(&self, rid: &str) -> std::io::Result<()> {
         let Some(dir) = self.tenant_dir(rid) else { return Ok(()) };
+        if let Some(pid) = self.public_id(rid) {
+            let _ = std::fs::remove_file(self.public_dir.join(pid));
+        }
         let trash = self.trash_dir.join(format!("{rid}-{}", rand::random::<u64>()));
         match std::fs::rename(&dir, &trash) {
             Ok(()) => {}
@@ -455,7 +493,7 @@ async fn register(
         return api_error(StatusCode::BAD_REQUEST, "public_key must be the signing key");
     }
     let app2 = app.clone();
-    let out = blocking(move || -> Result<String, Response> {
+    let out = blocking(move || -> Result<(String, String), Response> {
         {
             let _g = app2.register_lock.lock().unwrap_or_else(|p| p.into_inner());
             match App::fresh_nonce_at(&app2.tenants_dir.with_file_name("register-nonces.json"), &nonce) {
@@ -470,7 +508,9 @@ async fn register(
         }
         // Build the directory aside, then rename it into place: the sweeper never sees a
         // half-made tenant.
+        // `rid` (management id) is only ever known to the device; `pid` goes into Muse's URL.
         let rid = oauth::new_tenant_id();
+        let pid = oauth::new_tenant_id();
         let staging = app2.trash_dir.join(format!("new-{rid}"));
         let create = || -> std::io::Result<()> {
             std::fs::create_dir(&staging)?;
@@ -480,20 +520,21 @@ async fn register(
                 std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
             }
             private_write(&staging.join("device.pub"), key.as_bytes())?;
-            private_write(&staging.join("key_id"), oauth::new_tenant_id().as_bytes())?;
+            private_write(&staging.join("public_id"), pid.as_bytes())?;
             private_write(&staging.join("last_seen"), now().to_string().as_bytes())?;
             std::fs::rename(&staging, app2.tenants_dir.join(&rid))?;
-            sync_dir(&app2.tenants_dir)
+            sync_dir(&app2.tenants_dir)?;
+            private_write(&app2.public_dir.join(&pid), rid.as_bytes())
         };
         create().map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);
             internal(e)
         })?;
-        Ok(rid)
+        Ok((rid, pid))
     })
     .await;
     match out {
-        Ok(Ok(rid)) => (StatusCode::CREATED, Json(json!({ "rid": rid, "mcp_url": app.mcp_url(&rid) }))).into_response(),
+        Ok(Ok((rid, pid))) => (StatusCode::CREATED, Json(json!({ "rid": rid, "mcp_url": app.mcp_url(&pid) }))).into_response(),
         Ok(Err(r)) | Err(r) => r,
     }
 }
@@ -561,22 +602,19 @@ async fn tenant_api(
             };
         }
         if method == Method::POST && op == "enroll" {
-            // Every enrollment gets a NEW public URL: the tenant directory moves to a fresh
-            // id, so any earlier link (used, expired or leaked) stops working for good.
-            // Keys derive from the internal key_id, which doesn't move.
-            let new_rid = oauth::new_tenant_id();
-            app2.evict(&rid);
-            let Some(new_dir) = app2.tenant_dir(&new_rid) else { return internal("bad tenant id") };
-            if let Err(e) = std::fs::rename(&dir, &new_dir).and_then(|_| sync_dir(&app2.tenants_dir)) {
-                return internal(e);
-            }
-            let paths = match open_or_drop(&app2, &new_rid) {
+            // Every enrollment gets a NEW public URL, so any earlier link (used, expired or
+            // leaked) stops working for good. The tenant itself doesn't move: the device
+            // keeps managing it by its management id, even if this response is lost.
+            let pid = match app2.rotate_public_id(&rid) {
+                Ok(p) => p,
+                Err(e) => return internal(e),
+            };
+            let paths = match open_or_drop(&app2, &rid) {
                 Ok((_, _, p)) => p,
                 Err(r) => return r,
             };
             return match oauth::open_enrollment(&paths, ENROLL_SECS) {
-                Ok(()) => Json(json!({ "rid": new_rid, "mcp_url": app2.mcp_url(&new_rid), "expires_in": ENROLL_SECS }))
-                    .into_response(),
+                Ok(()) => Json(json!({ "mcp_url": app2.mcp_url(&pid), "expires_in": ENROLL_SECS })).into_response(),
                 Err(e) => internal(e),
             };
         }
@@ -670,7 +708,11 @@ fn split_tenant(path: &str) -> Option<(&str, String)> {
 }
 
 async fn route_tenant(State(app): State<Arc<App>>, req: Request) -> Response {
-    let Some((rid, inner_path)) = split_tenant(req.uri().path()).map(|(r, p)| (r.to_string(), p)) else {
+    let Some((pid, inner_path)) = split_tenant(req.uri().path()).map(|(r, p)| (r.to_string(), p)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Muse addresses the public id; only the tenant's CURRENT public id resolves.
+    let Some(rid) = app.resolve_public(&pid) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let router = match app.cached(&rid) {
@@ -736,6 +778,15 @@ fn sweep(app: &App) {
             }
         }
     }
+    // Mappings that no longer point at a tenant's current public id.
+    if let Ok(entries) = std::fs::read_dir(&app.public_dir) {
+        for e in entries.flatten() {
+            let pid = e.file_name().to_string_lossy().to_string();
+            if app.resolve_public(&pid).is_none() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let Ok(entries) = std::fs::read_dir(&app.tenants_dir) else { return };
     let t = now();
     for e in entries.flatten() {
@@ -770,13 +821,15 @@ fn build_app(args: &Args) -> Arc<App> {
         .unwrap_or_else(|e| die(&e.replace("--public-url", "--base-url")));
     let tenants_dir = args.data_dir.join("tenants");
     let trash_dir = args.data_dir.join("trash");
-    for d in [&tenants_dir, &trash_dir] {
+    let public_dir = args.data_dir.join("public");
+    for d in [&tenants_dir, &trash_dir, &public_dir] {
         std::fs::create_dir_all(d).unwrap_or_else(|e| die(&e.to_string()));
     }
     Arc::new(App {
         base_url,
         tenants_dir,
         trash_dir,
+        public_dir,
         master: load_master(&args.master_key),
         #[cfg(feature = "embeddings")]
         embedder: if std::env::var("CORTEX_NO_EMBEDDINGS").is_ok_and(|v| !v.is_empty()) {

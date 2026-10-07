@@ -101,11 +101,21 @@ pub fn verify(
 /// Shared memories and inbox text travel in these requests: HTTPS only, except to this
 /// machine (local testing).
 pub fn check_transport(base_url: &str) -> Result<(), String> {
-    let loopback = ["http://127.0.0.1:", "http://127.0.0.1/", "http://localhost:", "http://localhost/", "http://[::1]:"];
-    if base_url.starts_with("https://") || loopback.iter().any(|p| base_url.starts_with(p)) || base_url == "http://127.0.0.1" || base_url == "http://localhost" {
-        Ok(())
-    } else {
-        Err(format!("refusing to send memories over an unencrypted connection ({base_url}); Cortex Cloud must be https"))
+    let refuse = || Err(format!("refusing to send memories over an unencrypted or unusual connection ({base_url}); Cortex Cloud must be https"));
+    let Some((scheme, rest)) = base_url.split_once("://") else { return refuse() };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // No userinfo: `http://localhost:80@remote.example` goes to remote.example.
+    if authority.is_empty() || authority.contains('@') {
+        return refuse();
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" if matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1") => Ok(()),
+        _ => refuse(),
     }
 }
 
@@ -140,7 +150,10 @@ impl Device {
         let nonce = URL_SAFE_NO_PAD.encode(n);
         let sig = self.key.sign(&canonical(method, path, &body_bytes, ts, &nonce));
         let url = format!("{}{path}", self.base_url.trim_end_matches('/'));
-        let req = ureq::request(method, &url)
+        // Never follow redirects (a signed request is bound to its path) and only accept 2xx.
+        let agent = ureq::AgentBuilder::new().redirects(0).build();
+        let req = agent
+            .request(method, &url)
             .timeout(std::time::Duration::from_secs(20))
             .set(H_KEY, &self.public_key_b64())
             .set(H_TS, &ts.to_string())
@@ -149,6 +162,9 @@ impl Device {
             .set("content-type", "application/json");
         let resp = if body.is_some() { req.send_bytes(&body_bytes) } else { req.call() };
         match resp {
+            Ok(r) if !(200..300).contains(&r.status()) => {
+                Err(format!("Cortex Cloud answered {} instead of success", r.status()))
+            }
             Ok(r) => {
                 let text = r.into_string().map_err(|e| e.to_string())?;
                 if text.trim().is_empty() {
@@ -192,15 +208,12 @@ impl Device {
         Ok(v.get("count").and_then(Value::as_u64).unwrap_or(0))
     }
 
-    /// Open a one-sign-in window; returns the link to paste into Muse. The service moves
-    /// the tenant to a fresh id (so every earlier link dies): `self.rid` is updated and the
-    /// caller must persist it.
-    pub fn enroll(&mut self) -> Result<(String, u64), String> {
+    /// Open a one-sign-in window; returns the link to paste into Muse. Every enrollment
+    /// gets a fresh public URL (earlier links die); `rid` — the device's management id —
+    /// never changes.
+    pub fn enroll(&self) -> Result<(String, u64), String> {
         let v = self.call("POST", &format!("/api/tenants/{}/enroll", self.rid()?), Some(&json!({})))?;
         let url = v.get("mcp_url").and_then(Value::as_str).ok_or("bad enroll response")?.to_string();
-        if let Some(rid) = v.get("rid").and_then(Value::as_str) {
-            self.rid = Some(rid.to_string());
-        }
         Ok((url, v.get("expires_in").and_then(Value::as_u64).unwrap_or(0)))
     }
 
@@ -283,5 +296,25 @@ mod tests {
         assert!(check_transport("http://localhost:1").is_ok());
         assert!(check_transport("http://x.example").is_err());
         assert!(check_transport("http://127.0.0.1.evil.example").is_err());
+        assert!(check_transport("http://localhost:80@remote.example").is_err());
+        assert!(check_transport("https://user@x.example").is_err());
+        assert!(check_transport("http://[::1]:9").is_ok());
+        assert!(check_transport("ftp://x").is_err());
+    }
+
+    #[test]
+    fn a_redirect_is_not_success() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let dev = Device::new(Device::generate_secret(), Some("AAAAAAAAAAAAAAAAAAAAAA".into()), format!("http://127.0.0.1:{port}"));
+        assert!(dev.push_export(1, &[]).is_err(), "a 307 must not count as a successful push");
     }
 }
