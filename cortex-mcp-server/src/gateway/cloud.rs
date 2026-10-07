@@ -98,6 +98,17 @@ pub fn verify(
 
 // ── Device side ──────────────────────────────────────────────────────────────
 
+/// Shared memories and inbox text travel in these requests: HTTPS only, except to this
+/// machine (local testing).
+pub fn check_transport(base_url: &str) -> Result<(), String> {
+    let loopback = ["http://127.0.0.1:", "http://127.0.0.1/", "http://localhost:", "http://localhost/", "http://[::1]:"];
+    if base_url.starts_with("https://") || loopback.iter().any(|p| base_url.starts_with(p)) || base_url == "http://127.0.0.1" || base_url == "http://localhost" {
+        Ok(())
+    } else {
+        Err(format!("refusing to send memories over an unencrypted connection ({base_url}); Cortex Cloud must be https"))
+    }
+}
+
 /// The device's identity: its Ed25519 key, the tenant it registered, and the service URL.
 pub struct Device {
     key: SigningKey,
@@ -121,6 +132,7 @@ impl Device {
     }
 
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+        check_transport(&self.base_url)?;
         let body_bytes = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
         let ts = chrono::Utc::now().timestamp();
         let mut n = [0u8; 16];
@@ -180,10 +192,15 @@ impl Device {
         Ok(v.get("count").and_then(Value::as_u64).unwrap_or(0))
     }
 
-    /// Open a one-sign-in window; returns the link to paste into Muse.
-    pub fn enroll(&self) -> Result<(String, u64), String> {
+    /// Open a one-sign-in window; returns the link to paste into Muse. The service moves
+    /// the tenant to a fresh id (so every earlier link dies): `self.rid` is updated and the
+    /// caller must persist it.
+    pub fn enroll(&mut self) -> Result<(String, u64), String> {
         let v = self.call("POST", &format!("/api/tenants/{}/enroll", self.rid()?), Some(&json!({})))?;
         let url = v.get("mcp_url").and_then(Value::as_str).ok_or("bad enroll response")?.to_string();
+        if let Some(rid) = v.get("rid").and_then(Value::as_str) {
+            self.rid = Some(rid.to_string());
+        }
         Ok((url, v.get("expires_in").and_then(Value::as_u64).unwrap_or(0)))
     }
 
@@ -257,5 +274,14 @@ mod tests {
         let items: Vec<Value> = (0..MAX_EXPORT_ITEMS).map(|_| item.clone()).collect();
         let body = json!({ "version": i64::MAX, "items": items }).to_string();
         assert!(body.len() < MAX_EXPORT_BODY, "{} >= {}", body.len(), MAX_EXPORT_BODY);
+    }
+
+    #[test]
+    fn transport_must_be_https_except_loopback() {
+        assert!(check_transport("https://x.example").is_ok());
+        assert!(check_transport("http://127.0.0.1:8080").is_ok());
+        assert!(check_transport("http://localhost:1").is_ok());
+        assert!(check_transport("http://x.example").is_err());
+        assert!(check_transport("http://127.0.0.1.evil.example").is_err());
     }
 }

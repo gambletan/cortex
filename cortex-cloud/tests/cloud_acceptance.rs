@@ -877,11 +877,19 @@ fn enrollment_window_single_use_and_reconnect_revokes() {
     // New link → old token revoked, new window opens.
     let out2 = dev.connect_texts(&[]);
     let link2 = out2["link"].as_str().expect("link on reconnect").to_string();
-    assert_eq!(rid_of(&link2), rid, "same tenant on reconnect");
+    // Spec revision (Codex): every enrollment moves the tenant to a fresh URL, so an earlier
+    // (possibly leaked) link can never be used in a later window.
+    let rid2 = rid_of(&link2);
+    assert_ne!(rid2, rid, "fresh URL on reconnect");
     let r = muse.call(&token1, "recall_memory", json!({"query":"colour"}));
-    assert_eq!(r.status, 401, "old Muse token must be revoked by a new enrollment: {}", r.dump());
-    let token2 = muse.sign_in();
-    assert!(muse.recall(&token2, "favourite colour").iter().any(|t| t.contains("teal")));
+    assert!(matches!(r.status, 401 | 404), "old Muse token must be revoked by a new enrollment: {}", r.dump());
+    let muse2 = Muse::new(&cloud, &rid2);
+    let r = muse2.call(&token1, "recall_memory", json!({"query":"colour"}));
+    assert_eq!(r.status, 401, "old token useless on the new URL too: {}", r.dump());
+    let old = get(cloud.port, &format!("/.well-known/oauth-authorization-server/t/{rid}"));
+    assert_eq!(old.status, 404, "the old link is dead, it can't reach the new window: {}", old.dump());
+    let token2 = muse2.sign_in();
+    assert!(muse2.recall(&token2, "favourite colour").iter().any(|t| t.contains("teal")));
 }
 
 /// 3. Consent CSRF: missing cookie / mismatched csrf / foreign Origin are refused without
@@ -1541,7 +1549,7 @@ fn review_reconnect_revokes_before_publishing_new_shares() {
     // Reconnecting with a new item: the earlier connection must never see it.
     dev.connect_texts(&["Brand new secret"]);
     let r = Muse::new(&cloud, &rid).mcp_at(&rid, &intruder, "tools/list", json!({}));
-    assert_eq!(r.status, 401, "earlier connection revoked: {}", r.dump());
+    assert!(matches!(r.status, 401 | 404), "earlier connection revoked: {}", r.dump());
 }
 
 #[test]
@@ -1578,4 +1586,18 @@ fn review_failed_reconnect_never_queues_new_shares_for_the_old_connection() {
     assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "new item not added: {st}");
     let hits = Muse::new(&cloud2, &rid).recall(&old_conn, "New secret");
     assert!(hits.iter().all(|h| !h.contains("New secret")), "{hits:?}");
+}
+
+#[test]
+fn review_blank_memory_is_refused_before_it_wedges_sync() {
+    let tmp = TempDir::new("rv-blank");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["Normal"]);
+    let id = dev.call("memory_ingest", json!({ "text": "   ", "channel": "t" })).json()["id"].as_str().unwrap().to_string();
+    let out = dev.call("muse_share", json!({ "memory_ids": [id] }));
+    assert!(out.is_error && out.text.contains("empty"), "{}", out.text);
+    let st = dev.status();
+    assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "{st}");
+    assert!(st["sync_error"].is_null(), "{st}");
 }

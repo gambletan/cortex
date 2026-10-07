@@ -208,7 +208,11 @@ fn planned(cortex: &Cortex, args: &Value) -> Result<Vec<String>, String> {
             .get_memory(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no memory with id {id}"))?;
-        texts.push(content_to_string(&mem.content));
+        let text = content_to_string(&mem.content);
+        if text.trim().is_empty() {
+            return Err(format!("memory {id} is empty and can't be shared"));
+        }
+        texts.push(text);
     }
     texts.extend(ids_arg(args, "texts").into_iter().filter(|t| !t.trim().is_empty()));
     // Check everything the cloud would refuse BEFORE touching the local list, so one bad
@@ -364,6 +368,12 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         }
         other => other?,
     };
+    // The service moved the tenant to a new id with this enrollment: remember it.
+    {
+        let mut st = load_state(cortex)?;
+        st.rid = dev.rid.clone();
+        save_state(cortex, &st)?;
+    }
     // 2. Only now add and publish.
     if !texts.is_empty() {
         mark_stale(cortex, &dev)?;

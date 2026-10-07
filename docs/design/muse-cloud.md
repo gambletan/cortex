@@ -203,7 +203,12 @@ OAuth clients build `/authorize` from discovery metadata, not from the pasted UR
 query secret in the link (`?e=`) would not reach the consent step. Instead:
 
 - The link is the tenant's MCP URL: `https://<host>/t/<rid>/mcp`. `rid` is 128-bit random,
-  shown only in the user's AI chat.
+  shown only in the user's AI chat, and **rotates on every enrollment** (Codex review): the
+  service moves the tenant directory to a fresh id, so any earlier link — used, expired or
+  leaked — is dead for good (404). Encryption keys derive from a separate, fixed internal
+  `key_id`, so the move doesn't affect them. The device stores the new id.
+- Device → cloud traffic must be HTTPS (loopback excepted for testing); the client refuses
+  plain HTTP.
 - `muse_connect` asks the cloud (signed) to open an **enrollment window**: 30 min, one
   grant, with a 4-digit pairing code the agent tells the user. Opening a window revokes
   existing grants.

@@ -224,6 +224,12 @@ impl App {
         format!("{}/t/{rid}/mcp", self.base_url)
     }
 
+    fn evict(&self, rid: &str) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.routers.remove(rid);
+        cache.order.retain(|r| r != rid);
+    }
+
     fn tenant_lock(&self, rid: &str) -> Arc<Mutex<()>> {
         let mut locks = self.tenant_locks.lock().unwrap_or_else(|p| p.into_inner());
         if locks.len() > 4 * TENANT_CACHE {
@@ -251,8 +257,11 @@ impl App {
         let Ok(_permit) = self.opens.try_acquire() else {
             return Err("busy opening tenants".into());
         };
+        // Keys come from the tenant's internal id, not its public URL id (which rotates on
+        // every enrollment).
+        let key_id = std::fs::read_to_string(dir.join("key_id")).map(|k| k.trim().to_string()).unwrap_or_else(|_| rid.to_string());
         let db = dir.join("export.db");
-        let cortex = Cortex::open_with_raw_key(&db.to_string_lossy(), &derive(&self.master, "db", rid), 1)
+        let cortex = Cortex::open_with_raw_key(&db.to_string_lossy(), &derive(&self.master, "db", &key_id), 1)
             .map_err(|e| format!("tenant storage: {e}"))?;
         #[cfg(feature = "embeddings")]
         let cortex = match &self.embedder {
@@ -261,7 +270,7 @@ impl App {
             None => cortex.without_embedder(),
         };
         let cortex = Arc::new(cortex);
-        let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", rid)));
+        let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", &key_id)));
         let cfg = oauth::OAuthConfig::for_tenant(&self.base_url, rid, self.oauth_rate.clone())?;
         let router = gateway::tenant_router(cortex.clone(), paths.clone(), cfg, &TenantConfig::default());
         let entry: Tenant = (router, cortex, paths);
@@ -293,11 +302,7 @@ impl App {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        {
-            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.routers.remove(rid);
-            cache.order.retain(|r| r != rid);
-        }
+        self.evict(rid);
         match std::fs::remove_dir_all(&trash) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -356,6 +361,24 @@ async fn read_body(headers: &HeaderMap, body: Body, max: usize) -> Result<Bytes,
         Ok(Ok(b)) => Ok(b),
         Ok(Err(_)) => Err(api_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
         Err(_) => Err(api_error(StatusCode::REQUEST_TIMEOUT, "body too slow")),
+    }
+}
+
+/// Open a tenant for an AUTHENTICATED device call. A database that can't be decrypted
+/// (e.g. the master key was replaced) holds nothing recoverable: drop it and answer 404,
+/// so the device re-registers and pushes its list again.
+fn open_or_drop(app: &App, rid: &str) -> Result<Tenant, Response> {
+    match app.tenant(rid) {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(api_error(StatusCode::NOT_FOUND, "no such tenant")),
+        Err(e) if e.contains("not a database") => {
+            tracing::warn!(tenant = %rid, "tenant database unreadable; removing it");
+            match app.remove_tenant(rid) {
+                Ok(()) => Err(api_error(StatusCode::NOT_FOUND, "no such tenant")),
+                Err(e) => Err(internal(e)),
+            }
+        }
+        Err(e) => Err(internal(e)),
     }
 }
 
@@ -457,6 +480,7 @@ async fn register(
                 std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
             }
             private_write(&staging.join("device.pub"), key.as_bytes())?;
+            private_write(&staging.join("key_id"), oauth::new_tenant_id().as_bytes())?;
             private_write(&staging.join("last_seen"), now().to_string().as_bytes())?;
             std::fs::rename(&staging, app2.tenants_dir.join(&rid))?;
             sync_dir(&app2.tenants_dir)
@@ -536,20 +560,29 @@ async fn tenant_api(
                 Err(e) => internal(e),
             };
         }
-        let (_, cortex, paths) = match app2.tenant(&rid) {
-            Ok(Some(t)) => t,
-            Ok(None) => return api_error(StatusCode::NOT_FOUND, "no such tenant"),
-            // The tenant's database can't be decrypted (e.g. the master key was replaced):
-            // nothing in it is recoverable. Drop it, so the device — authenticated above —
-            // re-registers and pushes its list again.
-            Err(e) if e.contains("not a database") => {
-                tracing::warn!(tenant = %rid, "tenant database unreadable; removing it");
-                return match app2.remove_tenant(&rid) {
-                    Ok(()) => api_error(StatusCode::NOT_FOUND, "no such tenant"),
-                    Err(e) => internal(e),
-                };
+        if method == Method::POST && op == "enroll" {
+            // Every enrollment gets a NEW public URL: the tenant directory moves to a fresh
+            // id, so any earlier link (used, expired or leaked) stops working for good.
+            // Keys derive from the internal key_id, which doesn't move.
+            let new_rid = oauth::new_tenant_id();
+            app2.evict(&rid);
+            let Some(new_dir) = app2.tenant_dir(&new_rid) else { return internal("bad tenant id") };
+            if let Err(e) = std::fs::rename(&dir, &new_dir).and_then(|_| sync_dir(&app2.tenants_dir)) {
+                return internal(e);
             }
-            Err(e) => return internal(e),
+            let paths = match open_or_drop(&app2, &new_rid) {
+                Ok((_, _, p)) => p,
+                Err(r) => return r,
+            };
+            return match oauth::open_enrollment(&paths, ENROLL_SECS) {
+                Ok(()) => Json(json!({ "rid": new_rid, "mcp_url": app2.mcp_url(&new_rid), "expires_in": ENROLL_SECS }))
+                    .into_response(),
+                Err(e) => internal(e),
+            };
+        }
+        let (_, cortex, paths) = match open_or_drop(&app2, &rid) {
+            Ok(t) => t,
+            Err(r) => return r,
         };
         match (method.as_str(), op.as_str()) {
             ("PUT", "export") => {
@@ -582,10 +615,6 @@ async fn tenant_api(
                     Err(e) => internal(e),
                 }
             }
-            ("POST", "enroll") => match oauth::open_enrollment(&paths, ENROLL_SECS) {
-                Ok(()) => Json(json!({ "mcp_url": app2.mcp_url(&rid), "expires_in": ENROLL_SECS })).into_response(),
-                Err(e) => internal(e),
-            },
             ("GET", "inbox") => match gateway::inbox_items(&paths) {
                 Ok(items) => {
                     let items: Vec<Value> =
