@@ -582,10 +582,12 @@ name = "cortex-cloud"
 version = "2.4.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "cortex-core",
  "cortex-mcp-server",
+ "ed25519-dalek",
  "hmac",
  "libc",
  "rand 0.8.5",

@@ -4,11 +4,11 @@
 //!
 //! ```text
 //!                      ┌──────────────────── cortex-cloud ────────────────────┐
-//! Muse ── /t/<rid>/… ─▶│ tenant router (cache) ─▶ gateway (unchanged, per dir) │
+//! Muse ── /t/<rid>/… ─▶│ tenant router (LRU) ─▶ gateway (unchanged, per dir)   │  lane: 192
 //!   /.well-known/…/t/<rid>…  (RFC 8414/9728 inserted forms → same tenant)       │
-//! device ── /api/… ───▶│ Ed25519-signed: register · export · enroll · inbox ·  │
-//!                      │ status · delete                                        │
-//!                      │ <data>/tenants/<rid>/export.db  SQLCipher, key = HMAC(master, rid)
+//! device ── /api/… ───▶│ headers checked BEFORE the body is read; Ed25519-signed│  lane: 64
+//!                      │ register · export · enroll · inbox · status · delete   │
+//!                      │ <data>/tenants/<rid>/export.db  SQLCipher raw key = HMAC(master, rid)
 //!                      └────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -22,10 +22,10 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as UrlPath, Request, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -41,12 +41,21 @@ use cortex_core::Cortex;
 use cortex_mcp_server::gateway::{self, cloud, oauth, ExportItem, Paths, TenantConfig};
 
 const ENROLL_SECS: i64 = 30 * 60;
-const TENANT_CACHE: usize = 256;
-const MAX_TENANTS: usize = 100_000;
-const REGISTER_PER_IP_PER_HOUR: u32 = 5;
-const MAX_API_BODY: usize = 16 * 1024 * 1024;
-const IDLE_DAYS: u64 = 90;
-const MAX_CONCURRENT: usize = 256;
+/// Each cached tenant holds two SQLite connections (writer + one reader).
+const TENANT_CACHE: usize = 64;
+const MAX_TENANTS: usize = 20_000;
+const REGISTER_PER_NET_PER_HOUR: u32 = 5;
+const REGISTER_GLOBAL_PER_MINUTE: u32 = 30;
+/// Small bodies (register, enroll, ack, …) vs the export push.
+const MAX_SMALL_BODY: usize = 8 * 1024;
+const MAX_EXPORT_BODY: usize = 12 * 1024 * 1024;
+const BODY_DEADLINE: Duration = Duration::from_secs(20);
+const IDLE_DAYS: i64 = 90;
+/// A tenant that never pushed anything within a day is abandoned (or abuse): reclaim it.
+const UNUSED_TENANT_SECS: i64 = 24 * 3600;
+const API_LANE: usize = 64;
+const MUSE_LANE: usize = 192;
+const MAX_CONCURRENT_OPENS: usize = 4;
 
 #[derive(Parser)]
 #[command(name = "cortex-cloud", about = "Cortex Cloud for Muse (hosts only shared memories)")]
@@ -65,22 +74,39 @@ struct Args {
     master_key: PathBuf,
 }
 
+type Tenant = (Router, Arc<Cortex>, Paths);
+
 struct App {
     base_url: String,
     tenants_dir: PathBuf,
+    trash_dir: PathBuf,
     master: [u8; 32],
     #[cfg(feature = "embeddings")]
     embedder: Option<cortex_core::embedder::Embedder>,
     cache: Mutex<Cache>,
-    /// Serializes nonce-file read-modify-writes (one process owns the data dir).
-    nonce_lock: Mutex<()>,
+    /// Bounds concurrent tenant opens (each costs file descriptors and SQLCipher setup).
+    opens: tokio::sync::Semaphore,
+    /// Per-tenant locks: nonce store read-modify-write and export replacement.
+    tenant_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Nonces of registration requests (no tenant yet), persisted like tenant nonces.
+    register_lock: Mutex<()>,
     register_rate: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    register_global: Mutex<(Instant, u32)>,
+    oauth_rate: Arc<oauth::RateMap>,
 }
 
 #[derive(Default)]
 struct Cache {
-    routers: HashMap<String, (Router, Arc<Cortex>, Paths)>,
+    routers: HashMap<String, Tenant>,
+    /// Least recently used first.
     order: VecDeque<String>,
+}
+
+impl Cache {
+    fn touch(&mut self, rid: &str) {
+        self.order.retain(|r| r != rid);
+        self.order.push_back(rid.to_string());
+    }
 }
 
 fn die(msg: &str) -> ! {
@@ -118,15 +144,27 @@ fn private_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let v: Vec<u8> = (0..64).step_by(2).filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect();
+    v.try_into().ok()
+}
+
 fn load_master(path: &Path) -> [u8; 32] {
     match std::fs::read_to_string(path) {
         Ok(s) => {
-            let s = s.trim();
-            let bytes: Vec<u8> = (0..s.len())
-                .step_by(2)
-                .filter_map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-                .collect();
-            bytes.try_into().unwrap_or_else(|_| die("master key must be 64 hex characters"))
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(path).map(|m| m.permissions().mode()).unwrap_or(0);
+                if mode & 0o077 != 0 {
+                    die("master key file must not be readable by group or others (chmod 600)");
+                }
+            }
+            parse_hex32(&s).unwrap_or_else(|| die("master key must be exactly 64 hex characters"))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let key: [u8; 32] = rand::random();
@@ -141,12 +179,30 @@ fn load_master(path: &Path) -> [u8; 32] {
     }
 }
 
+/// Raise the open-file limit to the hard limit (tenants hold SQLite files open).
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            lim.rlim_cur = lim.rlim_max.min(65_536);
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
 fn api_error(status: StatusCode, msg: &str) -> Response {
     (status, [("cache-control", "no-store")], Json(json!({ "error": msg }))).into_response()
+}
+
+/// Log the detail server-side; tell the client nothing about internals.
+fn internal(detail: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %detail, "internal error");
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
 impl App {
@@ -158,17 +214,35 @@ impl App {
         format!("{}/t/{rid}/mcp", self.base_url)
     }
 
+    fn tenant_lock(&self, rid: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.tenant_locks.lock().unwrap_or_else(|p| p.into_inner());
+        if locks.len() > 4 * TENANT_CACHE {
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
+        }
+        locks.entry(rid.to_string()).or_default().clone()
+    }
+
+    fn cached(&self, rid: &str) -> Option<Tenant> {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let t = cache.routers.get(rid).cloned()?;
+        cache.touch(rid);
+        Some(t)
+    }
+
     /// The tenant's gateway, opening (and caching) it on first use. `None` if no such tenant.
-    fn tenant(&self, rid: &str) -> Result<Option<(Router, Arc<Cortex>, Paths)>, String> {
-        if let Some(t) = self.cache.lock().unwrap_or_else(|p| p.into_inner()).routers.get(rid) {
-            return Ok(Some(t.clone()));
+    fn tenant(&self, rid: &str) -> Result<Option<Tenant>, String> {
+        if let Some(t) = self.cached(rid) {
+            return Ok(Some(t));
         }
         let Some(dir) = self.tenant_dir(rid) else { return Ok(None) };
         if !dir.join("device.pub").is_file() {
             return Ok(None);
         }
+        let Ok(_permit) = self.opens.try_acquire() else {
+            return Err("busy opening tenants".into());
+        };
         let db = dir.join("export.db");
-        let cortex = Cortex::open_encrypted(&db.to_string_lossy(), &hex(&derive(&self.master, "db", rid)))
+        let cortex = Cortex::open_with_raw_key(&db.to_string_lossy(), &derive(&self.master, "db", rid), 1)
             .map_err(|e| format!("tenant storage: {e}"))?;
         #[cfg(feature = "embeddings")]
         let cortex = match &self.embedder {
@@ -177,32 +251,52 @@ impl App {
         };
         let cortex = Arc::new(cortex);
         let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", rid)));
-        let cfg = oauth::OAuthConfig::for_tenant(&self.base_url, rid)?;
+        let cfg = oauth::OAuthConfig::for_tenant(&self.base_url, rid, self.oauth_rate.clone())?;
         let router = gateway::tenant_router(cortex.clone(), paths.clone(), cfg, &TenantConfig::default());
-        let entry = (router, cortex, paths);
+        let entry: Tenant = (router, cortex, paths);
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.routers.len() >= TENANT_CACHE {
-            if let Some(old) = cache.order.pop_front() {
-                cache.routers.remove(&old);
-            }
+        // Deleted while we were opening? Then don't resurrect it.
+        if !dir.join("device.pub").is_file() {
+            return Ok(None);
         }
-        cache.order.push_back(rid.to_string());
+        if let Some(existing) = cache.routers.get(rid).cloned() {
+            cache.touch(rid);
+            return Ok(Some(existing));
+        }
+        while cache.routers.len() >= TENANT_CACHE {
+            let Some(old) = cache.order.pop_front() else { break };
+            cache.routers.remove(&old);
+        }
+        cache.touch(rid);
         cache.routers.insert(rid.to_string(), entry.clone());
         Ok(Some(entry))
     }
 
-    fn evict(&self, rid: &str) {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.routers.remove(rid);
-        cache.order.retain(|r| r != rid);
+    /// Remove a tenant: atomically move its directory out of the namespace (no request can
+    /// resolve it any more), drop it from the cache, then delete it.
+    fn remove_tenant(&self, rid: &str) -> std::io::Result<()> {
+        let Some(dir) = self.tenant_dir(rid) else { return Ok(()) };
+        let trash = self.trash_dir.join(format!("{rid}-{}", rand::random::<u64>()));
+        match std::fs::rename(&dir, &trash) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.routers.remove(rid);
+            cache.order.retain(|r| r != rid);
+        }
+        match std::fs::remove_dir_all(&trash) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Reject a nonce seen within the skew window (persisted, so replay protection survives
-    /// a restart).
-    fn fresh_nonce(&self, dir: &Path, nonce: &str) -> Result<bool, String> {
-        let _g = self.nonce_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let path = dir.join("nonces.json");
-        let mut seen: HashMap<String, i64> = match std::fs::read_to_string(&path) {
+    /// a restart). Caller holds the lock guarding `path`.
+    fn fresh_nonce_at(path: &Path, nonce: &str) -> Result<bool, String> {
+        let mut seen: HashMap<String, i64> = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).map_err(|_| "nonce store corrupt".to_string())?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e.to_string()),
@@ -213,7 +307,7 @@ impl App {
             return Ok(false);
         }
         seen.insert(nonce.to_string(), t);
-        private_write(&path, serde_json::to_string(&seen).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())?;
+        private_write(path, serde_json::to_string(&seen).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())?;
         Ok(true)
     }
 }
@@ -226,42 +320,58 @@ fn target(uri: &Uri) -> String {
     uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| uri.path().to_string())
 }
 
-/// Authenticate a device call for tenant `rid`: signature by the tenant's registered key,
-/// fresh timestamp, unseen nonce. Returns the tenant dir.
-fn authenticate(app: &App, rid: &str, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> Result<PathBuf, Response> {
+/// Cheap checks on headers only, before any body byte is read: the tenant exists, the
+/// declared key is the tenant's key, the timestamp is fresh.
+fn precheck(app: &App, rid: &str, headers: &HeaderMap) -> Result<(PathBuf, String), Response> {
     let not_found = || api_error(StatusCode::NOT_FOUND, "no such tenant");
     let dir = app.tenant_dir(rid).ok_or_else(not_found)?;
     let key = std::fs::read_to_string(dir.join("device.pub")).map_err(|_| not_found())?;
-    let (_, nonce) = cloud::verify(method.as_str(), &target(uri), body, header_fn(headers), Some(key.trim()), now())
-        .map_err(|e| api_error(StatusCode::UNAUTHORIZED, &format!("signature refused: {e:?}")))?;
-    match app.fresh_nonce(&dir, &nonce) {
-        Ok(true) => {}
-        Ok(false) => return Err(api_error(StatusCode::UNAUTHORIZED, "signature refused: replay")),
-        Err(e) => return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, &e)),
+    let key = key.trim().to_string();
+    let h = header_fn(headers);
+    let fresh = h(cloud::H_TS).and_then(|t| t.parse::<i64>().ok()).is_some_and(|t| (now() - t).abs() <= cloud::MAX_SKEW_SECS);
+    if h(cloud::H_KEY).as_deref() != Some(key.as_str()) || !fresh {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "signature refused"));
     }
-    let _ = std::fs::write(dir.join("last_seen"), now().to_string());
-    Ok(dir)
+    Ok((dir, key))
 }
 
-fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+/// Read a body with a size cap and an absolute deadline.
+async fn read_body(headers: &HeaderMap, body: Body, max: usize) -> Result<Bytes, Response> {
+    let declared = headers.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > max) {
+        return Err(api_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large"));
+    }
+    match tokio::time::timeout(BODY_DEADLINE, axum::body::to_bytes(body, max)).await {
+        Ok(Ok(b)) => Ok(b),
+        Ok(Err(_)) => Err(api_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large")),
+        Err(_) => Err(api_error(StatusCode::REQUEST_TIMEOUT, "body too slow")),
+    }
+}
+
+fn client_net(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     // Trust X-Forwarded-For only from the local TLS proxy; take the entry it appended.
-    if peer.ip().is_loopback() {
-        if let Some(ip) = headers
+    let ip = if peer.ip().is_loopback() {
+        headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').next())
             .and_then(|v| v.trim().parse().ok())
-        {
-            return ip;
+            .unwrap_or(peer.ip())
+    } else {
+        peer.ip()
+    };
+    // IPv6: one subscriber is a /64.
+    match ip {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
         }
+        v4 => v4,
     }
-    peer.ip()
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Response> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+    tokio::task::spawn_blocking(f).await.map_err(internal)
 }
 
 // ── Device API ───────────────────────────────────────────────────────────────
@@ -272,22 +382,34 @@ async fn register(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
-    let ip = client_ip(peer, &headers);
+    let net = client_net(peer, &headers);
     {
-        let mut rate = app.register_rate.lock().unwrap_or_else(|p| p.into_inner());
         let now_i = Instant::now();
+        let mut g = app.register_global.lock().unwrap_or_else(|p| p.into_inner());
+        if now_i.duration_since(g.0).as_secs() >= 60 {
+            *g = (now_i, 0);
+        }
+        g.1 += 1;
+        if g.1 > REGISTER_GLOBAL_PER_MINUTE {
+            return api_error(StatusCode::TOO_MANY_REQUESTS, "too many registrations");
+        }
+        let mut rate = app.register_rate.lock().unwrap_or_else(|p| p.into_inner());
         rate.retain(|_, (start, _)| now_i.duration_since(*start).as_secs() < 3600);
-        let slot = rate.entry(ip).or_insert((now_i, 0));
+        let slot = rate.entry(net).or_insert((now_i, 0));
         slot.1 += 1;
-        if slot.1 > REGISTER_PER_IP_PER_HOUR {
+        if slot.1 > REGISTER_PER_NET_PER_HOUR {
             return api_error(StatusCode::TOO_MANY_REQUESTS, "too many registrations");
         }
     }
+    let body = match read_body(&headers, body, MAX_SMALL_BODY).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     // Proof of possession: the request is signed by the key being registered.
-    let key = match cloud::verify(method.as_str(), &target(&uri), &body, header_fn(&headers), None, now()) {
-        Ok((k, _)) => k,
+    let (key, nonce) = match cloud::verify(method.as_str(), &target(&uri), &body, header_fn(&headers), None, now()) {
+        Ok(v) => v,
         Err(e) => return api_error(StatusCode::UNAUTHORIZED, &format!("signature refused: {e:?}")),
     };
     let declared = serde_json::from_slice::<Value>(&body)
@@ -298,36 +420,51 @@ async fn register(
     }
     let app2 = app.clone();
     let out = blocking(move || -> Result<String, Response> {
+        {
+            let _g = app2.register_lock.lock().unwrap_or_else(|p| p.into_inner());
+            match App::fresh_nonce_at(&app2.tenants_dir.with_file_name("register-nonces.json"), &nonce) {
+                Ok(true) => {}
+                Ok(false) => return Err(api_error(StatusCode::UNAUTHORIZED, "signature refused: replay")),
+                Err(e) => return Err(internal(e)),
+            }
+        }
         let count = std::fs::read_dir(&app2.tenants_dir).map(|d| d.count()).unwrap_or(0);
         if count >= MAX_TENANTS {
             return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "service is full"));
         }
+        // Build the directory aside, then rename it into place: the sweeper never sees a
+        // half-made tenant.
         let rid = oauth::new_tenant_id();
-        let dir = app2.tenants_dir.join(&rid);
-        std::fs::create_dir(&dir).map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
-        private_write(&dir.join("device.pub"), key.as_bytes())
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-        let _ = std::fs::write(dir.join("last_seen"), now().to_string());
+        let staging = app2.trash_dir.join(format!("new-{rid}"));
+        let create = || -> std::io::Result<()> {
+            std::fs::create_dir(&staging)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
+            }
+            private_write(&staging.join("device.pub"), key.as_bytes())?;
+            private_write(&staging.join("last_seen"), now().to_string().as_bytes())?;
+            std::fs::rename(&staging, app2.tenants_dir.join(&rid))
+        };
+        create().map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            internal(e)
+        })?;
         Ok(rid)
     })
     .await;
     match out {
-        Ok(Ok(rid)) => (
-            StatusCode::CREATED,
-            Json(json!({ "rid": rid, "mcp_url": app.mcp_url(&rid) })),
-        )
-            .into_response(),
+        Ok(Ok(rid)) => (StatusCode::CREATED, Json(json!({ "rid": rid, "mcp_url": app.mcp_url(&rid) }))).into_response(),
         Ok(Err(r)) | Err(r) => r,
     }
 }
 
 #[derive(Deserialize)]
 struct ExportBody {
+    /// Device clock (ms) when the snapshot was taken; older pushes are refused.
+    #[serde(default)]
+    version: i64,
     items: Vec<ExportBodyItem>,
 }
 
@@ -343,54 +480,81 @@ struct AckBody {
     ids: Vec<String>,
 }
 
-/// One handler for every signed tenant operation: authenticate, then dispatch.
+/// One handler for every signed tenant operation: header precheck, bounded body read,
+/// signature + nonce, then dispatch.
 async fn tenant_api(
     State(app): State<Arc<App>>,
     UrlPath(params): UrlPath<Vec<(String, String)>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let rid = params.iter().find(|(k, _)| k == "rid").map(|(_, v)| v.clone()).unwrap_or_default();
     let op = params.iter().find(|(k, _)| k == "op").map(|(_, v)| v.clone()).unwrap_or_default();
-    let op = match (method.as_str(), uri.path().ends_with("/inbox/ack"), op.as_str()) {
-        ("POST", true, _) => "ack".to_string(),
-        (_, _, op) => op.to_string(),
+    let op = if method == Method::POST && uri.path().ends_with("/inbox/ack") { "ack".to_string() } else { op };
+    let (dir, key) = match precheck(&app, &rid, &headers) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let max = if op == "export" { MAX_EXPORT_BODY } else { MAX_SMALL_BODY };
+    let body = match read_body(&headers, body, max).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let nonce = match cloud::verify(method.as_str(), &target(&uri), &body, header_fn(&headers), Some(&key), now()) {
+        Ok((_, n)) => n,
+        Err(_) => return api_error(StatusCode::UNAUTHORIZED, "signature refused"),
     };
     let app2 = app.clone();
     let out = blocking(move || -> Response {
-        let dir = match authenticate(&app2, &rid, &method, &uri, &headers, &body) {
-            Ok(d) => d,
-            Err(r) => return r,
-        };
+        let lock = app2.tenant_lock(&rid);
+        let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        match App::fresh_nonce_at(&dir.join("nonces.json"), &nonce) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::UNAUTHORIZED, "signature refused: replay"),
+            Err(e) => return internal(e),
+        }
+        let _ = private_write(&dir.join("last_seen"), now().to_string().as_bytes());
         if method == Method::DELETE && op.is_empty() {
-            app2.evict(&rid);
-            return match std::fs::remove_dir_all(&dir) {
-                Ok(()) => api_error(StatusCode::OK, "deleted").into_response(),
-                Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            return match app2.remove_tenant(&rid) {
+                Ok(()) => Json(json!({ "deleted": true })).into_response(),
+                Err(e) => internal(e),
             };
         }
         let (_, cortex, paths) = match app2.tenant(&rid) {
             Ok(Some(t)) => t,
             Ok(None) => return api_error(StatusCode::NOT_FOUND, "no such tenant"),
-            Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            Err(e) => return internal(e),
         };
         match (method.as_str(), op.as_str()) {
             ("PUT", "export") => {
                 let Ok(b) = serde_json::from_slice::<ExportBody>(&body) else {
-                    return api_error(StatusCode::BAD_REQUEST, "expected {items:[{text, embedding?}]}");
+                    return api_error(StatusCode::BAD_REQUEST, "expected {version, items:[{text, embedding?}]}");
                 };
+                // Serialized by the tenant lock; a snapshot older than the last applied one
+                // is refused, so an unshared item can never come back from a stale push.
+                let vpath = dir.join("export.version");
+                let applied = std::fs::read_to_string(&vpath).ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+                if b.version <= applied {
+                    return api_error(StatusCode::CONFLICT, "stale export snapshot");
+                }
                 let items: Vec<ExportItem> =
                     b.items.into_iter().map(|i| ExportItem { text: i.text, embedding: i.embedding }).collect();
                 match gateway::replace_export(&cortex, &items) {
-                    Ok(n) => Json(json!({ "count": n })).into_response(),
+                    Ok(n) => {
+                        if let Err(e) = private_write(&vpath, b.version.to_string().as_bytes()) {
+                            return internal(e);
+                        }
+                        let _ = private_write(&dir.join("pushed"), b"1");
+                        Json(json!({ "count": n })).into_response()
+                    }
                     Err(e) => api_error(StatusCode::BAD_REQUEST, &e),
                 }
             }
             ("POST", "enroll") => match oauth::open_enrollment(&paths, ENROLL_SECS) {
                 Ok(()) => Json(json!({ "mcp_url": app2.mcp_url(&rid), "expires_in": ENROLL_SECS })).into_response(),
-                Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+                Err(e) => internal(e),
             },
             ("GET", "inbox") => match gateway::inbox_items(&paths) {
                 Ok(items) => {
@@ -398,7 +562,7 @@ async fn tenant_api(
                         items.into_iter().map(|i| json!({ "id": i.id, "ts": i.ts, "text": i.text })).collect();
                     ([("cache-control", "no-store")], Json(json!({ "items": items }))).into_response()
                 }
-                Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+                Err(e) => internal(e),
             },
             ("POST", "ack") => {
                 let Ok(b) = serde_json::from_slice::<AckBody>(&body) else {
@@ -406,14 +570,15 @@ async fn tenant_api(
                 };
                 match gateway::inbox_ack(&paths, &b.ids) {
                     Ok(n) => Json(json!({ "removed": n })).into_response(),
-                    Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+                    Err(e) => internal(e),
                 }
             }
             ("GET", "status") => {
-                let (connected, last_used) = oauth::grant_summary(&paths).unwrap_or((0, None));
+                let (connected, connected_at, last_used) = oauth::grant_summary(&paths).unwrap_or((0, None, None));
                 Json(json!({
                     "shared": gateway::export_count(&cortex),
                     "connected": connected,
+                    "connected_at": connected_at,
                     "last_used": last_used,
                 }))
                 .into_response()
@@ -449,16 +614,21 @@ async fn route_tenant(State(app): State<Arc<App>>, req: Request) -> Response {
     let Some((rid, inner_path)) = split_tenant(req.uri().path()).map(|(r, p)| (r.to_string(), p)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let app2 = app.clone();
-    let rid2 = rid.clone();
-    let router = match blocking(move || app2.tenant(&rid2)).await {
-        Ok(Ok(Some((router, _, _)))) => router,
-        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "tenant open failed");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let router = match app.cached(&rid) {
+        Some((router, _, _)) => router,
+        None => {
+            let app2 = app.clone();
+            let rid2 = rid.clone();
+            match blocking(move || app2.tenant(&rid2)).await {
+                Ok(Ok(Some((router, _, _)))) => router,
+                Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "tenant open failed");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                Err(r) => return r,
+            }
         }
-        Err(r) => return r,
     };
     let (mut parts, body) = req.into_parts();
     let pq = match parts.uri.query() {
@@ -476,33 +646,51 @@ async fn route_tenant(State(app): State<Arc<App>>, req: Request) -> Response {
 }
 
 fn app_router(app: Arc<App>) -> Router {
+    // Two lanes: the device API can't starve Muse, and vice versa. Bodies are read inside
+    // the handlers, after the header precheck, with per-route caps.
     let api = Router::new()
         .route("/api/tenants", post(register))
         .route("/api/tenants/{rid}", delete(tenant_api))
         .route("/api/tenants/{rid}/{op}", get(tenant_api).put(tenant_api).post(tenant_api))
         .route("/api/tenants/{rid}/inbox/ack", post(tenant_api))
-        .layer(DefaultBodyLimit::max(MAX_API_BODY));
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(API_LANE));
     Router::new()
         .merge(api)
         .route("/healthz", get(|| async { "ok" }))
-        .fallback(route_tenant)
-        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT))
+        .fallback_service(
+            Router::new()
+                .fallback(route_tenant)
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(MUSE_LANE))
+                .with_state(app.clone()),
+        )
         .with_state(app)
 }
 
-/// Delete tenants whose device hasn't called in `IDLE_DAYS`.
-fn sweep_idle(tenants_dir: &Path, app: &App) {
-    let Ok(entries) = std::fs::read_dir(tenants_dir) else { return };
-    let cutoff = now() - (IDLE_DAYS * 86_400) as i64;
+/// Delete tenants whose device hasn't called in `IDLE_DAYS`, and tenants that never pushed
+/// anything within a day of registering. Also empties leftovers in the trash.
+fn sweep(app: &App) {
+    if let Ok(entries) = std::fs::read_dir(&app.trash_dir) {
+        for e in entries.flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+            if old.is_some_and(|d| d.as_secs() > 3600) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&app.tenants_dir) else { return };
+    let t = now();
     for e in entries.flatten() {
         let rid = e.file_name().to_string_lossy().to_string();
+        if !oauth::is_tenant_id(&rid) {
+            continue;
+        }
         let last = std::fs::read_to_string(e.path().join("last_seen"))
             .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .unwrap_or(0);
-        if oauth::is_tenant_id(&rid) && last < cutoff {
-            app.evict(&rid);
-            let _ = std::fs::remove_dir_all(e.path());
+            .and_then(|s| s.trim().parse::<i64>().ok());
+        let Some(last) = last else { continue }; // being created or damaged: leave it
+        let never_pushed = !e.path().join("pushed").exists();
+        let expired = t - last > IDLE_DAYS * 86_400 || (never_pushed && t - last > UNUSED_TENANT_SECS);
+        if expired && app.remove_tenant(&rid).is_ok() {
             tracing::info!(tenant = %rid, "deleted idle tenant");
         }
     }
@@ -513,10 +701,14 @@ fn build_app(args: &Args) -> Arc<App> {
         .map(|c| c.issuer)
         .unwrap_or_else(|e| die(&e.replace("--public-url", "--base-url")));
     let tenants_dir = args.data_dir.join("tenants");
-    std::fs::create_dir_all(&tenants_dir).unwrap_or_else(|e| die(&e.to_string()));
+    let trash_dir = args.data_dir.join("trash");
+    for d in [&tenants_dir, &trash_dir] {
+        std::fs::create_dir_all(d).unwrap_or_else(|e| die(&e.to_string()));
+    }
     Arc::new(App {
         base_url,
         tenants_dir,
+        trash_dir,
         master: load_master(&args.master_key),
         #[cfg(feature = "embeddings")]
         embedder: if std::env::var("CORTEX_NO_EMBEDDINGS").is_ok_and(|v| !v.is_empty()) {
@@ -525,25 +717,29 @@ fn build_app(args: &Args) -> Arc<App> {
             cortex_core::embedder::Embedder::new().ok()
         },
         cache: Mutex::new(Cache::default()),
-        nonce_lock: Mutex::new(()),
+        opens: tokio::sync::Semaphore::new(MAX_CONCURRENT_OPENS),
+        tenant_locks: Mutex::new(HashMap::new()),
+        register_lock: Mutex::new(()),
         register_rate: Mutex::new(HashMap::new()),
+        register_global: Mutex::new((Instant::now(), 0)),
+        oauth_rate: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 
 fn main() {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    raise_fd_limit();
     let args = Args::parse();
     let app = build_app(&args);
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(&e.to_string()));
     rt.block_on(async move {
         let sweeper = app.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(86_400));
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tick.tick().await;
                 let a = sweeper.clone();
-                let dir = a.tenants_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || sweep_idle(&dir, &a)).await;
+                let _ = tokio::task::spawn_blocking(move || sweep(&a)).await;
             }
         });
         let listener = tokio::net::TcpListener::bind(args.listen).await.unwrap_or_else(|e| die(&e.to_string()));
@@ -581,5 +777,20 @@ mod tests {
         let m = [9u8; 32];
         assert_ne!(derive(&m, "db", "a"), derive(&m, "db", "b"));
         assert_ne!(derive(&m, "db", "a"), derive(&m, "inbox", "a"));
+    }
+
+    #[test]
+    fn master_key_parsing_is_strict() {
+        assert!(parse_hex32(&"ab".repeat(32)).is_some());
+        assert!(parse_hex32(&"ab".repeat(31)).is_none());
+        assert!(parse_hex32(&format!("{}zz", "ab".repeat(31))).is_none());
+    }
+
+    #[test]
+    fn ipv6_clients_are_grouped_by_64() {
+        let h = HeaderMap::new();
+        let a: SocketAddr = "[2001:db8:1:2:aaaa::1]:1".parse().unwrap();
+        let b: SocketAddr = "[2001:db8:1:2:bbbb::9]:1".parse().unwrap();
+        assert_eq!(client_net(a, &h), client_net(b, &h));
     }
 }

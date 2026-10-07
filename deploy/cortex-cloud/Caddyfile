@@ -1,0 +1,17 @@
+# Cortex Cloud for Muse — TLS in front of cortex-cloud (127.0.0.1:8787).
+# Replace muse.example.com with the real host; Caddy gets the certificate itself.
+muse.example.com {
+	encode zstd gzip
+	# Never log request bodies or query strings (consent capabilities live there).
+	log {
+		output file /var/log/caddy/cortex-cloud.log
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+			}
+		}
+	}
+	reverse_proxy 127.0.0.1:8787
+}

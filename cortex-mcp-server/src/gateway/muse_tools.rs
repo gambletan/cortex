@@ -11,8 +11,9 @@
 //! ```
 //!
 //! The local `muse-export` namespace stays the source of truth; the cloud only ever holds
-//! a copy of it. The device key is a 0600 file next to the database (the same protection
-//! as the memories themselves).
+//! a copy of it. The device key lives in the OS keychain (macOS), else in a 0600 file next
+//! to the database. Sharing is two-step: the first call returns exactly what would be
+//! shared plus a confirmation code; only a second call with that code shares it.
 
 use std::path::PathBuf;
 
@@ -23,17 +24,25 @@ use uuid::Uuid;
 use cortex_core::types::PrivacyLevel;
 use cortex_core::Cortex;
 
-use super::cloud::{Device, DEFAULT_CLOUD_URL};
+use super::cloud::{Device, DEFAULT_CLOUD_URL, GONE};
 use super::{allow, export_rows, private_options, read_private};
 use crate::tools::content_to_string;
 
 const STATE_FILE: &str = "muse-cloud.json";
 const KEY_FILE: &str = "muse-device.key";
 
+const CONFIRM_TTL_SECS: i64 = 15 * 60;
+
 #[derive(Serialize, Deserialize, Default)]
 struct State {
     rid: Option<String>,
     base_url: Option<String>,
+    /// A local change hasn't reached the cloud yet (retried on the next muse_* call).
+    #[serde(default)]
+    dirty: bool,
+    /// Pending confirmation: code, hash of exactly what will be shared, expiry.
+    #[serde(default)]
+    confirm: Option<(String, String, i64)>,
 }
 
 fn dir(cortex: &Cortex) -> Result<PathBuf, String> {
@@ -61,23 +70,48 @@ fn save_state(cortex: &Cortex, st: &State) -> Result<(), String> {
     write_private(&dir(cortex)?.join(STATE_FILE), &serde_json::to_vec(st).map_err(|e| e.to_string())?)
 }
 
-/// The device, creating its key on first use.
+fn parse_key(hex: &str) -> Result<[u8; 32], String> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return Err("Muse device key is corrupt".into());
+    }
+    (0..64)
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect::<Option<Vec<u8>>>()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| "Muse device key is corrupt".into())
+}
+
+/// Keychain account for this database's device key.
+fn keychain_account(cortex: &Cortex) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let db = cortex.db_path().ok_or("Muse needs an on-disk Cortex database")?;
+    let h: String = Sha256::digest(db.to_string_lossy().as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Ok(format!("muse-device-{h}"))
+}
+
+/// The device, creating its key on first use (keychain first, 0600 file otherwise).
 fn device(cortex: &Cortex) -> Result<Device, String> {
+    use cortex_core::sync::secret::{load_secret, store_secret};
     let st = load_state(cortex)?;
     let key_path = dir(cortex)?.join(KEY_FILE);
-    let secret: [u8; 32] = match read_private(&key_path) {
-        Ok(hex) => (0..64)
-            .step_by(2)
-            .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-            .collect::<Option<Vec<u8>>>()
-            .and_then(|v| v.try_into().ok())
-            .ok_or("Muse device key is corrupt")?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let s = Device::generate_secret();
-            write_private(&key_path, s.iter().map(|b| format!("{b:02x}")).collect::<String>().as_bytes())?;
-            s
+    let account = keychain_account(cortex)?;
+    let secret: [u8; 32] = if let Some(hex) = load_secret(&account) {
+        parse_key(&hex)?
+    } else {
+        match read_private(&key_path) {
+            Ok(hex) => parse_key(&hex)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let s = Device::generate_secret();
+                let hex: String = s.iter().map(|b| format!("{b:02x}")).collect();
+                if !store_secret(&account, &hex) {
+                    write_private(&key_path, hex.as_bytes())?;
+                }
+                s
+            }
+            Err(e) => return Err(e.to_string()),
         }
-        Err(e) => return Err(e.to_string()),
     };
     let base_url = std::env::var("CORTEX_CLOUD_URL")
         .ok()
@@ -87,12 +121,79 @@ fn device(cortex: &Cortex) -> Result<Device, String> {
     Ok(Device::new(secret, st.rid, base_url))
 }
 
+/// Push the whole shared list. On failure the state is marked dirty and every later
+/// muse_* call retries first, so an unshare can't silently stay visible in the cloud.
 fn push(cortex: &Cortex, dev: &Device) -> Result<u64, String> {
+    // Version = when the snapshot was taken, so a slower, older push can never win.
+    let version = chrono::Utc::now().timestamp_millis();
     let items: Vec<(String, Option<Vec<f32>>)> = export_rows(cortex)?
         .into_iter()
         .map(|m| (content_to_string(&m.content), m.embedding.map(|e| e.as_ref().clone())))
         .collect();
-    dev.push_export(&items)
+    let out = dev.push_export(version, &items);
+    let mut st = load_state(cortex)?;
+    st.dirty = out.is_err();
+    save_state(cortex, &st)?;
+    out.map_err(|e| format!("{e}. Muse may still see the previous list until this is retried (automatically, on the next Muse action)."))
+}
+
+/// Retry a push that failed earlier.
+fn settle(cortex: &Cortex, dev: &Device) -> Result<(), String> {
+    if dev.rid.is_some() && load_state(cortex)?.dirty {
+        push(cortex, dev)?;
+    }
+    Ok(())
+}
+
+/// Exactly what a share call would add: (memory id or text) → text.
+fn planned(cortex: &Cortex, args: &Value) -> Result<Vec<String>, String> {
+    let mut texts = Vec::new();
+    for id in ids_arg(args, "memory_ids") {
+        let id = Uuid::parse_str(&id).map_err(|_| format!("not a memory id: {id}"))?;
+        let mem = cortex
+            .storage()
+            .get_memory(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no memory with id {id}"))?;
+        texts.push(content_to_string(&mem.content));
+    }
+    texts.extend(ids_arg(args, "texts").into_iter().filter(|t| !t.trim().is_empty()));
+    Ok(texts)
+}
+
+fn plan_hash(texts: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for t in texts {
+        h.update(t.as_bytes());
+        h.update([0u8]);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Two-step sharing. Without a valid `confirmation`, returns the preview and a fresh code
+/// (nothing is shared). With it, and for exactly the same items, lets the caller proceed.
+fn confirmed(cortex: &Cortex, args: &Value, texts: &[String]) -> Result<Option<Value>, String> {
+    let mut st = load_state(cortex)?;
+    let hash = plan_hash(texts);
+    let now = chrono::Utc::now().timestamp();
+    let given = args.get("confirmation").and_then(Value::as_str);
+    if let (Some(code), Some((want, h, exp))) = (given, &st.confirm) {
+        if code == want && *h == hash && *exp > now {
+            st.confirm = None;
+            save_state(cortex, &st)?;
+            return Ok(None);
+        }
+    }
+    let code: String = Uuid::new_v4().simple().to_string()[..8].to_string();
+    st.confirm = Some((code.clone(), hash, now + CONFIRM_TTL_SECS));
+    save_state(cortex, &st)?;
+    Ok(Some(json!({
+        "needs_confirmation": true,
+        "will_share_with_muse": texts,
+        "confirmation": code,
+        "next_step": "Show the user exactly this list and ask whether Muse may see it. Only if they say yes, call this tool again with the same arguments plus this confirmation. Nothing has been shared yet.",
+    })))
 }
 
 fn ids_arg(args: &Value, key: &str) -> Vec<String> {
@@ -102,26 +203,12 @@ fn ids_arg(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Copy memories (by id) or new texts into the local export. Returns how many were added.
-fn add_to_export(cortex: &Cortex, args: &Value) -> Result<usize, String> {
-    let mut n = 0;
-    for id in ids_arg(args, "memory_ids") {
-        let id = Uuid::parse_str(&id).map_err(|_| format!("not a memory id: {id}"))?;
-        let mem = cortex
-            .storage()
-            .get_memory(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("no memory with id {id}"))?;
-        allow(cortex, &content_to_string(&mem.content))?;
-        n += 1;
+/// Copy confirmed texts into the local export. Returns how many were added.
+fn add_to_export(cortex: &Cortex, texts: &[String]) -> Result<usize, String> {
+    for t in texts {
+        allow(cortex, t)?;
     }
-    for text in ids_arg(args, "texts") {
-        if !text.trim().is_empty() {
-            allow(cortex, &text)?;
-            n += 1;
-        }
-    }
-    Ok(n)
+    Ok(texts.len())
 }
 
 fn shared_list(cortex: &Cortex) -> Result<Vec<Value>, String> {
@@ -136,13 +223,13 @@ pub fn schemas() -> Vec<Value> {
     vec![
         json!({
             "name": "muse_connect",
-            "description": "Connect the user's memory to Meta Muse (works on their phone, even with this computer off). Muse will only see the memories the user explicitly agrees to share; everything else stays on their devices. Steps: (1) find candidate memories with memory_search (preferences, facts the user wants Muse to know), (2) ASK the user which to share, (3) call this with their memory_ids (and/or short texts). Returns a link: tell the user to paste it into Muse and tap Allow on the page that opens. Connecting again disconnects any earlier Muse connection.",
-            "inputSchema": { "type": "object", "properties": { "memory_ids": ids, "texts": ids } }
+            "description": "Connect the user's memory to Meta Muse (works on their phone, even with this computer off). Muse will only see the memories the user explicitly agrees to share; everything else stays on their devices. Steps: (1) find candidate memories with memory_search (preferences, facts the user wants Muse to know), (2) call this with the chosen memory_ids (and/or short texts): it returns exactly what would be shared plus a confirmation code and shares nothing yet, (3) show the user that list and, only if they agree, call again with the same arguments plus the confirmation. Returns a link: tell the user to paste it into Muse and tap Allow on the page that opens. Connecting again disconnects any earlier Muse connection.",
+            "inputSchema": { "type": "object", "properties": { "memory_ids": ids, "texts": ids, "confirmation": { "type": "string" } } }
         }),
         json!({
             "name": "muse_share",
-            "description": "Let Muse see more memories (by memory id, or new short texts). Only call after the user agreed.",
-            "inputSchema": { "type": "object", "properties": { "memory_ids": ids, "texts": ids } }
+            "description": "Let Muse see more memories (by memory id, or new short texts). Two steps: the first call returns exactly what would be shared and a confirmation code; show it to the user and, only if they agree, call again with the same arguments plus the confirmation.",
+            "inputSchema": { "type": "object", "properties": { "memory_ids": ids, "texts": ids, "confirmation": { "type": "string" } } }
         }),
         json!({
             "name": "muse_unshare",
@@ -180,19 +267,40 @@ pub fn call(cortex: &Cortex, name: &str, args: &Value) -> Option<Result<String, 
     Some(out.map(|v| v.to_string()))
 }
 
+fn register(cortex: &Cortex, dev: &mut Device) -> Result<(), String> {
+    dev.register()?;
+    let mut st = load_state(cortex)?;
+    st.rid = dev.rid.clone();
+    st.base_url = Some(dev.base_url.clone());
+    save_state(cortex, &st)
+}
+
 fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
-    let added = add_to_export(cortex, args)?;
+    let texts = planned(cortex, args)?;
+    if !texts.is_empty() {
+        if let Some(preview) = confirmed(cortex, args, &texts)? {
+            return Ok(preview);
+        }
+    }
+    let added = add_to_export(cortex, &texts)?;
     let shared = export_rows(cortex)?.len();
     if shared == 0 {
         return Err("Nothing is shared yet. Find memories with memory_search, ask the user which ones Muse may see, then call muse_connect with their memory_ids.".into());
     }
     let mut dev = device(cortex)?;
     if dev.rid.is_none() {
-        dev.register()?;
-        save_state(cortex, &State { rid: dev.rid.clone(), base_url: Some(dev.base_url.clone()) })?;
+        register(cortex, &mut dev)?;
     }
-    push(cortex, &dev)?;
-    let (link, expires) = dev.enroll()?;
+    let (link, expires) = match push(cortex, &dev).and_then(|_| dev.enroll()) {
+        Err(e) if e.starts_with(GONE) => {
+            // The service lost this connection (expired or deleted): start a fresh one.
+            dev.rid = None;
+            register(cortex, &mut dev)?;
+            push(cortex, &dev)?;
+            dev.enroll()?
+        }
+        other => other?,
+    };
     Ok(json!({
         "link": link,
         "shared": shared,
@@ -208,7 +316,14 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
 }
 
 fn share(cortex: &Cortex, args: &Value) -> Result<Value, String> {
-    let added = add_to_export(cortex, args)?;
+    let texts = planned(cortex, args)?;
+    if texts.is_empty() {
+        return Err("Give memory_ids or texts to share.".into());
+    }
+    if let Some(preview) = confirmed(cortex, args, &texts)? {
+        return Ok(preview);
+    }
+    let added = add_to_export(cortex, &texts)?;
     let dev = device(cortex)?;
     let pushed = if dev.rid.is_some() { Some(push(cortex, &dev)?) } else { None };
     Ok(json!({ "added": added, "shared": export_rows(cortex)?.len(), "synced_to_cloud": pushed.is_some() }))
@@ -216,6 +331,9 @@ fn share(cortex: &Cortex, args: &Value) -> Result<Value, String> {
 
 fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     let ids = ids_arg(args, "shared_ids");
+    if ids.is_empty() {
+        return Err("Give shared_ids (from muse_status).".into());
+    }
     let export: Vec<Uuid> = export_rows(cortex)?.into_iter().map(|m| m.id).collect();
     let mut removed = 0;
     for id in &ids {
@@ -239,12 +357,21 @@ fn status(cortex: &Cortex) -> Result<Value, String> {
     if dev.rid.is_none() {
         return Ok(json!({ "connected": false, "shared": shared }));
     }
-    let cloud = dev.status()?;
+    settle(cortex, &dev)?;
+    let cloud = match dev.status() {
+        Err(e) if e.starts_with(GONE) => {
+            return Ok(json!({ "connected": false, "shared": shared, "note": "The cloud connection expired; muse_connect starts a new one." }))
+        }
+        other => other?,
+    };
     let inbox = dev.inbox().map(|i| i.len()).unwrap_or(0);
     Ok(json!({
         "connected": cloud.get("connected").and_then(Value::as_u64).unwrap_or(0) > 0,
+        "muse_connected_at": cloud.get("connected_at").and_then(Value::as_i64)
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
         "muse_last_read": cloud.get("last_used").and_then(Value::as_i64)
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
+        "check_with_user": "If the user didn't connect Muse at muse_connected_at, run muse_connect again: it cancels every earlier connection.",
         "shared": shared,
         "waiting_in_inbox": inbox,
     }))
@@ -255,6 +382,7 @@ fn inbox(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if dev.rid.is_none() {
         return Err("Muse isn't connected (muse_connect first).".into());
     }
+    settle(cortex, &dev)?;
     let items = dev.inbox()?;
     let keep = ids_arg(args, "keep");
     let discard = ids_arg(args, "discard");
@@ -284,7 +412,10 @@ fn inbox(cortex: &Cortex, args: &Value) -> Result<Value, String> {
 fn disconnect(cortex: &Cortex) -> Result<Value, String> {
     let dev = device(cortex)?;
     if dev.rid.is_some() {
-        dev.delete()?;
+        match dev.delete() {
+            Err(e) if !e.starts_with(GONE) => return Err(e),
+            _ => {} // deleted, or already gone
+        }
     }
     save_state(cortex, &State::default())?;
     Ok(json!({

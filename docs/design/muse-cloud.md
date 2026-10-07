@@ -38,12 +38,19 @@ agent does everything; the user never touches a terminal.
 The link is the only credential the human ever sees: an enrollment capability, single use,
 30 min, shown only in the user's own AI chat. No passkey, QR, email or password.
 
-Hardening that costs the user nothing (Codex review):
-- **Pairing code at a glance**: the consent page shows "Code 4821"; the agent already told
-  the user in chat to expect 4821. A mismatch means someone else used the link first.
+Hardening that costs the user nothing (Codex review, revised after adversarial review):
+- ~~Pairing code~~ — dropped: the code would be per window, so whoever races the link sees
+  the same code; it detects nothing. Instead, a late click on a used link says **"This link
+  was already used to connect. If that wasn't you, ask your AI to connect Muse again"**, and
+  `muse_status` returns `muse_connected_at` with an instruction for the agent to ask the user
+  "was that you?". Reconnecting revokes every earlier grant.
+- **Sharing is two-step**: `muse_connect` / `muse_share` first return exactly what would be
+  shared and a confirmation code bound to that exact list (15 min); nothing is shared until
+  a second call carries the code. (A prompt-injected agent can still call twice; the MCP
+  client's own per-tool approval is the human gate. This makes the agent show the list.)
 - Only the enrollment hash is stored. GETs, link previews and discovery never consume it;
   **POST Allow** consumes the enrollment and mints the code in one SQL transaction.
-- Consent page: session-bound CSRF token + Origin check, Secure/HttpOnly/SameSite cookie,
+- Consent page: session-bound CSRF token + **required** same-origin `Origin`, Secure/HttpOnly/SameSite cookie,
   frame-ancestors none, no-store, no-referrer, no third-party assets, link redacted from logs.
   The page binds client, exact redirect_uri, resource, PKCE challenge and the export
   version shown.
@@ -84,8 +91,9 @@ device ── /api/… ────▶│ register · put export · new enrollme
    (`rid` = 128-bit random, validated charset) and never touches another. Tests assert a
    token from tenant A is useless on `/mcp/<B>`.
 2. **At rest:** each tenant's export DB is SQLCipher (already the `cortex-core` default)
-   with a raw 256-bit key derived as HKDF(master key, rid) — raw key, so no per-open
-   PBKDF cost. Master key outside the data dir. **No backups** of tenant data: the device is
+   with a raw 256-bit key = HMAC-SHA256(master key, "db" ‖ rid) — raw key
+   (`Cortex::open_with_raw_key`), so no per-open PBKDF cost; one read connection per
+   tenant. Inbox text sealed with AES-256-GCM under HMAC(master, "inbox" ‖ rid). Master key outside the data dir. **No backups** of tenant data: the device is
    the source of truth and re-pushes.
 3. **OAuth per tenant:** issuer `https://<host>/t/<rid>` (RFC 8414 path issuer), PRM at
    `/.well-known/oauth-protected-resource/mcp/<rid>`, so `oauth.rs` state stays per
@@ -99,7 +107,14 @@ device ── /api/… ────▶│ register · put export · new enrollme
    Server: ±300 s skew, nonce stored per tenant until it falls out of the window (file under
    the tenant lock, so replay protection survives restarts); a bad signature, stale time or
    reused nonce → 401. The tenant is created by the first signed `POST /api/tenants` (key
-   registered; trust on first use). Endpoints: `POST /api/tenants` (create; returns rid +
+   registered; trust on first use; registration nonces persisted too). The tenant, the key
+   and the timestamp are checked from headers **before any body byte is read**; bodies are
+   capped per route (8 KiB, export 12 MiB) with an absolute read deadline. Registration is
+   rate-limited per client network (IPv6 /64) and globally; at most 20 000 tenants; a tenant
+   that never pushes within a day is reclaimed. Export pushes carry a `version` (device ms
+   when the snapshot was taken) and are serialized per tenant; an older version is refused
+   (409), so a slow stale push can't resurrect an unshared item. Export items ≤ 2000 chars,
+   embeddings exactly 384-dim. Endpoints: `POST /api/tenants` (create; returns rid +
    token; rate limit per IP + global cap), `PUT /api/tenants/<rid>/export` (full snapshot:
    text + vector, ≤ 1000 items, replaces atomically), `POST …/enroll` (new link + pairing
    code; revokes existing grants), `GET …/inbox` + `POST …/inbox/ack` (remember items,
@@ -125,7 +140,10 @@ device ── /api/… ────▶│ register · put export · new enrollme
 ### Performance
 - **One shared embedder** for all tenants (today each `Cortex` lazily loads its own model,
   ~90 MB each): construct once, inject into every tenant instance.
-- Tenant `Cortex` handles in an LRU cache (cap 256), opened on demand.
+- Tenant `Cortex` handles in a true LRU cache (cap 64; ~2 file descriptors each), at most
+  4 concurrent opens; the process raises its fd limit. Two concurrency lanes (device API
+  64, Muse 192). Deletion renames the tenant dir out of the namespace first, so no request
+  can resurrect it.
 - Per-request cost stays as in the gateway (≤ 1000 rows scored, file-state reads).
 
 ## Architecture (original sketch)
@@ -146,8 +164,8 @@ format, terminal/HTML escaping. Embeddings: the device uploads each export item'
 
 ### Identity
 
-- **Device**: Ed25519 key in the OS keychain; every device API request is signed (see
-  decision 4). No bearer device secret.
+- **Device**: Ed25519 key in the OS keychain (macOS), else a 0600 file next to the local
+  database; every device API request is signed (see decision 4). No bearer device secret.
 - **Human**: no account. Control happens on the device (through the agent), which is
   already the user's trust anchor. Consent for Muse = the enrollment link (single use,
   30 min, 256-bit) + one tap.

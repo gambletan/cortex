@@ -29,8 +29,10 @@ pub const H_TS: &str = "x-cortex-ts";
 pub const H_NONCE: &str = "x-cortex-nonce";
 pub const H_SIG: &str = "x-cortex-sig";
 /// Where the hosted service lives; `CORTEX_CLOUD_URL` overrides (self-hosting, tests).
-pub const DEFAULT_CLOUD_URL: &str = "https://muse.cortexmem.ai";
+pub const DEFAULT_CLOUD_URL: &str = "https://studio.alvinsclub.ai";
 const PROTOCOL: &str = "cortex-cloud-v1";
+/// Error text when the service no longer knows this device's tenant (deleted or expired).
+pub const GONE: &str = "Cortex Cloud no longer has this connection";
 
 /// The exact bytes that are signed. `path_and_query` is the request target as sent.
 pub fn canonical(method: &str, path_and_query: &str, body: &[u8], ts: i64, nonce: &str) -> Vec<u8> {
@@ -140,6 +142,7 @@ impl Device {
                     serde_json::from_str(&text).map_err(|_| "unexpected response from Cortex Cloud".to_string())
                 }
             }
+            Err(ureq::Error::Status(404, _)) => Err(GONE.to_string()),
             Err(ureq::Error::Status(code, r)) => {
                 let msg = r
                     .into_string()
@@ -165,9 +168,12 @@ impl Device {
         Ok(rid)
     }
 
-    pub fn push_export(&self, items: &[(String, Option<Vec<f32>>)]) -> Result<u64, String> {
+    /// Replace the cloud copy of the shared list. `version` is when the snapshot was taken
+    /// (ms); the service refuses anything older than what it already applied.
+    pub fn push_export(&self, version: i64, items: &[(String, Option<Vec<f32>>)]) -> Result<u64, String> {
         let items: Vec<Value> = items.iter().map(|(t, e)| json!({ "text": t, "embedding": e })).collect();
-        let v = self.call("PUT", &format!("/api/tenants/{}/export", self.rid()?), Some(&json!({ "items": items })))?;
+        let body = json!({ "version": version, "items": items });
+        let v = self.call("PUT", &format!("/api/tenants/{}/export", self.rid()?), Some(&body))?;
         Ok(v.get("count").and_then(Value::as_u64).unwrap_or(0))
     }
 

@@ -49,6 +49,23 @@ pub fn store_passphrase(device_id: &str, passphrase: &str) -> bool {
     keychain_set(device_id, passphrase)
 }
 
+/// Read another Cortex secret from the OS keychain (macOS; `None` elsewhere or when
+/// keychain access is disabled). Same service as the sync passphrase, distinct account.
+pub fn load_secret(account: &str) -> Option<String> {
+    if keychain_disabled() {
+        return None;
+    }
+    keychain_get(account)
+}
+
+/// Store a secret in the OS keychain. Returns false when unavailable (caller falls back).
+pub fn store_secret(account: &str, value: &str) -> bool {
+    if keychain_disabled() {
+        return false;
+    }
+    keychain_set(account, value)
+}
+
 #[cfg(target_os = "macos")]
 fn keychain_get(account: &str) -> Option<String> {
     let out = Command::new("/usr/bin/security")

@@ -33,6 +33,13 @@ pub struct SqliteStorage {
     entity_cache: Mutex<lru::LruCache<String, Vec<MemObject>>>,
 }
 
+/// How a database is keyed.
+#[cfg_attr(not(feature = "encrypted-db"), allow(dead_code))]
+enum DbKey<'a> {
+    Passphrase(&'a str),
+    Raw(&'a [u8; 32]),
+}
+
 impl SqliteStorage {
     fn apply_read_pragmas(conn: &Connection) -> Result<(), CortexError> {
         conn.execute_batch(
@@ -58,18 +65,44 @@ impl SqliteStorage {
     /// Requires the `encrypted-db` feature (SQLCipher). Without the feature,
     /// the passphrase is ignored and the DB is opened without encryption.
     pub fn open_with_key(path: &str, passphrase: Option<&str>) -> Result<Self, CortexError> {
-        let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
+        Self::open_keyed(path, passphrase.map(DbKey::Passphrase), READ_POOL_SIZE)
+    }
 
-        // Apply encryption key if provided (requires bundled-sqlcipher feature)
+    /// Open with a raw 256-bit SQLCipher key (no per-open PBKDF2) and `readers` read
+    /// connections. For services that open many small databases (one per tenant).
+    /// Fails if SQLCipher is not compiled in: a raw key must never silently mean plaintext.
+    pub fn open_with_raw_key(path: &str, key: &[u8; 32], readers: usize) -> Result<Self, CortexError> {
+        if !cfg!(feature = "encrypted-db") {
+            return Err(CortexError::Storage("encrypted-db feature is required for a raw key".into()));
+        }
+        Self::open_keyed(path, Some(DbKey::Raw(key)), readers.max(1))
+    }
+
+    fn apply_key(conn: &Connection, key: Option<&DbKey>) -> Result<(), CortexError> {
         #[cfg(feature = "encrypted-db")]
-        if let Some(key) = passphrase {
-            conn.pragma_update(None, "key", key)
-                .map_err(|e| CortexError::Storage(format!("Failed to set encryption key: {}", e)))?;
+        match key {
+            Some(DbKey::Passphrase(p)) => conn
+                .pragma_update(None, "key", p)
+                .map_err(|e| CortexError::Storage(format!("Failed to set encryption key: {}", e)))?,
+            Some(DbKey::Raw(k)) => {
+                let hex: String = k.iter().map(|b| format!("{b:02x}")).collect();
+                // SQLCipher raw-key syntax: PRAGMA key = "x'<64 hex>'" (hex only; no injection).
+                conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
+                    .map_err(|e| CortexError::Storage(format!("Failed to set encryption key: {}", e)))?
+            }
+            None => {}
         }
         #[cfg(not(feature = "encrypted-db"))]
-        if passphrase.is_some() {
+        if key.is_some() {
+            let _ = conn;
             tracing::warn!("Database encryption requested but 'encrypted-db' feature not enabled. Opening without encryption.");
         }
+        Ok(())
+    }
+
+    fn open_keyed(path: &str, key: Option<DbKey>, readers: usize) -> Result<Self, CortexError> {
+        let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
+        Self::apply_key(&conn, key.as_ref())?;
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -84,8 +117,8 @@ impl SqliteStorage {
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
         // Open read-only connections for concurrent reads
-        let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
-        for _ in 0..READ_POOL_SIZE {
+        let mut read_pool = Vec::with_capacity(readers);
+        for _ in 0..readers {
             let reader = Connection::open_with_flags(
                 path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -93,11 +126,7 @@ impl SqliteStorage {
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-            #[cfg(feature = "encrypted-db")]
-            if let Some(key) = passphrase {
-                reader.pragma_update(None, "key", key)
-                    .map_err(|e| CortexError::Storage(format!("Failed to set reader encryption key: {}", e)))?;
-            }
+            Self::apply_key(&reader, key.as_ref())?;
             Self::apply_read_pragmas(&reader)?;
             read_pool.push(Mutex::new(reader));
         }

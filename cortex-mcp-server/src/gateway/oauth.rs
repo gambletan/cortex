@@ -66,6 +66,8 @@ const RATE_TOKEN_PER_CLIENT: u32 = 60;
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
+pub type RateMap = Mutex<HashMap<String, (Instant, u32)>>;
+
 /// Who approves a sign-in.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Consent {
@@ -84,8 +86,11 @@ pub struct OAuthConfig {
     /// Path part of the issuer (`""` self-hosted, `/t/<rid>` in the cloud); every URL this
     /// module emits for its own endpoints is prefixed with it.
     base_path: String,
-    /// endpoint → (window start, requests in window): a fixed one-minute window.
-    rate: Mutex<HashMap<String, (Instant, u32)>>,
+    /// endpoint → (window start, requests in window): a fixed one-minute window. Shared
+    /// across tenants in the cloud (keys are prefixed), so evicting a cached tenant never
+    /// resets its limits.
+    rate: Arc<RateMap>,
+    rate_prefix: String,
 }
 
 impl OAuthConfig {
@@ -104,13 +109,14 @@ impl OAuthConfig {
             redirect_allowlist,
             consent: Consent::LocalCli,
             base_path: String::new(),
-            rate: Mutex::new(HashMap::new()),
+            rate: Arc::new(Mutex::new(HashMap::new())),
+            rate_prefix: String::new(),
         })
     }
 
     /// One Cortex Cloud tenant: issuer `<base_url>/t/<rid>`, enrollment consent, Muse's
     /// callback only.
-    pub fn for_tenant(base_url: &str, rid: &str) -> Result<Self, String> {
+    pub fn for_tenant(base_url: &str, rid: &str, rate: Arc<RateMap>) -> Result<Self, String> {
         if !is_tenant_id(rid) {
             return Err("invalid tenant id".into());
         }
@@ -122,7 +128,8 @@ impl OAuthConfig {
             redirect_allowlist: vec![MUSE_CALLBACK.to_string()],
             consent: Consent::Enrollment,
             base_path: format!("/t/{rid}"),
-            rate: Mutex::new(HashMap::new()),
+            rate,
+            rate_prefix: format!("{rid}:"),
         })
     }
 
@@ -146,11 +153,11 @@ impl OAuthConfig {
     fn allow(&self, bucket: &str, per_minute: u32) -> bool {
         let mut rate = self.rate.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
-        // Bounded: fixed endpoint names plus at most MAX_CLIENTS client buckets live at once.
+        // Bounded: stale windows are dropped once the map grows.
         if rate.len() > 4 * MAX_CLIENTS {
             rate.retain(|_, v| now.duration_since(v.0).as_secs() < 60);
         }
-        let slot = rate.entry(bucket.to_string()).or_insert((now, 0));
+        let slot = rate.entry(format!("{}{bucket}", self.rate_prefix)).or_insert((now, 0));
         if now.duration_since(slot.0).as_secs() >= 60 {
             *slot = (now, 0);
         }
@@ -230,6 +237,9 @@ pub(super) struct OAuthState {
     /// Cloud only: the window the owner's device opened for one sign-in.
     #[serde(default)]
     enrollment: Option<Enrollment>,
+    /// When the last window was used up by an Allow (so a late click can say so).
+    #[serde(default)]
+    enrollment_used_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -903,7 +913,8 @@ pub(super) async fn authorize(State(st): State<Arc<HttpState>>, RawQuery(q): Raw
         let req = random_token();
         let created = with_state(paths, |s| {
             if enrollment && s.enrollment.is_none() {
-                return Err(());
+                let recently_used = s.enrollment_used_at.is_some_and(|t| now() - t < 24 * 3600);
+                return Err(recently_used);
             }
             if s.pending.len() >= MAX_PENDING {
                 return Ok(None);
@@ -934,7 +945,11 @@ pub(super) async fn authorize(State(st): State<Arc<HttpState>>, RawQuery(q): Raw
             Ok(Ok(Some(code))) => waiting_page(c, &code, &client.name, &redirect_uri, &req),
             // No window open: never a redirect (nothing for the client to retry), just tell
             // the human what to do.
-            Ok(Err(())) => bad_request_page("This link isn't active. Ask your AI to connect Muse again."),
+            Ok(Err(true)) => bad_request_page(
+                "This link was already used to connect. If that wasn't you, ask your AI to connect Muse \
+                 again: that cancels every earlier connection.",
+            ),
+            Ok(Err(false)) => bad_request_page("This link isn't active. Ask your AI to connect Muse again."),
             Ok(Ok(None)) => fail("temporarily_unavailable", "Too many sign-ins in progress; try again in a few minutes"),
             Err(_) => fail("server_error", "Gateway state error"),
         }
@@ -1045,8 +1060,9 @@ pub(super) async fn authorize_approve(
     if !c.allow("approve", RATE_AUTHORIZE) {
         return bad_request_page("Too many attempts. Wait a minute and try again.");
     }
-    // Origin, when sent, must be us (scheme + host of the issuer).
-    let origin_ok = headers.get("origin").is_none_or(|o| {
+    // Origin is required and must be us (scheme + host of the issuer). Browsers always send
+    // it on a form POST.
+    let origin_ok = headers.get("origin").is_some_and(|o| {
         o.to_str().is_ok_and(|o| c.issuer.starts_with(o) && c.issuer[o.len()..].starts_with('/'))
     });
     if !origin_ok {
@@ -1094,6 +1110,7 @@ pub(super) async fn authorize_approve(
             }
             p.status = Status::Approved;
             s.enrollment = None; // one window, one sign-in
+            s.enrollment_used_at = Some(t);
             (true, true)
         });
         match approved {
@@ -1119,15 +1136,16 @@ pub fn open_enrollment(paths: &Paths, ttl_secs: i64) -> Result<(), String> {
         s.codes.clear();
         s.redeemed.clear();
         s.enrollment = Some(Enrollment { expires: now() + ttl_secs });
+        s.enrollment_used_at = None;
     })
 }
 
-/// Live sign-ins (count) and when the newest was last used.
-pub fn grant_summary(paths: &Paths) -> Result<(usize, Option<i64>), String> {
+/// Live sign-ins: count, when the newest was created, and when any was last used.
+pub fn grant_summary(paths: &Paths) -> Result<(usize, Option<i64>, Option<i64>), String> {
     let st = read_shared(paths)?;
     let t = now();
     let live: Vec<&Grant> = st.grants.iter().filter(|g| g.refresh_exp > t).collect();
-    Ok((live.len(), live.iter().map(|g| g.last_used).max()))
+    Ok((live.len(), live.iter().map(|g| g.created).max(), live.iter().map(|g| g.last_used).max()))
 }
 
 // ── Token endpoint ───────────────────────────────────────────────────────────
@@ -1551,6 +1569,15 @@ mod tests {
     fn rate_limit_window() {
         let c = OAuthConfig::new("https://h", &[]).unwrap();
         assert!((0..3).all(|_| c.allow("x", 3)));
+        // Tenants share one map but never one bucket.
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        let a = OAuthConfig::for_tenant("https://h", "AAAAAAAAAAAAAAAAAAAAAA", shared.clone()).unwrap();
+        let b = OAuthConfig::for_tenant("https://h", "BBBBBBBBBBBBBBBBBBBBBB", shared.clone()).unwrap();
+        assert!((0..2).all(|_| a.allow("x", 2)));
+        assert!(!a.allow("x", 2));
+        assert!(b.allow("x", 2));
+        let a2 = OAuthConfig::for_tenant("https://h", "AAAAAAAAAAAAAAAAAAAAAA", shared).unwrap();
+        assert!(!a2.allow("x", 2), "re-created config keeps the tenant's window");
         assert!(!c.allow("x", 3));
         assert!(c.allow("y", 3));
     }

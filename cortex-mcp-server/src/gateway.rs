@@ -1259,7 +1259,9 @@ pub fn run(action: GatewayAction, db_path: &str) {
 // everything above unchanged. See docs/design/muse-cloud.md.
 
 const SEALED_PREFIX: &str = "enc1:";
-const MAX_EXPORT_TEXT_CHARS: usize = 4000;
+const MAX_EXPORT_TEXT_CHARS: usize = 2000;
+/// all-MiniLM-L6-v2, the model devices and the cloud share.
+pub const EMBED_DIM: usize = 384;
 
 /// AES-256-GCM, random 96-bit nonce: `enc1:` + base64(nonce ‖ ciphertext).
 fn seal(key: &[u8; 32], text: &str) -> Result<String, String> {
@@ -1349,7 +1351,7 @@ pub fn replace_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, St
     if let Some(bad) = items.iter().find(|i| i.text.trim().is_empty() || i.text.chars().count() > MAX_EXPORT_TEXT_CHARS) {
         return Err(format!("each item must be 1..={MAX_EXPORT_TEXT_CHARS} characters (got {})", bad.text.chars().count()));
     }
-    if items.iter().any(|i| i.embedding.as_ref().is_some_and(|e| e.is_empty() || e.iter().any(|x| !x.is_finite()))) {
+    if items.iter().any(|i| i.embedding.as_ref().is_some_and(|e| e.len() != EMBED_DIM || e.iter().any(|x| !x.is_finite()))) {
         return Err("invalid embedding".into());
     }
     for m in export_rows(cortex)? {
@@ -1428,13 +1430,15 @@ mod tests {
     #[test]
     fn replace_export_drops_unshared_items_and_validates() {
         let c = Cortex::in_memory().unwrap();
-        let item = |t: &str| ExportItem { text: t.into(), embedding: Some(vec![1.0, 0.0, 0.0, 0.0]) };
+        let item = |t: &str| ExportItem { text: t.into(), embedding: Some(vec![0.05; EMBED_DIM]) };
         assert_eq!(replace_export(&c, &[item("a"), item("b"), item("a")]).unwrap(), 2);
         assert_eq!(replace_export(&c, &[item("b")]).unwrap(), 1);
         let texts: Vec<String> = export_rows(&c).unwrap().iter().map(|m| content_to_string(&m.content)).collect();
         assert_eq!(texts, vec!["b".to_string()]);
         assert!(replace_export(&c, &[item(" ")]).is_err());
-        assert!(replace_export(&c, &[ExportItem { text: "x".into(), embedding: Some(vec![f32::NAN]) }]).is_err());
+        assert!(replace_export(&c, &[ExportItem { text: "x".into(), embedding: Some(vec![f32::NAN; EMBED_DIM]) }]).is_err());
+        assert!(replace_export(&c, &[ExportItem { text: "x".into(), embedding: Some(vec![0.1; 5]) }]).is_err(), "wrong dimension");
+        assert!(replace_export(&c, &[ExportItem { text: "x".repeat(MAX_EXPORT_TEXT_CHARS + 1), embedding: None }]).is_err());
         assert!(replace_export(&c, &(0..=MAX_EXPORT).map(|i| item(&i.to_string())).collect::<Vec<_>>()).is_err());
         assert_eq!(export_rows(&c).unwrap().len(), 1, "a refused push changes nothing");
     }

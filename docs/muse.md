@@ -17,6 +17,29 @@ daily budget, and you can cut it off with one command.
 Don't connect your whole Google Drive to Muse. That gives Meta the plaintext of every file.
 Connect Cortex instead, and Muse gets only what you put in the export.
 
+## Connect in two steps (recommended)
+
+1. Tell your AI (Claude, etc. with Cortex installed): **"connect my memory to Muse"**.
+   It suggests what to share, you say which ones, and it gives you a link.
+2. On your phone, paste the link into Muse. A Cortex page opens: tap **Allow**. Done.
+
+Muse now works from your phone even when your computer is off. Later, just talk to your
+AI: "also share that I'm vegetarian", "stop sharing my address", "what did Muse ask to
+remember?", "disconnect Muse".
+
+**How this keeps your privacy.** Only the memories you agreed to share go to Cortex
+Cloud, the always-on service that answers Muse. Those are the memories Muse (Meta) will
+see anyway. Everything else stays on your devices, and synced copies are encrypted in
+your own drive. In Cortex Cloud, your shared memories live in their own encrypted
+database; Muse can read at most 30 of them a day; and "disconnect Muse" deletes
+everything there. To be precise: while it answers Muse, the Cortex Cloud server can read
+the memories you shared. If you'd rather not use any server, run the gateway yourself
+([self-hosted setup](#self-hosted-setup)).
+
+The link works once, for 30 minutes. If someone else used your link before you did, your
+own Muse won't connect: ask your AI to connect again, which cancels any earlier
+connection.
+
 ## Why this is different
 
 | | Cortex gateway | Typical hosted/self-hosted memory connector |
@@ -36,7 +59,7 @@ Your private memories are never put into a response. The gateway's database quer
 asks for the `muse-export` namespace, so other rows are never loaded at all. Revoking an
 item takes effect on the next request, even while the server is running.
 
-## Setup (≈5 minutes)
+## Self-hosted setup
 
 Requires the standard `cortex-mcp-server` build. The `-lite` build has no HTTP code at all,
 so it does not include the gateway.

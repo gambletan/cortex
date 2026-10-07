@@ -1,0 +1,24 @@
+[Unit]
+Description=Cortex Cloud for Muse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cortex-cloud
+Group=cortex-cloud
+Environment=CORTEX_CLOUD_BASE_URL=https://studio.alvinsclub.ai
+ExecStart=/usr/local/bin/cortex-cloud --listen 127.0.0.1:8787 --data-dir /var/lib/cortex-cloud --master-key /etc/cortex-cloud/master.key
+Restart=on-failure
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/cortex-cloud /etc/cortex-cloud
+CapabilityBoundingSet=
+UMask=0077
+# Each cached tenant keeps SQLite files open.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

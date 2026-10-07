@@ -237,6 +237,14 @@ impl Cortex {
         Ok(Self::build(storage, index))
     }
 
+    /// Open an encrypted database with a raw 256-bit key (no per-open key stretching) and a
+    /// small read pool. For services opening many small databases, e.g. Cortex Cloud.
+    pub fn open_with_raw_key(db_path: &str, key: &[u8; 32], readers: usize) -> Result<Self, CortexError> {
+        let storage = SqliteStorage::open_with_raw_key(db_path, key, readers)?;
+        let index = MemoryIndex::with_config(IndexConfig::default());
+        Ok(Self::build(storage, index))
+    }
+
     /// Open or create a Cortex database with custom index configuration.
     /// Vector index is lazily loaded on first retrieve/get_context call for fast startup.
     pub fn open_with_config(db_path: &str, index_config: IndexConfig) -> Result<Self, CortexError> {
