@@ -1557,3 +1557,25 @@ fn review_resharing_counts_only_new_items_against_the_cap() {
     assert!(!again.is_error, "re-sharing the same 600 is a no-op, not over the cap: {}", again.text);
     assert_eq!(dev.status()["shared"].as_array().map(Vec::len), Some(601));
 }
+
+#[test]
+fn review_failed_reconnect_never_queues_new_shares_for_the_old_connection() {
+    let tmp = TempDir::new("rv-reconnect-fail");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let rid = rid_of(dev.connect_texts(&["Old shared"])["link"].as_str().unwrap());
+    let old_conn = Muse::new(&cloud, &rid).sign_in();
+    cloud.stop();
+    // Reconnect with a new item while the cloud is unreachable: must fail without
+    // touching the shared list.
+    let preview = dev.call("muse_connect", json!({ "texts": ["New secret"] })).json();
+    let code = preview["confirmation"].as_str().unwrap().to_string();
+    let out = dev.call("muse_connect", json!({ "texts": ["New secret"], "confirmation": code }));
+    assert!(out.is_error, "{}", out.text);
+    let cloud2 = Cloud::start(tmp.path());
+    let dev2 = Dev::new(tmp.path(), &cloud2);
+    let st = dev2.status();
+    assert_eq!(st["shared"].as_array().map(Vec::len), Some(1), "new item not added: {st}");
+    let hits = Muse::new(&cloud2, &rid).recall(&old_conn, "New secret");
+    assert!(hits.iter().all(|h| !h.contains("New secret")), "{hits:?}");
+}

@@ -345,36 +345,32 @@ fn connect(cortex: &Cortex, args: &Value) -> Result<Value, String> {
             return Ok(preview);
         }
     }
-    let pre = device(cortex)?;
-    if !texts.is_empty() {
-        mark_stale(cortex, &pre)?;
-    }
-    let added = add_to_export(cortex, &texts)?;
-    let shared = export_rows(cortex)?.len();
-    if shared == 0 {
+    if texts.is_empty() && export_rows(cortex)?.is_empty() {
         return Err("Nothing is shared yet. Find memories with memory_search, ask the user which ones Muse may see, then call muse_connect with their memory_ids.".into());
     }
     let mut dev = device(cortex)?;
     if dev.rid.is_none() {
         register(cortex, &mut dev)?;
     }
-    // Enroll FIRST: it revokes every earlier connection before the (possibly new) list is
-    // published, so a connection being replaced never sees what is shared next. Fail closed:
-    // no revocation, no push.
-    let publish = |dev: &Device| -> Result<(String, u64), String> {
-        let enrolled = dev.enroll()?;
-        push(cortex, dev)?;
-        Ok(enrolled)
-    };
-    let (link, expires) = match publish(&dev) {
+    // 1. Revoke every earlier connection and open the window — BEFORE the new items enter
+    //    the local list. If this fails nothing changed, so no later retry can publish the
+    //    new items to a connection that should have been replaced.
+    let (link, expires) = match dev.enroll() {
         Err(e) if e.starts_with(GONE) => {
             // The service lost this connection (expired or deleted): start a fresh one.
             dev.rid = None;
             register(cortex, &mut dev)?;
-            publish(&dev)?
+            dev.enroll()?
         }
         other => other?,
     };
+    // 2. Only now add and publish.
+    if !texts.is_empty() {
+        mark_stale(cortex, &dev)?;
+    }
+    let added = add_to_export(cortex, &texts)?;
+    push(cortex, &dev)?;
+    let shared = export_rows(cortex)?.len();
     Ok(json!({
         "link": link,
         "shared": shared,
