@@ -537,6 +537,16 @@ async fn tenant_api(
         let (_, cortex, paths) = match app2.tenant(&rid) {
             Ok(Some(t)) => t,
             Ok(None) => return api_error(StatusCode::NOT_FOUND, "no such tenant"),
+            // The tenant's database can't be decrypted (e.g. the master key was replaced):
+            // nothing in it is recoverable. Drop it, so the device — authenticated above —
+            // re-registers and pushes its list again.
+            Err(e) if e.contains("not a database") => {
+                tracing::warn!(tenant = %rid, "tenant database unreadable; removing it");
+                return match app2.remove_tenant(&rid) {
+                    Ok(()) => api_error(StatusCode::NOT_FOUND, "no such tenant"),
+                    Err(e) => internal(e),
+                };
+            }
             Err(e) => return internal(e),
         };
         match (method.as_str(), op.as_str()) {
@@ -702,13 +712,22 @@ fn sweep(app: &App) {
         if !oauth::is_tenant_id(&rid) {
             continue;
         }
-        let last = std::fs::read_to_string(e.path().join("last_seen"))
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok());
-        let Some(last) = last else { continue }; // being created or damaged: leave it
-        let never_pushed = !e.path().join("pushed").exists();
-        let expired = t - last > IDLE_DAYS * 86_400 || (never_pushed && t - last > UNUSED_TENANT_SECS);
-        if expired && app.remove_tenant(&rid).is_ok() {
+        let expired = || {
+            let last = std::fs::read_to_string(e.path().join("last_seen"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok());
+            let Some(last) = last else { return false }; // being created or damaged: leave it
+            let never_pushed = !e.path().join("pushed").exists();
+            t - last > IDLE_DAYS * 86_400 || (never_pushed && t - last > UNUSED_TENANT_SECS)
+        };
+        if !expired() {
+            continue;
+        }
+        // Re-check under the tenant lock: a device call that just refreshed `last_seen`
+        // (and pushed data) holds this lock while it works.
+        let lock = app.tenant_lock(&rid);
+        let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if expired() && app.remove_tenant(&rid).is_ok() {
             tracing::info!(tenant = %rid, "deleted idle tenant");
         }
     }

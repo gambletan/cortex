@@ -1490,3 +1490,22 @@ fn review_missing_device_key_is_reported_not_replaced() {
     assert!(out.is_error && out.text.contains("device key is unavailable"), "{}", out.text);
     assert!(!key.exists(), "no new key minted for an existing connection");
 }
+
+#[test]
+fn review_reconnect_works_after_the_master_key_is_replaced() {
+    let tmp = TempDir::new("rv-masterkey");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let first = dev.connect_texts(&["Master key check"]);
+    let rid = rid_of(first["link"].as_str().unwrap());
+    cloud.stop();
+    std::fs::remove_file(tmp.path().join("master.key")).unwrap();
+    let cloud2 = Cloud::start(tmp.path());
+    let dev2 = Dev::new(tmp.path(), &cloud2);
+    let again = dev2.call("muse_connect", json!({}));
+    assert!(!again.is_error, "reconnect must recover: {}", again.text);
+    let rid2 = rid_of(again.json()["link"].as_str().unwrap());
+    assert_ne!(rid, rid2, "unreadable tenant replaced by a fresh one");
+    let token = Muse::new(&cloud2, &rid2).sign_in();
+    assert_eq!(Muse::new(&cloud2, &rid2).recall(&token, "Master key check"), vec!["Master key check".to_string()]);
+}

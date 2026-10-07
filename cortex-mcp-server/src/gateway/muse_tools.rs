@@ -437,6 +437,21 @@ fn inbox(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         let list: Vec<Value> = items.iter().map(|(id, text)| json!({ "id": id, "text": text })).collect();
         return Ok(json!({ "items": list }));
     }
+    // Check the whole batch against the cloud limits before changing anything, and mark the
+    // cloud stale first, so a failure midway is still pushed later.
+    let keeping: Vec<&String> = items.iter().filter(|(id, _)| keep.contains(id)).map(|(_, t)| t).collect();
+    if let Some(t) = keeping.iter().find(|t| t.chars().count() > MAX_EXPORT_TEXT_CHARS) {
+        return Err(format!("An item is too long to keep shared ({} characters).", t.chars().count()));
+    }
+    let current = export_rows(cortex)?.len();
+    if current + keeping.len() > MAX_EXPORT_ITEMS {
+        return Err(format!("At most {MAX_EXPORT_ITEMS} memories can be shared; {current} already are."));
+    }
+    if !keeping.is_empty() {
+        let mut st = load_state(cortex)?;
+        st.dirty = true;
+        save_state(cortex, &st)?;
+    }
     let mut done = Vec::new();
     for (id, text) in &items {
         if keep.contains(id) {
