@@ -51,7 +51,7 @@ Hardening that costs the user nothing (Codex review, revised after adversarial r
 - Only the enrollment hash is stored. GETs, link previews and discovery never consume it;
   **POST Allow** consumes the enrollment and mints the code in one SQL transaction.
 - Consent page: session-bound CSRF token + **required** same-origin `Origin`, Secure/HttpOnly/SameSite cookie,
-  frame-ancestors none, no-store, no-referrer, no third-party assets, link redacted from logs.
+  frame-ancestors none, no-store, `Referrer-Policy: same-origin` (`no-referrer` would make browsers send `Origin: null` on the Allow POST), no third-party assets, link redacted from logs.
   The page binds client, exact redirect_uri, resource, PKCE challenge and the export
   version shown.
 - After a connection the agent says once: "Muse connected at T. Was that you?" with a

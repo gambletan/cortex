@@ -862,6 +862,12 @@ fn consent_page(c: &OAuthConfig, shared: usize, client_name: &str, redirect_uri:
     if let Ok(v) = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'".parse() {
         r.headers_mut().insert("content-security-policy", v);
     }
+    // `no-referrer` would make the browser send `Origin: null` on the Allow POST (and the
+    // Origin check would refuse every real click). `same-origin` keeps our own origin on
+    // that POST and still sends nothing to any other site.
+    if let Ok(v) = "same-origin".parse() {
+        r.headers_mut().insert("referrer-policy", v);
+    }
     r
 }
 

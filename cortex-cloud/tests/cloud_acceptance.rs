@@ -914,7 +914,9 @@ fn consent_csrf_and_get_never_consumes() {
     let csp = c.resp.header("content-security-policy").unwrap_or_default();
     assert!(csp.contains("frame-ancestors 'none'"), "consent page frame-ancestors none: {csp}");
     assert!(c.resp.header("cache-control").unwrap_or_default().contains("no-store"));
-    assert_eq!(c.resp.header("referrer-policy"), Some("no-referrer"));
+    // Spec revision (Codex): `no-referrer` makes browsers send `Origin: null` on the Allow
+    // POST, so the consent page uses `same-origin` (nothing leaks to other sites).
+    assert_eq!(c.resp.header("referrer-policy"), Some("same-origin"));
 
     let refused = |r: &Resp, what: &str| {
         assert!(
