@@ -17,16 +17,15 @@ SSH=(ssh "${SSH_OPTS[@]}" "$HOST")
 
 cd "$(dirname "$0")/../.."
 sha="$(git rev-parse --short HEAD)"
-if [[ -n "$(git status --porcelain -- cortex-core cortex-mcp-server cortex-cloud Cargo.toml Cargo.lock deploy/cortex-cloud)" ]]; then
+if [[ -n "$(git status --porcelain -- cortex-core cortex-http cortex-mcp-server cortex-cloud Cargo.toml Cargo.lock deploy/cortex-cloud)" ]]; then
   echo "refusing: uncommitted changes in the service sources" >&2
   exit 1
 fi
 
-"${SSH[@]}" "mkdir -p ~/$REMOTE_DIR/src-tree"
-rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
-  --exclude target --exclude .git --exclude cortex-python --exclude cortex-wasm \
-  --exclude node_modules --exclude '*.db' --exclude '*.db-wal' --exclude '*.db-shm' \
-  ./ "$HOST:$REMOTE_DIR/src-tree/"
+# Upload ONLY committed build inputs (never the working directory: it can hold ignored
+# files such as logs, caches or local databases).
+git archive --format=tar HEAD -- Cargo.toml Cargo.lock cortex-core cortex-http cortex-mcp-server cortex-cloud deploy/cortex-cloud \
+  | "${SSH[@]}" "rm -rf ~/$REMOTE_DIR/src-tree && mkdir -p ~/$REMOTE_DIR/src-tree && tar -x -C ~/$REMOTE_DIR/src-tree"
 
 "${SSH[@]}" bash -s -- "$sha" "$BASE_URL" "$LISTEN" "$SITE" <<'REMOTE'
 set -euo pipefail
@@ -44,14 +43,21 @@ for i in $(seq 1 60); do
 done
 curl -fsS "http://$listen/healthz" >/dev/null || { docker logs --tail 50 cortex-cloud; exit 1; }
 
-# nginx: route only the Cortex paths; idempotent.
-sudo install -m 644 src-tree/deploy/cortex-cloud/cortex-cloud.nginx.conf /etc/nginx/snippets/cortex-cloud.conf
+# nginx: route only the Cortex paths to the SAME address the container listens on; idempotent.
+sed "s#127.0.0.1:8084#$listen#g" src-tree/deploy/cortex-cloud/cortex-cloud.nginx.conf | sudo tee /etc/nginx/snippets/cortex-cloud.conf >/dev/null
 if ! sudo grep -q "snippets/cortex-cloud.conf" "$site"; then
-  sudo cp "$site" "$site.bak-cortex-$(date +%Y%m%d%H%M%S)"
+  anchor='include /etc/nginx/snippets/ecn-muse.conf;'
+  sudo grep -qF "$anchor" "$site" || { echo "no '$anchor' in $site: add 'include /etc/nginx/snippets/cortex-cloud.conf;' to its 443 server block by hand" >&2; exit 1; }
+  backup="$site.bak-cortex-$(date +%Y%m%d%H%M%S)"
+  sudo cp "$site" "$backup"
   # Before the catch-all `location /` include, inside the 443 server block.
   sudo sed -i '0,/include \/etc\/nginx\/snippets\/ecn-muse.conf;/s//include \/etc\/nginx\/snippets\/cortex-cloud.conf;\n    include \/etc\/nginx\/snippets\/ecn-muse.conf;/' "$site"
+  sudo grep -q "snippets/cortex-cloud.conf" "$site" || { sudo cp "$backup" "$site"; echo "include not inserted; site restored" >&2; exit 1; }
 fi
 sudo nginx -t
 sudo systemctl reload nginx
+# The public route must reach THIS service (an unknown tenant id answers an empty 404).
+code=$(curl -s -o /dev/null -w '%{http_code}' "$base/t/AAAAAAAAAAAAAAAAAAAAAA/mcp")
+[ "$code" = 404 ] || { echo "public route check failed ($code)" >&2; exit 1; }
 echo "deployed cortex-cloud:$sha"
 REMOTE
