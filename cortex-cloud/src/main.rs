@@ -48,7 +48,7 @@ const REGISTER_PER_NET_PER_HOUR: u32 = 5;
 const REGISTER_GLOBAL_PER_MINUTE: u32 = 30;
 /// Small bodies (register, enroll, ack, …) vs the export push.
 const MAX_SMALL_BODY: usize = 8 * 1024;
-const MAX_EXPORT_BODY: usize = 12 * 1024 * 1024;
+const MAX_EXPORT_BODY: usize = cloud::MAX_EXPORT_BODY;
 const BODY_DEADLINE: Duration = Duration::from_secs(20);
 const IDLE_DAYS: i64 = 90;
 /// A tenant that never pushed anything within a day is abandoned (or abuse): reclaim it.
@@ -247,7 +247,8 @@ impl App {
         #[cfg(feature = "embeddings")]
         let cortex = match &self.embedder {
             Some(e) => cortex.with_embedder(e.clone()),
-            None => cortex,
+            // The shared model is unavailable: keyword recall, and no per-tenant downloads.
+            None => cortex.without_embedder(),
         };
         let cortex = Arc::new(cortex);
         let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", rid)));

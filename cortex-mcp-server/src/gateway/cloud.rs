@@ -24,6 +24,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const MAX_SKEW_SECS: i64 = 300;
+/// Largest export push body. Sized so that ANY valid snapshot fits (1000 items of 2000
+/// chars, worst-case JSON escaping, 384-dim embeddings): see the test below.
+pub const MAX_EXPORT_BODY: usize = 24 * 1024 * 1024;
 pub const H_KEY: &str = "x-cortex-key";
 pub const H_TS: &str = "x-cortex-ts";
 pub const H_NONCE: &str = "x-cortex-nonce";
@@ -242,5 +245,17 @@ mod tests {
         assert_eq!(verify("PUT", "/api/tenants/a/export", b"{}", &h, Some(&other.public_key_b64()), t), Err(VerifyError::BadKey));
         assert_eq!(verify("PUT", "/api/tenants/a/export", b"{}", &h, None, t + MAX_SKEW_SECS + 1), Err(VerifyError::Stale));
         assert_eq!(verify("PUT", "/api/tenants/a/export", b"{}", |_| None, None, t), Err(VerifyError::Missing));
+    }
+
+    #[test]
+    fn any_valid_export_fits_the_body_limit() {
+        use crate::gateway::{EMBED_DIM, MAX_EXPORT_ITEMS, MAX_EXPORT_TEXT_CHARS};
+        // Worst case per char: a control char escapes to \u00XX (6 bytes); worst float text.
+        let text: String = std::iter::repeat_n('\u{1}', MAX_EXPORT_TEXT_CHARS).collect();
+        let emb = vec![-1.234_567_9e-30_f32; EMBED_DIM];
+        let item = json!({ "text": text, "embedding": emb });
+        let items: Vec<Value> = (0..MAX_EXPORT_ITEMS).map(|_| item.clone()).collect();
+        let body = json!({ "version": i64::MAX, "items": items }).to_string();
+        assert!(body.len() < MAX_EXPORT_BODY, "{} >= {}", body.len(), MAX_EXPORT_BODY);
     }
 }

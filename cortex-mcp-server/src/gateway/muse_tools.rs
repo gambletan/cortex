@@ -121,6 +121,11 @@ fn device(cortex: &Cortex) -> Result<Device, String> {
         match read_private(&key_path) {
             Ok(hex) => parse_key(&hex)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if st.rid.is_some() {
+                    // Never mint a new identity for an existing connection: the old key
+                    // is the only one the cloud accepts (and could be overwritten).
+                    return Err("This computer's Muse device key is unavailable (keychain locked or file missing). Unlock the keychain and retry; if the key is lost, delete the Muse connection state and run muse_connect again.".into());
+                }
                 let s = Device::generate_secret();
                 let hex: String = s.iter().map(|b| format!("{b:02x}")).collect();
                 if !store_secret(&account, &hex) {
@@ -354,8 +359,9 @@ fn share(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if let Some(preview) = confirmed(cortex, args, &texts)? {
         return Ok(preview);
     }
-    let added = add_to_export(cortex, &texts)?;
     let dev = device(cortex)?;
+    settle(cortex, &dev)?;
+    let added = add_to_export(cortex, &texts)?;
     let pushed = if dev.rid.is_some() { Some(push(cortex, &dev)?) } else { None };
     Ok(json!({ "added": added, "shared": export_rows(cortex)?.len(), "synced_to_cloud": pushed.is_some() }))
 }
@@ -365,6 +371,10 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if ids.is_empty() {
         return Err("Give shared_ids (from muse_status).".into());
     }
+    // A previous unshare whose push failed is completed first, so retrying it always
+    // reaches the cloud even though the row is already gone locally.
+    let dev = device(cortex)?;
+    settle(cortex, &dev)?;
     // Validate the whole list first: never a partial unshare.
     let export: Vec<Uuid> = export_rows(cortex)?.into_iter().map(|m| m.id).collect();
     let mut targets = Vec::new();
@@ -375,7 +385,6 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         }
         targets.push(id);
     }
-    let dev = device(cortex)?;
     if dev.rid.is_some() {
         // Record "cloud is behind" before deleting, so a crash or failed push is retried.
         let mut st = load_state(cortex)?;

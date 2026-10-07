@@ -1415,3 +1415,45 @@ fn review_two_databases_in_one_directory_have_separate_connections() {
     assert_eq!(a.status()["connected"], json!(false), "a is not signed in yet, but still has a tenant");
     assert!(tmp.path().join("data").join("tenants").join(&ra).is_dir(), "b's disconnect left a's tenant alone");
 }
+
+#[test]
+fn review_retrying_a_failed_unshare_reaches_the_cloud() {
+    let tmp = TempDir::new("rv-unshare-retry");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let link = dev.connect_texts(&["Secret alpha fact", "Public beta fact"]);
+    let rid = rid_of(link["link"].as_str().unwrap());
+    let token = Muse::new(&cloud, &rid).sign_in();
+    let id = dev.status()["shared"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["text"] == json!("Secret alpha fact"))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cloud.stop();
+    let out = dev.call("muse_unshare", json!({ "shared_ids": [id.clone()] }));
+    assert!(out.is_error, "push must fail while the cloud is down: {}", out.text);
+    let cloud2 = Cloud::start(tmp.path());
+    let dev2 = Dev::new(tmp.path(), &cloud2);
+    // Retrying the same call completes the pending sync first.
+    let _ = dev2.call("muse_unshare", json!({ "shared_ids": [id] }));
+    let hits = Muse::new(&cloud2, &rid).recall(&token, "Secret alpha fact");
+    assert!(hits.iter().all(|t| !t.contains("alpha")), "unshared item must be gone from the cloud: {hits:?}");
+}
+
+#[test]
+fn review_missing_device_key_is_reported_not_replaced() {
+    let tmp = TempDir::new("rv-key");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    dev.connect_texts(&["Key check memory"]);
+    let key = dev.db_dir().join("memory.db.muse-device.key");
+    assert!(key.is_file(), "fallback key file exists (keychain disabled in tests)");
+    std::fs::remove_file(&key).unwrap();
+    let out = dev.call("muse_status", json!({}));
+    assert!(out.is_error && out.text.contains("device key is unavailable"), "{}", out.text);
+    assert!(!key.exists(), "no new key minted for an existing connection");
+}

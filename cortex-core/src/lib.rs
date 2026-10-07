@@ -575,6 +575,14 @@ impl Cortex {
         self
     }
 
+    /// Never load an embedding model in this instance (keyword-only recall). For services
+    /// whose shared model failed to load: tenants must not each retry on their own.
+    #[cfg(feature = "embeddings")]
+    pub fn without_embedder(self) -> Self {
+        *self.embedder.lock() = Some(None);
+        self
+    }
+
     /// Embed `text` with the local model, or `None` when embeddings are compiled out,
     /// disabled via `CORTEX_NO_EMBEDDINGS`, or the model failed to load.
     pub fn embed_query(&self, text: &str) -> Option<Vec<f32>> {

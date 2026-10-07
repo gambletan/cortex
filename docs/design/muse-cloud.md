@@ -109,7 +109,7 @@ device ── /api/… ────▶│ register · put export · new enrollme
    reused nonce → 401. The tenant is created by the first signed `POST /api/tenants` (key
    registered; trust on first use; registration nonces persisted too). The tenant, the key
    and the timestamp are checked from headers **before any body byte is read**; bodies are
-   capped per route (8 KiB, export 12 MiB) with an absolute read deadline. Registration is
+   capped per route (8 KiB, export 24 MiB — any valid snapshot fits) with an absolute read deadline. Registration is
    rate-limited per client network (IPv6 /64) and globally; at most 20 000 tenants; a tenant
    that never pushes within a day is reclaimed. Export pushes carry a `version` (device ms
    when the snapshot was taken) and are serialized per tenant; an older version is refused
