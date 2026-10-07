@@ -929,6 +929,9 @@ fn consent_csrf_and_get_never_consumes() {
     assert!(set_cookie.contains("samesite"), "csrf cookie SameSite: {set_cookie}");
     let csp = c.resp.header("content-security-policy").unwrap_or_default();
     assert!(csp.contains("frame-ancestors 'none'"), "consent page frame-ancestors none: {csp}");
+    // Found in a real browser: form-action also governs the redirects after the POST, so
+    // the client's callback origin must be allowed or sign-in never completes.
+    assert!(csp.contains("form-action 'self' https://agent.meta.ai"), "consent CSP must allow the callback hop: {csp}");
     assert!(c.resp.header("cache-control").unwrap_or_default().contains("no-store"));
     // Spec revision (Codex): `no-referrer` makes browsers send `Origin: null` on the Allow
     // POST, so the consent page uses `same-origin` (nothing leaks to other sites).

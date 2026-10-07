@@ -825,6 +825,14 @@ fn waiting_page(c: &OAuthConfig, code: &str, client_name: &str, redirect_uri: &s
     )
 }
 
+/// `scheme://host[:port]` of a (validated) redirect URI, for CSP source lists.
+fn redirect_origin(redirect_uri: &str) -> String {
+    match redirect_uri.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{}", rest.split(['/', '?', '#']).next().unwrap_or("")),
+        None => String::new(),
+    }
+}
+
 fn redirect_host(redirect_uri: &str) -> &str {
     redirect_uri.split("://").nth(1).and_then(|r| r.split(['/', '?']).next()).unwrap_or(redirect_uri)
 }
@@ -858,8 +866,15 @@ fn consent_page(c: &OAuthConfig, shared: usize, client_name: &str, redirect_uri:
     if let Ok(v) = cookie.parse() {
         r.headers_mut().insert("set-cookie", v);
     }
-    // The page has a form now: allow posting to ourselves only.
-    if let Ok(v) = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'".parse() {
+    // The page has a form now. Browsers apply `form-action` to every redirect that follows
+    // the submission too (approve → wait → the client's callback), so besides ourselves it
+    // must allow the origin of this request's (exact-registered, allowlisted) redirect URI —
+    // with `'self'` alone the final hop to the client is blocked and sign-in never completes.
+    let callback_origin = redirect_origin(redirect_uri);
+    let csp = format!(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {callback_origin}; frame-ancestors 'none'"
+    );
+    if let Ok(v) = csp.parse() {
         r.headers_mut().insert("content-security-policy", v);
     }
     // `no-referrer` would make the browser send `Origin: null` on the Allow POST (and the
@@ -1599,5 +1614,11 @@ mod tests {
         assert!(!a2.allow("x", 2), "re-created config keeps the tenant's window");
         assert!(!c.allow("x", 3));
         assert!(c.allow("y", 3));
+    }
+
+    #[test]
+    fn callback_origin_for_csp() {
+        assert_eq!(redirect_origin(MUSE_CALLBACK), "https://agent.meta.ai");
+        assert_eq!(redirect_origin("http://127.0.0.1:9/cb?x=1"), "http://127.0.0.1:9");
     }
 }
