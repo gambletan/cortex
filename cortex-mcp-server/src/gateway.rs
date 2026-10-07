@@ -1494,7 +1494,12 @@ fn apply_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> 
 /// the audit log (which stores ids, never queries). Ids no longer shared are skipped.
 pub fn reads_today(cortex: &Cortex, paths: &Paths) -> Vec<(String, usize)> {
     let today = today();
-    let Ok(log) = read_private(&paths.audit) else { return Vec::new() };
+    // Both generations: rotation (past MAX_AUDIT_BYTES) can split one day across them.
+    let log: String = [paths.audit.with_extension("jsonl.1"), paths.audit.clone()]
+        .iter()
+        .filter_map(|p| read_private(p).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for line in log.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
@@ -1546,6 +1551,20 @@ pub fn inbox_ack(paths: &Paths, ids: &[String]) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_today_counts_both_audit_generations() {
+        let c = Cortex::in_memory().unwrap();
+        replace_export(&c, &[ExportItem { text: "mu".into(), embedding: None }]).unwrap();
+        let id = export_rows(&c).unwrap()[0].id.to_string();
+        let dir = std::env::temp_dir().join(format!("gw-reads-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_dir(&dir, None);
+        let line = json!({ "ts": format!("{}T01:00:00Z", today()), "outcome": "ok", "memory_ids": [id] }).to_string();
+        std::fs::write(paths.audit.with_extension("jsonl.1"), format!("{line}\n")).unwrap();
+        std::fs::write(&paths.audit, format!("{line}\n")).unwrap();
+        assert_eq!(reads_today(&c, &paths), vec![("mu".to_string(), 2)]);
+    }
 
     #[test]
     fn sealed_inbox_text_round_trips_and_detects_tampering() {
