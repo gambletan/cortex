@@ -501,6 +501,8 @@ fn inbox(cortex: &Cortex, args: &Value) -> Result<Value, String> {
         }
     }
     if done.iter().any(|id| keep.contains(id)) {
+        // Kept memories must be durable here before the cloud deletes its inbox copy.
+        cortex.flush_durable().map_err(|e| e.to_string())?;
         push(cortex, &dev)?;
     }
     let removed = dev.inbox_ack(&done)?;

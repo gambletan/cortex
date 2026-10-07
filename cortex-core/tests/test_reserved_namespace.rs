@@ -110,3 +110,14 @@ fn near_dedup_still_finds_an_ordinary_duplicate_behind_an_export_copy() {
         "near-duplicate of the ordinary memory must be merged, not stored again"
     );
 }
+
+#[test]
+fn flush_durable_checkpoints_an_on_disk_database() {
+    let dir = std::env::temp_dir().join(format!("cx-flush-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = Cortex::open(&dir.join("m.db").to_string_lossy()).unwrap();
+    c.ingest_with_options("durable", "test", None, None, None, Some("work"), None).unwrap();
+    c.flush_durable().expect("checkpoint completes");
+    let db = std::fs::metadata(dir.join("m.db")).unwrap().len();
+    assert!(db > 4096, "checkpoint moved the change into the database file ({db} bytes)");
+}

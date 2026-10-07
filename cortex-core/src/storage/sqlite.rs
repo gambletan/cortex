@@ -60,8 +60,18 @@ impl SqliteStorage {
     /// acknowledgement must survive power loss, e.g. revoking a share.
     pub fn flush_durable(&self) -> Result<(), CortexError> {
         let conn = self.write_conn.lock();
-        conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |_| Ok(()))
-            .map_err(|e| CortexError::Storage(e.to_string()))
+        // Row = (busy, wal frames, checkpointed frames). `busy = 1` means it did NOT run
+        // (another connection holds the checkpoint lock): retry, never report success.
+        for attempt in 0..20 {
+            let (busy, log, done): (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(FULL)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if busy == 0 && done >= log {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1)));
+        }
+        Err(CortexError::Storage("could not make the change durable (database busy); try again".into()))
     }
 
     /// The database file, or `None` for an in-memory database.
