@@ -1136,6 +1136,8 @@ pub(super) async fn authorize_approve(
 /// request and unredeemed code is dropped first, so reconnecting always revokes whoever
 /// may have used an earlier link.
 pub fn open_enrollment(paths: &Paths, ttl_secs: i64) -> Result<(), String> {
+    // Fence: no disclosure is mid-flight while grants are revoked (see `grant_is_live`).
+    let _fence = super::budget_file_lock(paths).map_err(|e| e.to_string())?;
     with_state(paths, |s| {
         s.grants.clear();
         s.pending.clear();
@@ -1144,6 +1146,16 @@ pub fn open_enrollment(paths: &Paths, ttl_secs: i64) -> Result<(), String> {
         s.enrollment = Some(Enrollment { expires: now() + ttl_secs });
         s.enrollment_used_at = None;
     })
+}
+
+/// Is this sign-in still valid right now? Checked again just before disclosing, while
+/// holding the same lock that revocation (enroll / disconnect) takes, so a request that was
+/// authenticated earlier can never read what is shared after its revocation.
+pub(super) fn grant_is_live(paths: &Paths, grant_id: &str) -> bool {
+    let t = now();
+    read_shared(paths)
+        .map(|st| st.grants.iter().any(|g| g.id == grant_id && g.refresh_exp > t && t - g.created < GRANT_MAX_AGE))
+        .unwrap_or(false)
 }
 
 /// Live sign-ins: count, when the newest was created, and when any was last used.
@@ -1441,6 +1453,7 @@ pub(super) fn list_grants(paths: &Paths) -> Result<Vec<String>, String> {
 }
 
 pub fn disconnect(paths: &Paths, id: Option<&str>) -> Result<usize, String> {
+    let _fence = super::budget_file_lock(paths).map_err(|e| e.to_string())?;
     with_state(paths, |s| {
         let before = s.grants.len();
         match id {

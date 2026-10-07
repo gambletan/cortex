@@ -515,6 +515,13 @@ impl Gateway {
         out
     }
 
+    /// An OAuth caller (grant id) must still hold a live grant at the moment of disclosure.
+    /// Callers hold the budget file lock, which revocation also takes.
+    fn caller_still_authorized(&self) -> bool {
+        let caller = CALLER.with(|c| c.borrow().clone());
+        caller == "static" || caller.is_empty() || oauth::grant_is_live(&self.paths, &caller)
+    }
+
     fn audit(&self, tool: &str, n: usize, ids: &[String], bytes: usize, outcome: &str) -> Result<(), String> {
         append_audit(
             &self.paths.audit,
@@ -568,6 +575,9 @@ impl Gateway {
         let Ok(_file_guard) = budget_file_lock(&self.paths) else {
             return tool_error("Refusing: could not lock the budget.");
         };
+        if !self.caller_still_authorized() {
+            return tool_error("This connection was revoked.");
+        }
         let mut budget = match self.charge(TOOL_NAME) {
             Ok(b) => b,
             Err(v) => return v,
@@ -612,6 +622,9 @@ impl Gateway {
         let Ok(_file_guard) = budget_file_lock(&self.paths) else {
             return tool_error("Refusing: could not lock the budget.");
         };
+        if !self.caller_still_authorized() {
+            return tool_error("This connection was revoked.");
+        }
         let mut budget = match self.charge(REMEMBER_TOOL) {
             Ok(b) => b,
             Err(v) => return v,

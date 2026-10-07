@@ -1628,3 +1628,31 @@ fn review_lost_enroll_response_leaves_the_tenant_manageable() {
     assert!(!tmp.path().join("data/tenants").join(&mid).exists(), "nothing orphaned");
     assert_eq!(std::fs::read_dir(tmp.path().join("data/public")).unwrap().count(), 0, "no stale public ids");
 }
+
+#[test]
+fn review_in_flight_request_cannot_read_what_is_shared_after_revocation() {
+    use std::io::Read as _;
+    let tmp = TempDir::new("rv-inflight");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let pid = rid_of(dev.connect_texts(&["Old item"])["link"].as_str().unwrap());
+    let old_token = Muse::new(&cloud, &pid).sign_in();
+    // The old connection authenticates now but holds its body back.
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"recall_memory","arguments":{"query":"Freshly shared secret"}}})
+    .to_string();
+    let head = format!(
+        "POST /t/{pid}/mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {old_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", cloud.port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    sock.write_all(head.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    // Meanwhile the user reconnects and shares something new.
+    dev.connect_texts(&["Freshly shared secret"]);
+    sock.write_all(body.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    assert!(!resp.contains("Freshly shared secret"), "revoked in-flight request read new data: {resp}");
+}
