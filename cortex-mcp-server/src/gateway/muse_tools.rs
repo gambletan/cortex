@@ -300,7 +300,8 @@ fn confirmed(cortex: &Cortex, args: &Value, texts: &[String]) -> Result<Option<V
         "needs_confirmation": true,
         "will_share_with_muse": texts,
         "confirmation": code,
-        "next_step": "Show the user exactly this list and ask whether Muse may see it. Only if they say yes, call this tool again with the same arguments plus this confirmation. Nothing has been shared yet.",
+        "tell_the_user_first": "Whatever Muse reads becomes visible to Meta, and Muse may keep its own copy even if you unshare it later. Cortex asks Muse not to, but can't enforce it. For unsharing to really work, turn off Muse's own memory in its settings.",
+        "next_step": "Show the user exactly this list AND the warning in tell_the_user_first, and ask whether Muse may see it. Only if they say yes, call this tool again with the same arguments plus this confirmation. Nothing has been shared yet.",
     })))
 }
 
@@ -346,7 +347,7 @@ pub fn schemas() -> Vec<Value> {
         }),
         json!({
             "name": "muse_status",
-            "description": "What Muse can see, whether Muse is connected and when it last read, and how many things Muse asked to remember (see muse_inbox).",
+            "description": "What Muse can see, whether Muse is connected, which shared memories Muse read today (and how often), when it last read, and how many things Muse asked to remember (see muse_inbox).",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
@@ -508,6 +509,7 @@ fn status(cortex: &Cortex) -> Result<Value, String> {
         "connected": cloud.get("connected").and_then(Value::as_u64).unwrap_or(0) > 0,
         "muse_connected_at": cloud.get("connected_at").and_then(Value::as_i64)
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
+        "muse_read_today": cloud.get("read_today").cloned().unwrap_or(Value::Null),
         "muse_last_read": cloud.get("last_used").and_then(Value::as_i64)
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
         "check_with_user": "If the user didn't connect Muse at muse_connected_at, run muse_connect again: it cancels every earlier connection.",

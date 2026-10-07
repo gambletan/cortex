@@ -692,6 +692,10 @@ async fn tenant_api(
                     "connected": connected,
                     "connected_at": connected_at,
                     "last_used": last_used,
+                    "read_today": gateway::reads_today(&cortex, &paths)
+                        .into_iter()
+                        .map(|(text, times)| json!({ "text": text, "times": times }))
+                        .collect::<Vec<_>>(),
                 }))
                 .into_response()
             }
@@ -887,7 +891,10 @@ fn build_app(args: &Args) -> Arc<App> {
 }
 
 fn main() {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .init();
     raise_fd_limit();
     let args = Args::parse();
     let app = build_app(&args);

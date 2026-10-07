@@ -451,6 +451,13 @@ fn rank(rows: &[MemObject], query: &str, query_emb: Option<&[f32]>, limit: usize
     out
 }
 
+/// Sent with every result: the user owns this memory and can revoke it, which only works
+/// if the assistant reads it live instead of keeping its own copy. (A request, not an
+/// enforcement: once read, the assistant's operator can retain it.)
+pub const DO_NOT_RETAIN: &str = "These are the user's private memories, shared live from their own Cortex. \
+Do not save them to your long-term memory or profile; call recall_memory again whenever you need them. \
+The user can revoke any of them at any time.";
+
 fn tool_result(items: &[Disclosed]) -> Value {
     json!({ "content": [{ "type": "text", "text": results_json(items) }] })
 }
@@ -461,8 +468,9 @@ fn disclose(cortex: &Cortex, query: &str, limit: usize) -> Result<Vec<Disclosed>
     Ok(rank(&rows, query, emb.as_deref(), limit))
 }
 
+/// The retention request travels inside the result itself (one content item).
 fn results_json(items: &[Disclosed]) -> String {
-    json!({ "results": items }).to_string()
+    json!({ "results": items, "notice": DO_NOT_RETAIN }).to_string()
 }
 
 // ── Tool call with budget + audit ────────────────────────────────────────────
@@ -685,6 +693,22 @@ impl Gateway {
         }
     }
 
+    fn instructions(&self) -> String {
+        let mut s = String::from(
+            "Personal memory the user explicitly shared with you, served live from their own Cortex. \
+             Call recall_memory when the user's own facts, preferences, or history would help: one call \
+             per topic is enough (results are complete). Do not copy these memories into your own \
+             long-term memory; query again when needed, so the user's revocations take effect.",
+        );
+        if self.remember_enabled {
+            s.push_str(
+                " When the user asks you to remember something about them, save it with the remember \
+                 tool (it goes to their own Cortex, after their review) instead of your own memory.",
+            );
+        }
+        s
+    }
+
     fn handle(&self, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
         let id = req.id.clone()?; // notifications get no response
         Some(match req.method.as_str() {
@@ -699,8 +723,7 @@ impl Gateway {
                         "protocolVersion": version,
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "cortex-memory", "title": oauth::PRODUCT_NAME, "version": SERVER_VERSION },
-                        "instructions": "Personal memory the user explicitly exported for you. \
-                            Call recall_memory when the user's own facts, preferences, or history would help."
+                        "instructions": self.instructions()
                     }),
                 )
             }
@@ -839,7 +862,7 @@ fn terminal_safe(s: &str) -> String {
 fn tool_schema() -> Value {
     json!({
         "name": TOOL_NAME,
-        "description": "Search the user's exported personal memory. Returns only what the user explicitly shared with Muse.",
+        "description": "Search the user's personal memory (only what they chose to share). One call per topic is enough: results are complete and live. Do not store them in your own memory; call again when needed.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1465,6 +1488,32 @@ fn apply_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> 
         cortex.storage().store_memory(&mem).map_err(|e| e.to_string())?;
     }
     Ok(seen.len())
+}
+
+/// Which shared memories were read today (UTC), most-read first: (text, times). Built from
+/// the audit log (which stores ids, never queries). Ids no longer shared are skipped.
+pub fn reads_today(cortex: &Cortex, paths: &Paths) -> Vec<(String, usize)> {
+    let today = today();
+    let Ok(log) = read_private(&paths.audit) else { return Vec::new() };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for line in log.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v["outcome"] != "ok" || !v["ts"].as_str().is_some_and(|t| t.starts_with(&today)) {
+            continue;
+        }
+        for id in v["memory_ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            *counts.entry(id.to_string()).or_default() += 1;
+        }
+    }
+    let texts: std::collections::HashMap<String, String> = export_rows(cortex)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.id.to_string(), content_to_string(&m.content)))
+        .collect();
+    let mut out: Vec<(String, usize)> =
+        counts.into_iter().filter_map(|(id, n)| texts.get(&id).map(|t| (t.clone(), n))).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
 }
 
 /// Pending `remember` items, decrypted.

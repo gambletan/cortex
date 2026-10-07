@@ -186,6 +186,14 @@ master key (file, 0600, not in the DB or backups). Tokens/codes/secrets: SHA-256
 1000 chars per item, 4 KiB response. Global: per-IP and per-account rate limits, body
 limits, timeouts, separate lane for unauthenticated endpoints.
 
+## Copies kept by Muse (observed in the first real test)
+
+Muse saved the memories it read into its own long-term memory and later answered without
+calling Cortex. Revocation cannot reach that copy. Mitigations (requests, not enforcement):
+every recall result carries a do-not-retain notice and the MCP `instructions` say to query
+live; the sharing preview tells the user that Meta sees what is shared and Muse may keep a
+copy; the guide tells users to turn off Muse's own memory so Cortex stays the single source.
+
 ## Threat model (delta from the self-hosted gateway)
 
 | Threat | Mitigation / residual |

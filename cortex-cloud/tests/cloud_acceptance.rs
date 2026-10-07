@@ -1725,3 +1725,19 @@ fn review_deleting_the_original_also_unshares_its_copy() {
     let hits = Muse::new(&cloud, &pid).recall(&token, "Iota original fact");
     assert!(hits.is_empty(), "{hits:?}");
 }
+
+#[test]
+fn status_shows_what_muse_read_today() {
+    let tmp = TempDir::new("read-today");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let pid = rid_of(dev.connect_texts(&["Kappa likes jazz", "Lambda hates olives"])["link"].as_str().unwrap());
+    let muse = Muse::new(&cloud, &pid);
+    let token = muse.sign_in();
+    muse.recall(&token, "Kappa likes jazz");
+    muse.recall(&token, "Kappa likes jazz");
+    let st = dev.status();
+    let read = st["muse_read_today"].as_array().cloned().unwrap_or_default();
+    assert!(read.iter().any(|r| r["text"] == json!("Kappa likes jazz") && r["times"].as_u64() >= Some(2)), "{st}");
+    assert!(read.iter().all(|r| r["text"] != json!("Lambda hates olives")), "{st}");
+}
