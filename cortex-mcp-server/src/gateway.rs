@@ -979,12 +979,9 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
     let method = req.method.clone();
     let tool = req.params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     if method == "initialize" {
-        tracing::info!(
-            protocol = %req.params.get("protocolVersion").and_then(Value::as_str).unwrap_or(""),
-            client = %req.params.get("clientInfo").map(|c| c.to_string()).unwrap_or_default(),
-            accept = ?headers.get("accept"),
-            "mcp initialize"
-        );
+        let protocol = req.params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let client = req.params.get("clientInfo").map(|c| c.to_string()).unwrap_or_default();
+        tracing::info!(%protocol, %client, accept = ?headers.get("accept"), "mcp initialize");
     }
     let started = std::time::Instant::now();
     let resp = tokio::task::spawn_blocking(move || {
