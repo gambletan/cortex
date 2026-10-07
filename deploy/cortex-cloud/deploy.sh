@@ -22,6 +22,7 @@ if [[ -n "$(git status --porcelain -- cortex-core cortex-mcp-server cortex-cloud
   exit 1
 fi
 
+"${SSH[@]}" "mkdir -p ~/$REMOTE_DIR/src-tree"
 rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
   --exclude target --exclude .git --exclude cortex-python --exclude cortex-wasm \
   --exclude node_modules --exclude '*.db' --exclude '*.db-wal' --exclude '*.db-shm' \
