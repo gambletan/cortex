@@ -626,6 +626,7 @@ name = "cortex-mcp-server"
 version = "2.4.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "cortex-core",
@@ -634,6 +635,8 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha2",
  "tokio",
  "tower",
  "tracing",

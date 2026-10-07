@@ -222,7 +222,7 @@ println!("Applied {} remote changes", applied);
 | **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
 | **Zero telemetry** | No analytics, no phone-home, no user data ever leaves the device — **enforced in CI** (`scripts/check-no-network-egress.sh`): the build fails if any network/telemetry crate enters `cortex-core`'s default tree, and the check also proves the `--no-default-features` binary is completely zero-network. |
 | **Embedding model fetch (one-time)** | The default `cortex-mcp-server` enables on-device semantic search, which **downloads a ~30 MB model (all-MiniLM-L6-v2) from the Hugging Face CDN on first ingest**, then runs fully offline and sends none of your data. For a 100%-offline setup: run with `CORTEX_NO_EMBEDDINGS=1` (keyword/FTS recall, zero network) or build `--no-default-features`. A one-time stderr notice is printed before any download — nothing is ever fetched silently. |
-| **Muse gateway (opt-in)** | `gateway serve` is the only component that accepts remote requests. It serves a single read-only tool over an explicit per-memory export only. Every request needs a bearer token, and there are daily request and disclosure budgets, a kill switch, and a metadata-only audit log. The export namespace is reserved, so ordinary ingest and sync peers cannot write it. It is left out of the `-lite` build. [docs/muse.md](docs/muse.md) |
+| **Muse gateway (opt-in)** | `gateway serve` is the only component that accepts remote requests. It serves a single read-only tool over an explicit per-memory export only. Every request needs a token: OAuth (each sign-in approved locally with `gateway connect`; PKCE, rotating refresh tokens, hash-only storage) or a static bearer token. There are daily request and disclosure budgets, a kill switch, and a metadata-only audit log. The export namespace is reserved, so ordinary ingest and sync peers cannot write it. It is left out of the `-lite` build. [docs/muse.md](docs/muse.md) |
 | **No accounts** | No API key, no registration, no cloud dependency |
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
@@ -504,8 +504,8 @@ cortex-mcp-server ~/.cortex/memory.db info
 # Meta Muse gateway (see docs/muse.md)
 cortex-mcp-server gateway allow "I prefer aisle seats"   # export one memory to Muse
 cortex-mcp-server gateway preview "booking a flight"      # exactly what Muse would get
-export CORTEX_GATEWAY_TOKEN=$(cortex-mcp-server gateway token)
-cortex-mcp-server gateway serve                           # http://127.0.0.1:3316/mcp
+cortex-mcp-server gateway serve --oauth --public-url https://<you>.ts.net   # Muse signs in with OAuth
+cortex-mcp-server gateway connect K7QM-2XDF               # approve a sign-in, on your computer only
 cortex-mcp-server gateway off                             # kill switch
 ```
 

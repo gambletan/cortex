@@ -42,9 +42,10 @@ This is the prioritized forward plan. The per-iteration security audits
 - ✅ **v2.4.0** — `remember` shipped: Muse appends to a quarantined inbox and the user approves
   locally (`docs/design/muse-remember.md`). Also a full security review of v2.2.1–v2.3.0 (see
   CHANGELOG).
-- ⏭ **Next (blocker): OAuth 2.1 + DCR for the gateway**: Muse may
-  not accept a static bearer token (Hindsight's self-hosted Muse path uses OAuth), so this
-  must be verified with a real Muse account and is likely a blocker for real-world use.
+- ✅ **v2.5.0 — OAuth 2.1 for the gateway** (what Muse custom connectors use): discovery, DCR,
+  PKCE, rotating refresh tokens; every sign-in is approved locally with `gateway connect`
+  (`docs/design/muse-oauth.md`). npm now publishes via trusted publishing (OIDC).
+- ⏭ **Next:** verify with a real Muse account end to end (release gate).
 - ✅ **Iteration 21 — Unify single & batch ingest into one lifecycle (data-integrity, 2026-06-16).**
   `ingest_batch` had silently diverged from single ingest — it skipped near-dedup,
   fact-contradiction resolution, relationship extraction, the `on_post_ingest` hook, and

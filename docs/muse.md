@@ -1,8 +1,8 @@
 # Cortex × Meta Muse — give Muse your memory, keep your privacy
 
-> **Preview.** Muse is US-only, and we have not yet confirmed that Muse accepts a plain
-> bearer-token connector (some Muse memory integrations use OAuth). If it rejects the token,
-> please [open an issue](https://github.com/gambletan/cortex/issues) — OAuth is next.
+> **Preview.** Muse is US-only. Since v2.5 the gateway signs Muse in with OAuth (what Muse
+> custom connectors use), and every sign-in must be approved on your own computer. Problems?
+> [Open an issue](https://github.com/gambletan/cortex/issues).
 
 Muse is far more useful when it knows you: your kid's peanut allergy, that you always take
 the aisle seat, which coffee you like. Typical memory connectors for Muse keep your memory
@@ -27,6 +27,7 @@ Connect Cortex instead, and Muse gets only what you put in the export.
 | Can Muse write or delete? | No. It gets one read-only tool | Usually yes (retain, bank tools) |
 | Daily cap on what leaves | Yes: requests and distinct memories per day | No |
 | Kill switch | `gateway off` takes effect on the next request | Revoke the OAuth grant |
+| Who can sign Muse in | Only you, by typing `gateway connect <code>` on your computer | Whoever completes the web login |
 | Record of what was shared | Local audit log (ids, counts, outcome; never your query or text) | Vendor-side, often an enterprise feature |
 | Preview before sharing | `gateway preview "<question>"` | — |
 | Cost | Free, MIT, no account | Usage-based pricing or your own LLM bill |
@@ -52,12 +53,12 @@ cortex-mcp-server gateway list
 # 2. Check exactly what Muse would get
 cortex-mcp-server gateway preview "what should I avoid buying for my kid?"
 
-# 3. Start the gateway (local only) with a random token
-export CORTEX_GATEWAY_TOKEN=$(cortex-mcp-server gateway token)
-cortex-mcp-server gateway serve            # → http://127.0.0.1:3316/mcp
+# 3. Give it an HTTPS address Muse can reach
+tailscale funnel --bg 3316     # recommended: TLS terminates on YOUR machine
+                               # → https://<machine>.<tailnet>.ts.net
 
-# 4. Give it an HTTPS address Muse can reach
-tailscale funnel 3316          # recommended: TLS terminates on YOUR machine
+# 4. Start the gateway (listens on 127.0.0.1 only) with OAuth for that address
+cortex-mcp-server gateway serve --oauth --public-url https://<machine>.<tailnet>.ts.net
 ```
 
 Use a tunnel that terminates TLS **on your machine**, such as Tailscale Funnel or an opaque
@@ -69,8 +70,35 @@ When it is off, Muse simply can't reach your memory. That fails closed, which is
 intentional. Don't run it on a rented cloud server: the server would hold your key, so you
 would be trusting that provider instead of Meta.
 
-5. In Muse, say *"create a custom connector"*. Enter the URL `https://<your-tunnel>/mcp`
-   (MCP) and use `CORTEX_GATEWAY_TOKEN` as the bearer token.
+5. In Muse, say *"create a custom connector"* and give it `https://<your-tunnel>/mcp`
+   (MCP, OAuth). Muse opens a sign-in page that shows a code such as `K7QM-2XDF`.
+6. On your computer, run the command the page shows and answer `y`:
+
+   ```bash
+   cortex-mcp-server gateway connect K7QM-2XDF
+   ```
+
+   The page then continues by itself and Muse is connected.
+
+**Only approve a code that appeared right after *you* clicked Connect in Muse, on *your*
+screen.** Anyone can open the sign-in page of your gateway, but nobody gets in unless you
+run `connect`, so the one way in is to trick you into approving their code. The client
+name shown by `connect` is whatever the client chose to call itself; it is not verified.
+Nothing is ever typed into the sign-in page, so Meta's in-app browser never sees a password
+or token it could reuse.
+
+```bash
+cortex-mcp-server gateway clients            # who is signed in
+cortex-mcp-server gateway disconnect <id>    # sign one out (or --all), effective immediately
+```
+
+Muse gets a 1-hour access token and a 30-day refresh token that rotates on every use. If an
+old refresh token is ever used again, which means someone holds a copy, that sign-in is
+revoked and Muse has to be approved again. The gateway stores only hashes of tokens.
+
+Prefer a fixed token (scripts, other MCP clients)? Set
+`CORTEX_GATEWAY_TOKEN=$(cortex-mcp-server gateway token)` before `serve`; it works with or
+without `--oauth`. `disconnect --all` does not affect it: unset it and restart.
 
 ## Let Muse save to *your* memory (`remember`, v2.4)
 
@@ -100,7 +128,7 @@ deleted with you, not with Meta.
 ## Day-to-day control
 
 ```bash
-cortex-mcp-server gateway off        # kill switch: every request refused, immediately
+cortex-mcp-server gateway off        # kill switch: every request and sign-in refused, immediately
 cortex-mcp-server gateway on
 cortex-mcp-server gateway revoke <id>
 cortex-mcp-server gateway audit      # what was disclosed, when (no query or snippet text)

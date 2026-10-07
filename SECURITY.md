@@ -60,14 +60,17 @@ from the internet, through a tunnel the user runs. Full design and threat model:
 |---|---|
 | Scope | One read-only MCP tool. Only memories added with `gateway allow` (namespace `muse-export`, which is reserved: core rejects ordinary ingest and sync-peer writes to it). |
 | Freshness | Each request reads the export straight from SQLite, with no shared index or cache, so `revoke` takes effect on the next request. |
-| Auth | Bearer token (≥ 32 chars, random), constant-time compare, checked before any body byte is read; `Origin` allowlist; 64 KiB body with an absolute 10 s read deadline; 16 concurrent requests; one server per database. |
+| Auth | OAuth 2.1 (v2.5, `--oauth`): DCR restricted to allowlisted redirect URIs, PKCE S256 mandatory, **every sign-in approved on the user's machine** (`gateway connect <code>`, interactive; nothing typed in the browser grants access), single-use 60 s codes, 1 h access / 30 d rotating refresh tokens with reuse detection, tokens bound to the `/mcp` resource, only SHA-256 hashes stored. And/or a static bearer token (≥ 32 chars, random). Constant-time compare, checked before any body byte is read; `Origin` allowlist; 64 KiB body with an absolute 10 s read deadline; 16 concurrent requests; one server per database. |
 | Budgets | Per UTC day: requests and **distinct** memories disclosed. Every call is charged first. Over the disclosure budget, unseen matches are withheld silently, so no search oracle. |
-| Kill switch | `gateway off` takes effect immediately and fails closed on I/O errors. |
+| Kill switch | `gateway off` takes effect immediately and fails closed on I/O errors. It refuses every MCP method, sign-ins and token requests, and cancels sign-ins in progress; signed-in clients are suspended until `on` (`disconnect` revokes them). |
 | Audit | Local JSONL with metadata only (ids, counts, outcome), never the query or text. 0600, rotated. |
 
 **Not protected:** anything returned to Muse is in Meta's cloud and cannot be recalled. Use a
 tunnel that terminates TLS on your machine (e.g. Tailscale Funnel). Edge-terminating tunnels
-can read traffic. Whoever controls the gateway host can read the database.
+can read traffic. Whoever controls the gateway host can read the database. OAuth relay
+phishing is reduced, not closed: an attacker can start a sign-in and try to talk the user
+into approving the attacker's code; `connect` shows the full redirect and marks the client
+name as unverified ([docs/design/muse-oauth.md](docs/design/muse-oauth.md)).
 
 ## Zero Telemetry Verification
 

@@ -27,7 +27,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,8 @@ use cortex_core::Cortex;
 
 use crate::tools::{content_to_string, redact_emails};
 use crate::{JsonRpcRequest, JsonRpcResponse, SERVER_VERSION};
+
+mod oauth;
 
 /// The only namespace the gateway ever reads. Membership is the user's explicit consent;
 /// core rejects ordinary ingest and sync writes into it.
@@ -77,7 +79,7 @@ const ALL_TIERS: [MemoryTier; 5] = [
 
 #[derive(Subcommand)]
 pub enum GatewayAction {
-    /// Serve the Muse MCP endpoint (requires CORTEX_GATEWAY_TOKEN)
+    /// Serve the Muse MCP endpoint (CORTEX_GATEWAY_TOKEN and/or --oauth)
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -98,6 +100,25 @@ pub enum GatewayAction {
         /// Max `remember` items accepted per UTC day
         #[arg(long, default_value_t = 20)]
         daily_remembers: u32,
+        /// Let clients sign in with OAuth (what Muse uses); each sign-in needs `gateway connect`
+        #[arg(long, requires = "public_url")]
+        oauth: bool,
+        /// The public https URL of this gateway (your tunnel), e.g. https://me.tail1234.ts.net
+        #[arg(long, requires = "oauth")]
+        public_url: Option<String>,
+        /// Extra OAuth redirect URI to allow (Muse's callback is always allowed)
+        #[arg(long, requires = "oauth")]
+        oauth_redirect: Vec<String>,
+    },
+    /// Approve (or refuse) an OAuth sign-in: the code shown on the sign-in page
+    Connect { code: String },
+    /// List clients signed in with OAuth
+    Clients,
+    /// Sign out an OAuth client (or all of them with --all)
+    Disconnect {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// List items Muse asked to remember, pending your review
     Inbox,
@@ -137,6 +158,7 @@ pub enum GatewayAction {
 
 // ── State files ──────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Paths {
     disabled: PathBuf,
     budget: PathBuf,
@@ -144,6 +166,8 @@ struct Paths {
     lock: PathBuf,
     inbox: PathBuf,
     inbox_lock: PathBuf,
+    oauth: PathBuf,
+    oauth_lock: PathBuf,
 }
 
 impl Paths {
@@ -160,6 +184,8 @@ impl Paths {
             lock: dir.join("gateway.lock"),
             inbox: dir.join("gateway-inbox.jsonl"),
             inbox_lock: dir.join("gateway-inbox.lock"),
+            oauth: dir.join("gateway-oauth.json"),
+            oauth_lock: dir.join("gateway-oauth.lock"),
         }
     }
 
@@ -457,13 +483,27 @@ fn parse_args(args: &Value) -> Result<(String, usize), String> {
     Ok((query.to_string(), limit as usize))
 }
 
+std::thread_local! {
+    /// Who the request on this (blocking) thread came from: `static` or an OAuth grant id.
+    /// Set by `handle_as` around one request; read only by `audit`.
+    static CALLER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 impl Gateway {
+    fn handle_as(&self, caller: &str, req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        CALLER.with(|c| *c.borrow_mut() = caller.to_string());
+        let out = self.handle(req);
+        CALLER.with(|c| c.borrow_mut().clear());
+        out
+    }
+
     fn audit(&self, tool: &str, n: usize, ids: &[String], bytes: usize, outcome: &str) -> Result<(), String> {
         append_audit(
             &self.paths.audit,
             &json!({
                 "ts": chrono::Utc::now().to_rfc3339(),
                 "method": "tools/call",
+                "client": CALLER.with(|c| c.borrow().clone()),
                 "tool": tool,
                 "n_results": n,
                 "memory_ids": ids,
@@ -761,7 +801,9 @@ fn tool_schema() -> Value {
 
 struct HttpState {
     gw: Gateway,
-    token: String,
+    /// Static bearer token (`CORTEX_GATEWAY_TOKEN`); optional when OAuth is on.
+    token: Option<String>,
+    oauth: Option<oauth::OAuthConfig>,
     origins: Vec<String>,
     /// Bounds the blocking work actually in flight. The permit moves into the blocking
     /// task, so it is held for as long as the work runs, even if the client goes away.
@@ -777,37 +819,81 @@ fn rpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response {
     (status, [("content-type", "application/json")], body).into_response()
 }
 
-async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body: axum::body::Body) -> Response {
-    let authorized = headers
+/// Read a request body under an ABSOLUTE deadline (a per-frame timer would let a client
+/// trickle one byte every few seconds and hold a slot indefinitely).
+async fn read_body(headers: &HeaderMap, body: axum::body::Body, max: usize) -> Result<Bytes, Response> {
+    let declared = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > max) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+    }
+    let read = axum::body::to_bytes(body, max);
+    match tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), read).await {
+        Ok(Ok(b)) => Ok(b),
+        Ok(Err(_)) => Err(StatusCode::PAYLOAD_TOO_LARGE.into_response()),
+        Err(_) => Err(StatusCode::REQUEST_TIMEOUT.into_response()),
+    }
+}
+
+fn unauthorized(st: &HttpState, presented: bool) -> Response {
+    let challenge = match &st.oauth {
+        Some(o) => o.challenge(presented),
+        None => "Bearer".to_string(),
+    };
+    (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]).into_response()
+}
+
+/// `static` for the configured token, the grant id for a live OAuth access token.
+async fn authenticate(st: &Arc<HttpState>, headers: &HeaderMap) -> Result<String, Response> {
+    let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, t)| t)
-        .is_some_and(|t: &str| ct_eq(t.as_bytes(), st.token.as_bytes()));
-    if !authorized {
-        return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Bearer")]).into_response();
+        .map(|(_, t)| t.trim().to_string());
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Err(unauthorized(st, false));
+    };
+    if st.token.as_deref().is_some_and(|s| ct_eq(token.as_bytes(), s.as_bytes())) {
+        return Ok("static".into());
     }
+    // Only token-shaped strings reach the disk, and only within the bounded worker pool.
+    if let Some(o) = st.oauth.as_ref().filter(|_| oauth::is_token_shaped(&token)) {
+        let Ok(permit) = st.workers.clone().try_acquire_owned() else {
+            return Err(rpc_error_response(StatusCode::SERVICE_UNAVAILABLE, -32000, "Server busy"));
+        };
+        let (paths, resource) = (st.gw.paths.clone(), o.resource.clone());
+        let grant = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            oauth::grant_for_access_token(&paths, &resource, &token)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(g) = grant {
+            return Ok(g);
+        }
+    }
+    Err(unauthorized(st, true))
+}
+
+async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body: axum::body::Body) -> Response {
+    let caller = match authenticate(&st, &headers).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
     if let Some(origin) = headers.get("origin") {
         let ok = origin.to_str().is_ok_and(|o| st.origins.iter().any(|a| a == o));
         if !ok {
             return StatusCode::FORBIDDEN.into_response();
         }
     }
-    // The body is read only after auth, under an ABSOLUTE deadline (a per-frame timer would
-    // let a client trickle one byte every few seconds and hold a slot indefinitely).
-    let declared = headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > MAX_BODY_BYTES) {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    }
-    let read = axum::body::to_bytes(body, MAX_BODY_BYTES);
-    let body: Bytes = match tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), read).await {
-        Ok(Ok(b)) => b,
-        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    // The body is read only after auth.
+    let body = match read_body(&headers, body, MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(r) => return r,
     };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -820,13 +906,18 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
         Ok(r) => r,
         Err(_) => return rpc_error_response(StatusCode::BAD_REQUEST, -32600, "Invalid request"),
     };
+    // Kill switch covers every method. `tools/call` checks it itself, after charging the
+    // request budget (so a refusal is never a free oracle) and auditing.
+    if req.method != "tools/call" && st.gw.paths.is_disabled() {
+        return rpc_error_response(StatusCode::FORBIDDEN, -32000, "Memory access for Muse is turned off by the user");
+    }
     let Ok(permit) = st.workers.clone().try_acquire_owned() else {
         return rpc_error_response(StatusCode::SERVICE_UNAVAILABLE, -32000, "Server busy");
     };
     let st2 = st.clone();
     let resp = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        st2.gw.handle(&req)
+        st2.gw.handle_as(&caller, &req)
     })
     .await;
     match resp {
@@ -842,12 +933,21 @@ async fn handle_post(State(st): State<Arc<HttpState>>, headers: HeaderMap, body:
 }
 
 fn router(state: Arc<HttpState>) -> Router {
-    Router::new()
-        .route(
-            "/mcp",
-            post(handle_post).get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
-        )
-        .fallback(|| async { StatusCode::NOT_FOUND })
+    let mut r = Router::new().route(
+        "/mcp",
+        post(handle_post).get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+    );
+    if state.oauth.is_some() {
+        r = r
+            .route("/.well-known/oauth-protected-resource", get(oauth::protected_resource))
+            .route("/.well-known/oauth-protected-resource/mcp", get(oauth::protected_resource))
+            .route("/.well-known/oauth-authorization-server", get(oauth::authorization_server))
+            .route("/register", post(oauth::register))
+            .route("/authorize", get(oauth::authorize))
+            .route("/authorize/wait", get(oauth::authorize_wait))
+            .route("/token", post(oauth::token));
+    }
+    r.fallback(|| async { StatusCode::NOT_FOUND })
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         // Body reads have an absolute deadline in `handle_post`. Deliberately no whole-request
         // timeout: that would drop the response while the blocking disclosure keeps running
@@ -961,7 +1061,35 @@ pub fn run(action: GatewayAction, db_path: &str) {
         },
         GatewayAction::Off => {
             std::fs::write(&paths.disabled, b"off\n").unwrap_or_else(|e| die(&e.to_string()));
+            // Sign-ins in flight die with the switch; signed-in clients are suspended, not revoked.
+            if let Err(e) = oauth::cancel_in_flight(&paths) {
+                eprintln!("warning: could not cancel OAuth sign-ins in progress: {e}");
+            }
             println!("Muse access is OFF");
+        }
+        GatewayAction::Connect { code } => match oauth::connect(&paths, &code, true) {
+            Ok(true) => println!("Approved. The sign-in page continues by itself."),
+            Ok(false) => {
+                println!("Refused.");
+            }
+            Err(e) => die(&e),
+        },
+        GatewayAction::Clients => {
+            for line in oauth::list_grants(&paths).unwrap_or_else(|e| die(&e)) {
+                println!("{line}");
+            }
+        }
+        GatewayAction::Disconnect { id, all } => {
+            let n = match (id.as_deref(), all) {
+                (None, true) => oauth::disconnect(&paths, None),
+                (Some(id), false) => match oauth::disconnect(&paths, Some(id)) {
+                    Ok(0) => die("no signed-in client with that id (see `gateway clients`)"),
+                    other => other,
+                },
+                _ => die("give either an ID or --all"),
+            }
+            .unwrap_or_else(|e| die(&e));
+            println!("disconnected {n}");
         }
         GatewayAction::On => {
             match std::fs::remove_file(&paths.disabled) {
@@ -1024,12 +1152,23 @@ pub fn run(action: GatewayAction, db_path: &str) {
             allow_origin,
             enable_remember,
             daily_remembers,
+            oauth,
+            public_url,
+            oauth_redirect,
         } => {
-            let token = std::env::var("CORTEX_GATEWAY_TOKEN").unwrap_or_default();
-            let distinct = token.chars().collect::<BTreeSet<_>>().len();
-            if token.len() < MIN_TOKEN_LEN || distinct < MIN_TOKEN_DISTINCT_CHARS {
-                die("CORTEX_GATEWAY_TOKEN must be a random string of at least 32 characters (try `gateway token`)");
+            let token = std::env::var("CORTEX_GATEWAY_TOKEN").ok().filter(|t| !t.is_empty());
+            if let Some(t) = &token {
+                let distinct = t.chars().collect::<BTreeSet<_>>().len();
+                if t.len() < MIN_TOKEN_LEN || distinct < MIN_TOKEN_DISTINCT_CHARS {
+                    die("CORTEX_GATEWAY_TOKEN must be a random string of at least 32 characters (try `gateway token`)");
+                }
+            } else if !oauth {
+                die("set CORTEX_GATEWAY_TOKEN (try `gateway token`) or use --oauth --public-url <https URL>");
             }
+            let oauth_cfg = match (oauth, public_url) {
+                (true, Some(url)) => Some(oauth::OAuthConfig::new(&url, &oauth_redirect).unwrap_or_else(|e| die(&e))),
+                _ => None,
+            };
             // One server per state dir: two would race on the budget file.
             let lock = private_options()
                 .create(true)
@@ -1060,6 +1199,7 @@ pub fn run(action: GatewayAction, db_path: &str) {
                     lock: Mutex::new(()),
                 },
                 token,
+                oauth: oauth_cfg,
                 origins: allow_origin,
                 workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             });
@@ -1073,6 +1213,9 @@ pub fn run(action: GatewayAction, db_path: &str) {
                     eprintln!("WARNING: bound to non-loopback {addr}; expose it only through an HTTPS tunnel");
                 }
                 eprintln!("cortex gateway listening on http://{addr}/mcp");
+                if let Some(o) = &state.oauth {
+                    eprintln!("OAuth on: add the connector in Muse with {}", o.resource);
+                }
                 axum::serve(listener, router(state)).await.unwrap_or_else(|e| die(&e.to_string()));
             });
             drop(lock);

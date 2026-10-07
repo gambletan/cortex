@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.5.0 — Muse signs in with OAuth; you approve every sign-in on your own computer
+
+### New
+- `gateway serve --oauth --public-url https://<your tunnel>`: the gateway is now its own single-user OAuth 2.1 server, which is how Muse custom connectors connect. Discovery (RFC 9728 + RFC 8414), dynamic client registration (RFC 7591), PKCE S256, `iss` in responses, resource-bound tokens (RFC 8707)
+- **Every sign-in is approved on your machine:** the sign-in page shows a code; `gateway connect <code>` shows the request (client name marked unverified, full redirect, age) and asks `y/N`. Nothing typed in the browser grants access, so Meta's in-app browser never sees a reusable secret
+- `gateway clients` / `gateway disconnect <id>|--all` (effective on the next request)
+- The audit log records which client (`static` or a sign-in id) made each call
+
+### Security
+- Registration only accepts allowlisted redirect URIs (Muse's callback; more with `--oauth-redirect`); omitted `token_endpoint_auth_method` means `client_secret_basic` (RFC 7591), enforced with no downgrade. Field caps, 50 clients / 10 sign-ins in flight, per-endpoint rate limits; a client in use is never evicted
+- Codes: minted only when the approved sign-in is first polled (atomically consumed), single use, 60 s. Access tokens 1 h; refresh tokens 30 d, rotated on every use; replaying a rotated refresh token revokes the sign-in. Sign-ins expire after 180 days. Only SHA-256 hashes are stored (`gateway-oauth.json`, 0600, atomic + fsync, file lock shared with the CLI)
+- The kill switch now refuses every MCP method (not just tool calls), sign-ins and token requests, and cancels sign-ins in progress. Signed-in clients are suspended, not revoked
+- Sign-in pages: no form, `frame-ancestors 'none'`, `no-store`, `no-referrer`, all client strings escaped
+- `CORTEX_GATEWAY_TOKEN` is optional with `--oauth` and keeps working alongside it
+
+### Release
+- npm publishes through **trusted publishing (OIDC)** with provenance; no npm token is stored anywhere
+
 ## v2.4.0 — `remember`: Muse saves to your memory, you approve
 
 ### New
