@@ -74,7 +74,9 @@ struct Args {
     master_key: PathBuf,
 }
 
-type Tenant = (Router, Arc<Cortex>, Paths);
+/// A tenant's gateway, its database, its state paths, and the public id the router was
+/// built for (its OAuth issuer).
+type Tenant = (Router, Arc<Cortex>, Paths, String);
 
 struct App {
     base_url: String,
@@ -308,7 +310,7 @@ impl App {
         let paths = Paths::for_dir(&dir, Some(derive(&self.master, "inbox", rid)));
         let cfg = oauth::OAuthConfig::for_tenant(&self.base_url, &pid, self.oauth_rate.clone())?;
         let router = gateway::tenant_router(cortex.clone(), paths.clone(), cfg, &TenantConfig::default());
-        let entry: Tenant = (router, cortex, paths);
+        let entry: Tenant = (router, cortex, paths, pid.clone());
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         // Deleted while we were opening? Then don't resurrect it.
         if !dir.join("device.pub").is_file() {
@@ -616,7 +618,7 @@ async fn tenant_api(
                 Err(e) => return internal(e),
             };
             let paths = match open_or_drop(&app2, &rid) {
-                Ok((_, _, p)) => p,
+                Ok((_, _, p, _)) => p,
                 Err(r) => return r,
             };
             return match oauth::open_enrollment(&paths, ENROLL_SECS) {
@@ -624,7 +626,7 @@ async fn tenant_api(
                 Err(e) => internal(e),
             };
         }
-        let (_, cortex, paths) = match open_or_drop(&app2, &rid) {
+        let (_, cortex, paths, _) = match open_or_drop(&app2, &rid) {
             Ok(t) => t,
             Err(r) => return r,
         };
@@ -722,12 +724,12 @@ async fn route_tenant(State(app): State<Arc<App>>, req: Request) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
     let router = match app.cached(&rid) {
-        Some((router, _, _)) => router,
+        Some(t) => t,
         None => {
             let app2 = app.clone();
             let rid2 = rid.clone();
             match blocking(move || app2.tenant(&rid2)).await {
-                Ok(Ok(Some((router, _, _)))) => router,
+                Ok(Ok(Some(t))) => t,
                 Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "tenant open failed");
@@ -737,6 +739,13 @@ async fn route_tenant(State(app): State<Arc<App>>, req: Request) -> Response {
             }
         }
     };
+    // The router must have been built for exactly the public id in this request: a stale
+    // link racing a rotation must never be answered by the new router (whose discovery
+    // would reveal the new link).
+    let (router, _, _, built_for) = router;
+    if built_for != pid {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let (mut parts, body) = req.into_parts();
     let pq = match parts.uri.query() {
         Some(q) => format!("{inner_path}?{q}"),
