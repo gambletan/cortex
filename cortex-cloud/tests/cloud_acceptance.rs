@@ -1703,3 +1703,22 @@ fn review_delete_reports_when_the_cloud_could_not_be_updated() {
     let out = dev.call("memory_delete", json!({ "id": id })).json();
     assert!(out["muse_cloud"].as_str().unwrap_or_default().contains("NOT updated"), "{out}");
 }
+
+#[test]
+fn review_deleting_the_original_also_unshares_its_copy() {
+    let tmp = TempDir::new("rv-source-delete");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let id = dev.call("memory_ingest", json!({ "text": "Iota original fact", "channel": "t" })).json()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let link = dev.call_confirmed("muse_connect", json!({ "memory_ids": [id.clone()] })).json();
+    let pid = rid_of(link["link"].as_str().unwrap());
+    let token = Muse::new(&cloud, &pid).sign_in();
+    let out = dev.call("memory_delete", json!({ "id": id })).json();
+    assert_eq!(out["also_unshared_from_muse"], json!(1), "{out}");
+    assert_eq!(dev.status()["shared"].as_array().map(Vec::len), Some(0));
+    let hits = Muse::new(&cloud, &pid).recall(&token, "Iota original fact");
+    assert!(hits.is_empty(), "{hits:?}");
+}

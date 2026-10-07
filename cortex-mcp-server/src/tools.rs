@@ -628,8 +628,38 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_ingest_batch" => tool_memory_ingest_batch(cortex, args),
         "tag_list_taxonomy" => tool_tag_list_taxonomy(cortex),
         "memory_delete" => {
+            // Forgetting a memory also stops sharing it: Muse export copies are copies by
+            // text, so find them before the original is gone.
+            #[cfg(feature = "gateway")]
+            let copies: Vec<Uuid> = get_str(args, "id")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| cortex.storage().get_memory(id).ok().flatten())
+                .filter(|m| m.namespace.as_deref() != Some(crate::gateway::EXPORT_NS))
+                .map(|m| {
+                    let text = content_to_string(&m.content);
+                    crate::gateway::export_rows(cortex)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|e| content_to_string(&e.content) == text)
+                        .map(|e| e.id)
+                        .collect()
+                })
+                .unwrap_or_default();
             #[allow(unused_mut)]
             let mut out = tool_memory_delete(cortex, args);
+            #[cfg(feature = "gateway")]
+            if out.is_ok() && !copies.is_empty() {
+                for id in &copies {
+                    if let Err(e) = cortex.delete_memory(*id) {
+                        out = Err(format!("deleted the memory, but could not stop sharing its Muse copy: {e}"));
+                    }
+                }
+                if let Ok(text) = &out {
+                    let mut v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+                    v["also_unshared_from_muse"] = json!(copies.len());
+                    out = Ok(v.to_string());
+                }
+            }
             // Deleting a shared memory must also stop Muse seeing it in Cortex Cloud — and if
             // that can't happen right now, the caller is told, not just a log line.
             #[cfg(feature = "gateway")]
