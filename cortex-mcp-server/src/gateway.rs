@@ -696,8 +696,9 @@ impl Gateway {
     fn instructions(&self) -> String {
         let mut s = String::from(
             "Personal memory the user explicitly shared with you, served live from their own Cortex. \
-             Call recall_memory when the user's own facts, preferences, or history would help: one call \
-             per topic is enough (results are complete). Do not copy these memories into your own \
+             Call recall_memory when the user's own facts, preferences, or history would help. It returns \
+             the most relevant matches (a few at most), not everything: don't repeat an identical query; \
+             ask a narrower or different one if you need more. Do not copy these memories into your own \
              long-term memory; query again when needed, so the user's revocations take effect.",
         );
         if self.remember_enabled {
@@ -862,7 +863,7 @@ fn terminal_safe(s: &str) -> String {
 fn tool_schema() -> Value {
     json!({
         "name": TOOL_NAME,
-        "description": "Search the user's personal memory (only what they chose to share). One call per topic is enough: results are complete and live. Do not store them in your own memory; call again when needed.",
+        "description": "Search the user's personal memory (only what they chose to share). Returns the few most relevant matches, live; don't repeat an identical query, ask a narrower one for more. Do not store them in your own memory; call again when needed.",
         "inputSchema": {
             "type": "object",
             "properties": {
