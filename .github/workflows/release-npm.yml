@@ -1,8 +1,9 @@
 name: Release npm package
 
 # Auto-publish the OpenClaw plugin (@cortex-ai-memory/cortex-memory) to npm on every
-# version tag, so npm never lags a release. Requires the NPM_TOKEN repo secret
-# (an npm automation token with publish rights to the @cortex-ai-memory scope).
+# version tag, so npm never lags a release. Uses npm trusted publishing (OIDC): no npm
+# token is stored anywhere. One-time setup on npmjs.com → package Settings → Trusted
+# Publisher → GitHub Actions: owner `gambletan`, repo `cortex`, workflow `release-npm.yml`.
 on:
   push:
     tags: ['v*']
@@ -10,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # OIDC token for npm trusted publishing
 
 jobs:
   publish:
@@ -19,9 +21,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
       - name: Guard — package version must match the tag
+        if: github.ref_type == 'tag'   # a manual run on main publishes the manifest version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PKG=$(node -p "require('./openclaw-plugin/package.json').version")
@@ -32,8 +35,7 @@ jobs:
       - name: Build & publish
         working-directory: openclaw-plugin
         run: |
+          npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
           npm install
           npm run build
           npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
