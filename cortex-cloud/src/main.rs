@@ -340,11 +340,18 @@ impl App {
     fn remove_tenant(&self, rid: &str) -> std::io::Result<()> {
         let Some(dir) = self.tenant_dir(rid) else { return Ok(()) };
         if let Some(pid) = self.public_id(rid) {
-            let _ = std::fs::remove_file(self.public_dir.join(pid));
+            match std::fs::remove_file(self.public_dir.join(pid)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => sync_dir(&self.public_dir)?,
+            }
         }
         let trash = self.trash_dir.join(format!("{rid}-{}", rand::random::<u64>()));
         match std::fs::rename(&dir, &trash) {
-            Ok(()) => {}
+            // Durable before we report success: a power loss must not bring it back.
+            Ok(()) => {
+                sync_dir(&self.tenants_dir)?;
+                sync_dir(&self.trash_dir)?;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }

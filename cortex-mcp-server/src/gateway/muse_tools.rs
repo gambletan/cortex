@@ -76,7 +76,9 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     let mut f = private_options().write(true).create_new(true).open(&tmp).map_err(|e| e.to_string())?;
     f.write_all(data).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    // The retry marker lives here: it must survive power loss.
+    super::sync_parent(path).map_err(|e| e.to_string())
 }
 
 fn load_state(cortex: &Cortex) -> Result<State, String> {
@@ -227,14 +229,11 @@ fn planned(cortex: &Cortex, args: &Value) -> Result<Vec<String>, String> {
     Ok(texts)
 }
 
+/// Identifies exactly this list (a JSON array is unambiguous, whatever the texts contain).
 fn plan_hash(texts: &[String]) -> String {
     use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    for t in texts {
-        h.update(t.as_bytes());
-        h.update([0u8]);
-    }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    let encoded = serde_json::to_vec(texts).unwrap_or_default();
+    Sha256::digest(&encoded).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Two-step sharing. Without a valid `confirmation`, returns the preview and a fresh code
@@ -514,4 +513,16 @@ fn disconnect(cortex: &Cortex) -> Result<Value, String> {
         "disconnected": true,
         "note": "Everything in Cortex Cloud was deleted and Muse can no longer read anything. The shared list is kept on this computer; connect again any time."
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_hash_distinguishes_lists_whatever_the_texts_contain() {
+        assert_ne!(plan_hash(&["first\u{0}second".into()]), plan_hash(&["first".into(), "second".into()]));
+        assert_ne!(plan_hash(&["a,b".into()]), plan_hash(&["a".into(), "b".into()]));
+        assert_eq!(plan_hash(&["x".into()]), plan_hash(&["x".into()]));
+    }
 }

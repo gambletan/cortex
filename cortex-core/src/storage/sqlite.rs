@@ -68,14 +68,22 @@ impl SqliteStorage {
         Self::open_keyed(path, passphrase.map(DbKey::Passphrase), READ_POOL_SIZE)
     }
 
-    /// Open with a raw 256-bit SQLCipher key (no per-open PBKDF2) and `readers` read
-    /// connections. For services that open many small databases (one per tenant).
+    /// Open with a raw 256-bit SQLCipher key (no per-open PBKDF2), `readers` read
+    /// connections, and fully durable commits (`synchronous=FULL`). For services that open many small databases (one per tenant).
     /// Fails if SQLCipher is not compiled in: a raw key must never silently mean plaintext.
     pub fn open_with_raw_key(path: &str, key: &[u8; 32], readers: usize) -> Result<Self, CortexError> {
         if !cfg!(feature = "encrypted-db") {
             return Err(CortexError::Storage("encrypted-db feature is required for a raw key".into()));
         }
-        Self::open_keyed(path, Some(DbKey::Raw(key)), readers.max(1))
+        let storage = Self::open_keyed(path, Some(DbKey::Raw(key)), readers.max(1))?;
+        // Services acknowledge writes to remote clients (e.g. "unshared"): a commit must
+        // survive power loss before that acknowledgement.
+        storage
+            .write_conn
+            .lock()
+            .execute_batch("PRAGMA synchronous=FULL;")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        Ok(storage)
     }
 
     fn apply_key(conn: &Connection, key: Option<&DbKey>) -> Result<(), CortexError> {
