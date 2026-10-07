@@ -141,7 +141,17 @@ fn private_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // Durable before we acknowledge: nonces and the export watermark are security state.
+    sync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
@@ -446,7 +456,8 @@ async fn register(
             }
             private_write(&staging.join("device.pub"), key.as_bytes())?;
             private_write(&staging.join("last_seen"), now().to_string().as_bytes())?;
-            std::fs::rename(&staging, app2.tenants_dir.join(&rid))
+            std::fs::rename(&staging, app2.tenants_dir.join(&rid))?;
+            sync_dir(&app2.tenants_dir)
         };
         create().map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);

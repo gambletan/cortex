@@ -78,6 +78,14 @@ fn mcp_server_bin() -> PathBuf {
             assert!(st.success(), "building cortex-mcp-server failed");
         }
         assert!(p.exists(), "cortex-mcp-server binary not found at {}", p.display());
+        // `cargo test -p cortex-cloud` doesn't rebuild that binary: refuse to test a stale one.
+        let built = std::fs::metadata(&p).and_then(|m| m.modified()).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../cortex-mcp-server/src");
+        let newest = files_under(&src).iter().filter_map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).max();
+        assert!(
+            newest.is_none_or(|n| n <= built),
+            "cortex-mcp-server binary is older than its sources: run `cargo build -p cortex-mcp-server` (or test the workspace)"
+        );
         p
     })
     .clone()
@@ -1373,6 +1381,31 @@ fn review_client_recovers_when_the_cloud_lost_its_tenant() {
     // Disconnect is idempotent even if the cloud already forgot us.
     let out = dev.call("muse_disconnect", json!({}));
     assert!(!out.is_error, "{}", out.text);
+}
+
+#[test]
+fn review_unshare_while_the_cloud_is_down_is_not_lost() {
+    let tmp = TempDir::new("rv-unshare-down");
+    let cloud = Cloud::start(tmp.path());
+    let dev = Dev::new(tmp.path(), &cloud);
+    let link = dev.connect_texts(&["Gamma secret", "Delta public"]);
+    let rid = rid_of(link["link"].as_str().unwrap());
+    let token = Muse::new(&cloud, &rid).sign_in();
+    let shared = dev.status()["shared"].as_array().unwrap().clone();
+    let id_of = |t: &str| shared.iter().find(|s| s["text"] == json!(t)).unwrap()["id"].as_str().unwrap().to_string();
+    let (gamma, delta) = (id_of("Gamma secret"), id_of("Delta public"));
+    cloud.stop();
+    // Two unshares while the cloud is down: both must survive until the next sync.
+    assert!(dev.call("muse_unshare", json!({ "shared_ids": [gamma] })).is_error);
+    assert!(dev.call("muse_unshare", json!({ "shared_ids": [delta] })).is_error);
+    let cloud2 = Cloud::start(tmp.path());
+    let dev2 = Dev::new(tmp.path(), &cloud2);
+    let _ = dev2.call("muse_status", json!({}));
+    let muse = Muse::new(&cloud2, &rid);
+    for q in ["Gamma secret", "Delta public"] {
+        let hits = muse.recall(&token, q);
+        assert!(hits.is_empty(), "{q} must be gone after the retry: {hits:?}");
+    }
 }
 
 #[test]

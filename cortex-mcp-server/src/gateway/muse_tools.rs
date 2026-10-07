@@ -371,22 +371,18 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     if ids.is_empty() {
         return Err("Give shared_ids (from muse_status).".into());
     }
-    // A previous unshare whose push failed is completed first, so retrying it always
-    // reaches the cloud even though the row is already gone locally.
-    let dev = device(cortex)?;
-    settle(cortex, &dev)?;
-    // Validate the whole list first: never a partial unshare.
+    // Parse everything first: a malformed id changes nothing.
+    let parsed: Vec<Uuid> = ids
+        .iter()
+        .map(|id| Uuid::parse_str(id).map_err(|_| format!("not a shared id: {id}")))
+        .collect::<Result<_, _>>()?;
     let export: Vec<Uuid> = export_rows(cortex)?.into_iter().map(|m| m.id).collect();
-    let mut targets = Vec::new();
-    for id in &ids {
-        let id = Uuid::parse_str(id).map_err(|_| format!("not a shared id: {id}"))?;
-        if !export.contains(&id) {
-            return Err(format!("{id} is not in the shared list (see muse_status)"));
-        }
-        targets.push(id);
-    }
+    // Ids already gone locally are fine (idempotent: e.g. retrying after a failed push).
+    let targets: Vec<Uuid> = parsed.into_iter().filter(|id| export.contains(id)).collect();
+    let dev = device(cortex)?;
     if dev.rid.is_some() {
-        // Record "cloud is behind" before deleting, so a crash or failed push is retried.
+        // Record "cloud is behind" BEFORE deleting, so a crash or a failed push is retried
+        // with the new list, whatever happens next.
         let mut st = load_state(cortex)?;
         st.dirty = true;
         save_state(cortex, &st)?;
@@ -394,11 +390,10 @@ fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
     for id in &targets {
         cortex.delete_memory(*id).map_err(|e| e.to_string())?;
     }
-    let removed = targets.len();
     if dev.rid.is_some() {
         push(cortex, &dev)?;
     }
-    Ok(json!({ "removed": removed, "shared": export_rows(cortex)?.len() }))
+    Ok(json!({ "removed": targets.len(), "shared": export_rows(cortex)?.len() }))
 }
 
 fn status(cortex: &Cortex) -> Result<Value, String> {
