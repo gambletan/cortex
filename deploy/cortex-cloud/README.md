@@ -37,6 +37,16 @@ BASE_URL=https://cortex.alvinsclub.ai SITE=/etc/nginx/sites-available/cortex dep
 curl --fail https://cortex.alvinsclub.ai/healthz
 ```
 
+Install the certificate reload hook on the nginx host and test renewal:
+
+```bash
+sudo install -m 755 deploy/cortex-cloud/renew-cortex-cert.sh /etc/letsencrypt/renewal-hooks/deploy/cortex-nginx
+sudo certbot renew --cert-name cortex.alvinsclub.ai --dry-run --run-deploy-hooks
+```
+
+The hook reloads nginx only when this domain renews, after checking its configuration.
+See [Certbot's renewal-hook documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
+
 Do not bypass certificate checks. Switching the service's base URL changes its OAuth
 issuer/resource: existing Muse connectors must reconnect. Existing local device state
 retains its previous base URL, so set `CORTEX_CLOUD_URL=https://cortex.alvinsclub.ai` for

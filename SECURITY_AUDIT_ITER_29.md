@@ -89,3 +89,7 @@ The user supplied `cortex.alvinsclub.ai`. DNS resolves, but ordinary verified HT
 A dedicated nginx site example and rollout instructions are prepared. Compiled defaults
 and the running server have not changed. Release needs matching TLS coverage, routing
 verification, and deliberate OAuth issuer migration/reconnection of existing clients.
+
+Subsequent user-authorized release: see
+[`RELEASE_2026-10-07.md`](deploy/cortex-cloud/RELEASE_2026-10-07.md) for the completed
+dedicated-host deployment, verified TLS/renewal, and 34 passing production checks.
