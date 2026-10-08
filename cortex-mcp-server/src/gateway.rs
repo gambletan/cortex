@@ -901,6 +901,8 @@ fn rpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response {
 
 /// Read a request body under an ABSOLUTE deadline (a per-frame timer would let a client
 /// trickle one byte every few seconds and hold a slot indefinitely).
+// Return the ready HTTP rejection directly, as in the cloud request helpers.
+#[allow(clippy::result_large_err)]
 async fn read_body(headers: &HeaderMap, body: axum::body::Body, max: usize) -> Result<Bytes, Response> {
     let declared = headers
         .get("content-length")
@@ -926,6 +928,8 @@ fn unauthorized(st: &HttpState, presented: bool) -> Response {
 }
 
 /// `static` for the configured token, the grant id for a live OAuth access token.
+// Authentication failures carry a ready response, including the OAuth challenge.
+#[allow(clippy::result_large_err)]
 async fn authenticate(st: &Arc<HttpState>, headers: &HeaderMap) -> Result<String, Response> {
     let token = headers
         .get("authorization")
@@ -1550,7 +1554,7 @@ pub fn reads_today(cortex: &Cortex, paths: &Paths) -> Result<Vec<(String, usize)
         .collect();
     let mut out: Vec<(String, usize)> =
         counts.into_iter().filter_map(|(id, n)| texts.get(&id).map(|t| (t.clone(), n))).collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|item| std::cmp::Reverse(item.1));
     Ok(out)
 }
 
