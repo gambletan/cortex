@@ -75,6 +75,13 @@ fn with_lock<T>(cortex: &Cortex, f: impl FnOnce() -> Result<T, String>) -> Resul
     out
 }
 
+/// Serialize memory deletion with sharing's read-copy-push sequence. In-memory Cortex
+/// instances cannot connect to Muse and need no operation lock.
+pub(crate) fn with_operation_lock<T>(cortex: &Cortex, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if cortex.db_path().is_none() { return f(); }
+    with_lock(cortex, f)
+}
+
 fn write_private(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
@@ -237,10 +244,14 @@ pub fn reconcile(cortex: &Cortex) -> Result<(), String> {
     if cortex.db_path().is_none() || load_state(cortex)?.rid.is_none() {
         return Ok(());
     }
-    with_lock(cortex, || {
-        let dev = device(cortex)?;
-        settle(cortex, &dev)
-    })
+    with_lock(cortex, || reconcile_locked(cortex))
+}
+
+/// Caller already holds the Muse operation lock. Avoid recursively taking its OS lock.
+pub(crate) fn reconcile_locked(cortex: &Cortex) -> Result<(), String> {
+    if cortex.db_path().is_none() || load_state(cortex)?.rid.is_none() { return Ok(()); }
+    let dev = device(cortex)?;
+    settle(cortex, &dev)
 }
 
 /// Exactly what a share call would add: (memory id or text) → text.
@@ -300,7 +311,7 @@ fn confirmed(cortex: &Cortex, args: &Value, texts: &[String]) -> Result<Option<V
         "needs_confirmation": true,
         "will_share_with_muse": texts,
         "confirmation": code,
-        "tell_the_user_first": "Whatever Muse reads becomes visible to Meta, and Muse may keep its own copy even if you unshare it later. Cortex asks Muse not to, but can't enforce it. For unsharing to really work, turn off Muse's own memory in its settings.",
+        "tell_the_user_first": "Whatever Muse reads becomes visible to Meta, and Muse may keep its own copy even if you unshare it later. Cortex asks Muse not to, but can't enforce it. Turn off Muse's own memory to reduce retained copies. Unsharing stops future Cortex reads; it cannot delete copies Meta already retained.",
         "next_step": "Show the user exactly this list AND the warning in tell_the_user_first, and ask whether Muse may see it. Only if they say yes, call this tool again with the same arguments plus this confirmation. Nothing has been shared yet.",
     })))
 }
@@ -461,6 +472,9 @@ fn share(cortex: &Cortex, args: &Value) -> Result<Value, String> {
 }
 
 fn unshare(cortex: &Cortex, args: &Value) -> Result<Value, String> {
+    let db = cortex.db_path().ok_or("Muse needs an on-disk Cortex database")?;
+    let paths = super::Paths::for_dir(db.parent().unwrap_or(std::path::Path::new(".")), None);
+    let _fence = super::budget_file_lock(&paths).map_err(|e| e.to_string())?;
     let ids = ids_arg(args, "shared_ids");
     if ids.is_empty() {
         return Err("Give shared_ids (from muse_status).".into());
@@ -504,17 +518,20 @@ fn status(cortex: &Cortex) -> Result<Value, String> {
         }
         Ok(v) => v,
     };
-    let inbox = dev.inbox().map(|i| i.len()).unwrap_or(0);
+    let inbox = dev.inbox().map(|i| i.len());
+    let inbox_error = inbox.as_ref().err().cloned();
     Ok(json!({
         "connected": cloud.get("connected").and_then(Value::as_u64).unwrap_or(0) > 0,
         "muse_connected_at": cloud.get("connected_at").and_then(Value::as_i64)
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
         "muse_read_today": cloud.get("read_today").cloned().unwrap_or(Value::Null),
+        "muse_read_today_error": cloud.get("read_today_error").cloned().unwrap_or(Value::Null),
         "muse_last_read": cloud.get("last_used").and_then(Value::as_i64)
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339()),
         "check_with_user": "If the user didn't connect Muse at muse_connected_at, run muse_connect again: it cancels every earlier connection.",
         "shared": shared,
-        "waiting_in_inbox": inbox,
+        "waiting_in_inbox": inbox.ok(),
+        "inbox_error": inbox_error,
         "sync_error": sync_error,
     }))
 }
@@ -580,6 +597,72 @@ fn disconnect(cortex: &Cortex) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_export_deletion_keeps_original_for_retry() {
+        use std::sync::Arc;
+        let c = Cortex::in_memory().unwrap();
+        #[cfg(feature = "embeddings")]
+        let c = c.without_embedder();
+        let c = Arc::new(c);
+        let original = c.ingest("retry deletion secret", "test", None, None, None).unwrap().id;
+        let copy = allow(&c, "retry deletion secret").unwrap();
+        c.sqlite_storage().with_write_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER block_export_delete BEFORE DELETE ON memories
+                WHEN OLD.namespace = 'muse-export' BEGIN SELECT RAISE(ABORT, 'test failure'); END;")
+                .map_err(|e| cortex_core::CortexError::Storage(e.to_string()))
+        }).unwrap();
+        let args = json!({"id": original.to_string()});
+        assert!(crate::tools::call_tool(&c, "memory_delete", &args).is_err());
+        assert!(c.storage().get_memory(original).unwrap().is_some(), "original preserves copy-discovery linkage");
+        assert!(c.storage().get_memory(copy).unwrap().is_some());
+        c.sqlite_storage().with_write_conn(|conn| {
+            conn.execute_batch("DROP TRIGGER block_export_delete;")
+                .map_err(|e| cortex_core::CortexError::Storage(e.to_string()))
+        }).unwrap();
+        crate::tools::call_tool(&c, "memory_delete", &args).unwrap();
+        assert!(c.storage().get_memory(original).unwrap().is_none());
+        assert!(c.storage().get_memory(copy).unwrap().is_none());
+        assert!(export_rows(&c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deletion_waits_for_sharing_then_removes_the_original_and_new_copy() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("muse-delete-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("memory.db");
+        let c = Cortex::open_with_raw_key(db.to_str().unwrap(), &[7; 32], 1).unwrap();
+        #[cfg(feature = "embeddings")]
+        let c = c.without_embedder();
+        let c = Arc::new(c);
+        let original = c.ingest("sharing race secret", "test", None, None, None).unwrap().id;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = with_lock(&c, || {
+            let other = c.clone();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = crate::tools::call_tool(&other, "memory_delete", &json!({"id": original.to_string()}));
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(done_rx.recv_timeout(Duration::from_millis(200)), Err(mpsc::RecvTimeoutError::Timeout)),
+                "delete must not finish while sharing holds the operation lock");
+            assert!(c.storage().get_memory(original).unwrap().is_some());
+            // Sharing finishes its read-copy sequence before deletion can discover copies.
+            allow(&c, "sharing race secret")?;
+            Ok(worker)
+        }).unwrap();
+        let out = done_rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["also_unshared_from_muse"], json!(1));
+        assert!(c.storage().get_memory(original).unwrap().is_none());
+        assert!(export_rows(&c).unwrap().is_empty());
+        drop(c);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn plan_hash_distinguishes_lists_whatever_the_texts_contain() {

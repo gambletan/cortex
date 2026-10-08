@@ -781,7 +781,7 @@ pub struct InboxItem {
 /// lock, not just the in-process mutex: two gateway instances for the same directory (e.g.
 /// a cloud tenant reopened after cache eviction while old requests still run) must never
 /// interleave budget updates.
-fn budget_file_lock(paths: &Paths) -> std::io::Result<std::fs::File> {
+pub fn budget_file_lock(paths: &Paths) -> std::io::Result<std::fs::File> {
     let f = private_options().create(true).truncate(false).write(true).open(paths.budget.with_extension("lock"))?;
     f.lock()?;
     Ok(f)
@@ -1112,40 +1112,43 @@ pub fn run(action: GatewayAction, db_path: &str) {
         }
         GatewayAction::Allow { text, from } => {
             let cortex = open(db_path);
-            let text = match (text, from) {
-                (Some(t), None) => t,
-                (None, Some(id)) => {
-                    let id = Uuid::parse_str(&id).unwrap_or_else(|_| die("invalid memory id"));
-                    let mem = cortex
-                        .storage()
-                        .get_memory(id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| die("no memory with that id"));
-                    content_to_string(&mem.content)
-                }
-                _ => die("give either TEXT or --from <ID>"),
-            };
-            if text.trim().is_empty() {
-                die("text must not be empty");
-            }
-            // Connected to Cortex Cloud: refuse what the cloud would refuse, before storing it
-            // (an oversized item would block every later sync).
-            if muse_tools::is_connected(&cortex) && text.chars().count() > MAX_EXPORT_TEXT_CHARS {
-                die(&format!(
-                    "too long to share through Cortex Cloud ({} characters, at most {MAX_EXPORT_TEXT_CHARS}); share a shorter summary",
-                    text.chars().count()
-                ));
-            }
-            match allow(&cortex, &text) {
-                Ok(id) => {
-                    println!("{id}");
-                    if let Err(e) = muse_tools::reconcile(&cortex) {
-                        eprintln!("warning: Cortex Cloud not updated yet ({e}); it syncs on the next Muse action");
+            muse_tools::with_operation_lock(&cortex, || {
+                let text = match (text, from) {
+                    (Some(t), None) => t,
+                    (None, Some(id)) => {
+                        let id = Uuid::parse_str(&id).unwrap_or_else(|_| die("invalid memory id"));
+                        let mem = cortex
+                            .storage()
+                            .get_memory(id)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| die("no memory with that id"));
+                        content_to_string(&mem.content)
                     }
+                    _ => die("give either TEXT or --from <ID>"),
+                };
+                if text.trim().is_empty() {
+                    die("text must not be empty");
                 }
-                Err(e) => die(&e),
-            }
+                // Connected to Cortex Cloud: refuse what the cloud would refuse, before storing it
+                // (an oversized item would block every later sync).
+                if muse_tools::is_connected(&cortex) && text.chars().count() > MAX_EXPORT_TEXT_CHARS {
+                    die(&format!(
+                        "too long to share through Cortex Cloud ({} characters, at most {MAX_EXPORT_TEXT_CHARS}); share a shorter summary",
+                        text.chars().count()
+                    ));
+                }
+                match allow(&cortex, &text) {
+                    Ok(id) => {
+                        println!("{id}");
+                        if let Err(e) = muse_tools::reconcile_locked(&cortex) {
+                            eprintln!("warning: Cortex Cloud not updated yet ({e}); it syncs on the next Muse action");
+                        }
+                    }
+                    Err(e) => die(&e),
+                }
+                Ok(())
+            }).unwrap_or_else(|e| die(&e));
         }
         GatewayAction::List => {
             let cortex = open(db_path);
@@ -1155,17 +1158,21 @@ pub fn run(action: GatewayAction, db_path: &str) {
         }
         GatewayAction::Revoke { id } => {
             let cortex = open(db_path);
-            let id = Uuid::parse_str(&id).unwrap_or_else(|_| die("invalid memory id"));
-            match cortex.storage().get_memory(id) {
-                Ok(Some(m)) if m.namespace.as_deref() == Some(EXPORT_NS) => {
-                    cortex.delete_memory(id).unwrap_or_else(|e| die(&e.to_string()));
-                    println!("revoked {id}");
-                    if let Err(e) = muse_tools::reconcile(&cortex) {
-                        eprintln!("warning: Cortex Cloud still has the old list ({e}); it syncs on the next Muse action");
+            muse_tools::with_operation_lock(&cortex, || {
+                let _fence = budget_file_lock(&paths).map_err(|e| e.to_string())?;
+                let id = Uuid::parse_str(&id).unwrap_or_else(|_| die("invalid memory id"));
+                match cortex.storage().get_memory(id) {
+                    Ok(Some(m)) if m.namespace.as_deref() == Some(EXPORT_NS) => {
+                        cortex.delete_memory(id).unwrap_or_else(|e| die(&e.to_string()));
+                        println!("revoked {id}");
+                        if let Err(e) = muse_tools::reconcile_locked(&cortex) {
+                            eprintln!("warning: Cortex Cloud still has the old list ({e}); it syncs on the next Muse action");
+                        }
                     }
+                    _ => die("that id is not in the Muse export"),
                 }
-                _ => die("that id is not in the Muse export"),
-            }
+                Ok(())
+            }).unwrap_or_else(|e| die(&e));
         }
         GatewayAction::Preview { query, limit } => {
             let cortex = open(db_path);
@@ -1493,17 +1500,43 @@ fn apply_export(cortex: &Cortex, items: &[ExportItem]) -> Result<usize, String> 
 
 /// Which shared memories were read today (UTC), most-read first: (text, times). Built from
 /// the audit log (which stores ids, never queries). Ids no longer shared are skipped.
-pub fn reads_today(cortex: &Cortex, paths: &Paths) -> Vec<(String, usize)> {
+pub fn reads_today(cortex: &Cortex, paths: &Paths) -> Result<Vec<(String, usize)>, String> {
+    let _fence = budget_file_lock(paths).map_err(|_| "Read history is unavailable.".to_string())?;
     let today = today();
     // Both generations: rotation (past MAX_AUDIT_BYTES) can split one day across them.
-    let log: String = [paths.audit.with_extension("jsonl.1"), paths.audit.clone()]
-        .iter()
-        .filter_map(|p| read_private(p).ok())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut generations = Vec::new();
+    for path in [paths.audit.with_extension("jsonl.1"), paths.audit.clone()] {
+        match read_private(&path) {
+            Ok(log) => generations.push(log),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A missing active log is only an empty history before any disclosure.
+                if path == paths.audit {
+                    let previous: Budget = match read_private(&paths.budget) {
+                        Ok(s) => serde_json::from_str(&s).map_err(|_| "Read history is unavailable.".to_string())?,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Budget::default(),
+                        Err(_) => return Err("Read history is unavailable.".into()),
+                    };
+                    if previous.requests > 0 || !previous.disclosed.is_empty() || !generations.is_empty() {
+                        return Err("Read history is unavailable.".into());
+                    }
+                }
+            }
+            Err(_) => return Err("Read history is unavailable.".into()),
+        }
+    }
+    let log = generations.join("\n");
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for line in log.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if line.trim().is_empty() { continue; }
+        let v: Value = serde_json::from_str(line).map_err(|_| "Read history is unavailable.".to_string())?;
+        if !v["ts"].is_string() || !v["outcome"].is_string() || !v["memory_ids"].is_array() {
+            return Err("Read history is unavailable.".into());
+        }
+        if chrono::DateTime::parse_from_rfc3339(v["ts"].as_str().unwrap()).is_err()
+            || v["memory_ids"].as_array().unwrap().iter()
+                .any(|id| id.as_str().is_none_or(|s| Uuid::parse_str(s).is_err())) {
+            return Err("Read history is unavailable.".into());
+        }
         if v["outcome"] != "ok" || !v["ts"].as_str().is_some_and(|t| t.starts_with(&today)) {
             continue;
         }
@@ -1511,15 +1544,14 @@ pub fn reads_today(cortex: &Cortex, paths: &Paths) -> Vec<(String, usize)> {
             *counts.entry(id.to_string()).or_default() += 1;
         }
     }
-    let texts: std::collections::HashMap<String, String> = export_rows(cortex)
-        .unwrap_or_default()
+    let texts: std::collections::HashMap<String, String> = export_rows(cortex)?
         .into_iter()
         .map(|m| (m.id.to_string(), content_to_string(&m.content)))
         .collect();
     let mut out: Vec<(String, usize)> =
         counts.into_iter().filter_map(|(id, n)| texts.get(&id).map(|t| (t.clone(), n))).collect();
     out.sort_by(|a, b| b.1.cmp(&a.1));
-    out
+    Ok(out)
 }
 
 /// Pending `remember` items, decrypted.
@@ -1554,6 +1586,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_today_distinguishes_pristine_missing_logs_from_lost_or_corrupt_history() {
+        let dir = std::env::temp_dir().join(format!("gw-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths::for_dir(&dir, None);
+        let c = Cortex::in_memory().unwrap();
+        assert!(reads_today(&c, &paths).unwrap().is_empty());
+        let history = Budget { day: "2000-01-01".into(), requests: 1, ..Budget::default() };
+        save_budget(&paths.budget, &history).unwrap();
+        assert!(reads_today(&c, &paths).is_err(), "old history must not reset to pristine at midnight");
+        std::fs::write(&paths.audit, "not JSON\n").unwrap();
+        assert!(reads_today(&c, &paths).is_err());
+        std::fs::write(&paths.audit, "{}\n").unwrap();
+        assert!(reads_today(&c, &paths).is_err(), "valid JSON is not necessarily an audit record");
+        std::fs::write(&paths.audit, format!("{}\n", json!({"ts": chrono::Utc::now().to_rfc3339(), "outcome": "ok", "memory_ids": []}))).unwrap();
+        assert!(reads_today(&c, &paths).unwrap().is_empty());
+        std::fs::write(paths.audit.with_extension("jsonl.1"), "broken\n").unwrap();
+        assert!(reads_today(&c, &paths).is_err(), "an unreadable older generation cannot be silently omitted");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reads_today_counts_both_audit_generations() {
         let c = Cortex::in_memory().unwrap();
         replace_export(&c, &[ExportItem { text: "mu".into(), embedding: None }]).unwrap();
@@ -1564,7 +1617,7 @@ mod tests {
         let line = json!({ "ts": format!("{}T01:00:00Z", today()), "outcome": "ok", "memory_ids": [id] }).to_string();
         std::fs::write(paths.audit.with_extension("jsonl.1"), format!("{line}\n")).unwrap();
         std::fs::write(&paths.audit, format!("{line}\n")).unwrap();
-        assert_eq!(reads_today(&c, &paths), vec![("mu".to_string(), 2)]);
+        assert_eq!(reads_today(&c, &paths).unwrap(), vec![("mu".to_string(), 2)]);
     }
 
     #[test]

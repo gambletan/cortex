@@ -24,6 +24,44 @@ X-Forwarded-For is trusted), data in `~/cortex-cloud/data`, master key in
 Devices use `https://studio.alvinsclub.ai` by default; set `CORTEX_CLOUD_URL` on the device
 to point at another deployment.
 
+**Dedicated hostname: `cortex.alvinsclub.ai`.** DNS resolving is not sufficient: nginx
+must serve a certificate whose subject alternative names include this exact hostname.
+The checked-in [`cortex-domain.nginx.conf`](cortex-domain.nginx.conf) is a dedicated site
+template, using the existing `127.0.0.1:8084` container and Cortex routing snippet. Obtain
+the hostname's certificate first, then install/enable the site at
+`/etc/nginx/sites-available/cortex`. The deployment command installs the snippet and
+checks nginx before reload:
+
+```bash
+BASE_URL=https://cortex.alvinsclub.ai SITE=/etc/nginx/sites-available/cortex deploy/cortex-cloud/deploy.sh
+curl --fail https://cortex.alvinsclub.ai/healthz
+```
+
+Do not bypass certificate checks. Switching the service's base URL changes its OAuth
+issuer/resource: existing Muse connectors must reconnect. Existing local device state
+retains its previous base URL, so set `CORTEX_CLOUD_URL=https://cortex.alvinsclub.ai` for
+those devices. Keep the legacy hostname's routes available for device management during
+migration; do not redirect signed device requests, whose paths are signature-bound.
+The compiled default remains the current Studio deployment until the dedicated host
+passes TLS and end-to-end validation.
+
+**Validation.** Run the entire workspace suite:
+
+```bash
+cargo test --workspace --exclude cortex-python --exclude cortex-wasm
+```
+
+The test that writes to a real Google Drive is explicitly ignored in ordinary runs.
+To exercise it on a machine with a working Google Drive mount, run:
+
+```bash
+cargo test -p cortex-core --test test_gdrive_real test_real_gdrive_encrypted_sync -- --ignored
+```
+
+It uses a unique owned temporary folder; failed cloud mounts remain test failures when
+this live test is explicitly selected. The normal suite still exercises encrypted sync
+against local temporary folders.
+
 Operations:
 - Losing `/var/lib/cortex-cloud` loses nothing important: each device pushes its shared
   list again on the next `muse_share` / `muse_connect`. Do not back it up.

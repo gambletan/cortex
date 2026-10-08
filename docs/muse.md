@@ -39,8 +39,9 @@ the memories you shared. If you'd rather not use any server, run the gateway you
 **Turn off Muse's own memory.** Whatever Muse reads becomes visible to Meta, and Muse may
 save its own copy into its built-in memory (in our first test it did: "I've also saved these
 to my long-term memory"). Cortex asks Muse with every answer not to keep copies, but can't
-enforce that. With Muse's memory off, Cortex is the only place your memory lives: Muse reads
-it live each time, and unsharing or disconnecting really takes effect.
+enforce that. Turn off Muse's own memory to reduce retained copies. Unsharing or
+disconnecting stops future Cortex reads; it cannot delete copies Meta already retained,
+and turning off Muse's memory does not guarantee those copies are erased.
 
 The link works once, for 30 minutes. If someone else used your link before you did, your
 own Muse won't connect: ask your AI to connect again, which cancels any earlier

@@ -188,6 +188,30 @@ limits, timeouts, separate lane for unauthenticated endpoints.
 
 ## Copies kept by Muse (observed in the first real test)
 
+### Revocation and disclosure ordering
+
+Every cloud export replacement and tenant deletion (including retention deletion) takes
+the tenant's `gateway-state.lock`, the same OS file lock held through recall/remember
+authorization, disclosure construction, accounting, and audit/inbox writes. OAuth code
+replay and refresh-token reuse revocations take that lock before the OAuth state lock.
+A revocation cannot finish while a disclosure is being constructed; a request waiting
+for the lock rechecks authorization and reads the current export. Network delivery of a
+response already constructed before revocation cannot be withdrawn.
+
+On the local device, `<db filename>.muse.lock` serializes sharing's original-memory
+lookup and export creation with memory deletion's copy discovery, deletion, and cloud
+reconciliation. Local deletion also takes `gateway-state.lock` to fence self-hosted reads.
+Lock order is local Muse operation, then disclosure, then OAuth state. No operation
+recursively acquires a disclosure lock it already holds.
+
+Read status never turns an unreadable or corrupt existing audit generation into an empty
+history. The device API returns `read_today: null` plus `read_today_error`; local
+`muse_status` exposes `muse_read_today: null` plus `muse_read_today_error`. A legitimately
+absent initial log or rotated generation is allowed. Read counts describe retained audit
+records for currently shared items, not proof that Meta has deleted earlier copies.
+
+### External copies
+
 Muse saved the memories it read into its own long-term memory and later answered without
 calling Cortex. Revocation cannot reach that copy. Mitigations (requests, not enforcement):
 every recall result carries a do-not-retain notice and the MCP `instructions` say to query

@@ -1741,3 +1741,5 @@ fn status_shows_what_muse_read_today() {
     assert!(read.iter().any(|r| r["text"] == json!("Kappa likes jazz") && r["times"].as_u64() >= Some(2)), "{st}");
     assert!(read.iter().all(|r| r["text"] != json!("Lambda hates olives")), "{st}");
 }
+#[path = "acceptance/muse_privacy.rs"]
+mod muse_privacy_acceptance;

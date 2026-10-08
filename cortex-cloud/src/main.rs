@@ -339,6 +339,11 @@ impl App {
     /// resolve it any more), drop it from the cache, then delete it.
     fn remove_tenant(&self, rid: &str) -> std::io::Result<()> {
         let Some(dir) = self.tenant_dir(rid) else { return Ok(()) };
+        // Serialize every deletion path (including retention) with active disclosures.
+        // Never call OAuth disconnect here: it would recursively acquire this lock.
+        let paths = Paths::for_dir(&dir, None);
+        let _fence = gateway::budget_file_lock(&paths)?;
+        private_write(&dir.join("gateway.disabled"), b"deleted")?;
         if let Some(pid) = self.public_id(rid) {
             match std::fs::remove_file(self.public_dir.join(pid)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -654,6 +659,11 @@ async fn tenant_api(
                 if let Err(e) = gateway::validate_export(&items) {
                     return api_error(StatusCode::BAD_REQUEST, &e);
                 }
+                // A successful unshare must be ordered after any already-running recall.
+                let _fence = match gateway::budget_file_lock(&paths) {
+                    Ok(f) => f,
+                    Err(e) => return internal(e),
+                };
                 // The watermark is persisted BEFORE the export changes: if we crash or fail
                 // midway, no older snapshot can be applied afterwards; the device simply
                 // retries with a newer one and converges.
@@ -686,17 +696,28 @@ async fn tenant_api(
                 }
             }
             ("GET", "status") => {
-                let (connected, connected_at, last_used) = oauth::grant_summary(&paths).unwrap_or((0, None, None));
+                let shared = match gateway::export_rows(&cortex) {
+                    Ok(rows) => rows.len(),
+                    Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Shared memories are unavailable"),
+                };
+                let (connected, connected_at, last_used) = match oauth::grant_summary(&paths) {
+                    Ok(summary) => summary,
+                    Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "Connection status is unavailable"),
+                };
+                let reads = gateway::reads_today(&cortex, &paths);
+                let read_error = reads.as_ref().err().map(|_| "Read history is unavailable.");
+                let read_today = reads.ok().map(|r| r.into_iter()
+                    .map(|(text, times)| json!({ "text": text, "times": times }))
+                    .collect::<Vec<_>>());
+                ([("cache-control", "no-store")],
                 Json(json!({
-                    "shared": gateway::export_count(&cortex),
+                    "shared": shared,
                     "connected": connected,
                     "connected_at": connected_at,
                     "last_used": last_used,
-                    "read_today": gateway::reads_today(&cortex, &paths)
-                        .into_iter()
-                        .map(|(text, times)| json!({ "text": text, "times": times }))
-                        .collect::<Vec<_>>(),
-                }))
+                    "read_today": read_today,
+                    "read_today_error": read_error,
+                })))
                 .into_response()
             }
             _ => api_error(StatusCode::NOT_FOUND, "unknown operation"),

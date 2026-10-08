@@ -1,5 +1,6 @@
 //! Real Google Drive sync integration test.
-//! Only runs when Google Drive is available on the system.
+//! Live cloud writes are opt-in: run with `--ignored` when Google Drive is available.
+//! The normal workspace suite never writes to the user's installed cloud folders.
 
 use cortex_core::sync::oplog;
 use cortex_core::sync::provider;
@@ -31,6 +32,7 @@ fn test_real_gdrive_provider_detection() {
 }
 
 #[test]
+#[ignore = "writes to a live Google Drive; run explicitly with --ignored"]
 fn test_real_gdrive_encrypted_sync() {
     let gdrive = match find_gdrive() {
         Some(p) => p,
@@ -40,8 +42,13 @@ fn test_real_gdrive_encrypted_sync() {
         }
     };
 
-    // Use a test-specific subfolder to avoid polluting user's Drive
-    let sync_dir = gdrive.parent().unwrap().join("cortex-test-sync");
+    // A unique owned directory avoids sharing state with earlier/concurrent test runs
+    // and ensures cleanup never removes someone else's files.
+    let owned_dir = tempfile::Builder::new()
+        .prefix("cortex-test-sync-")
+        .tempdir_in(gdrive.parent().unwrap())
+        .unwrap();
+    let sync_dir = owned_dir.path().to_path_buf();
 
     // Device A: create encrypted sync
     let cortex_a = Cortex::in_memory().unwrap();
@@ -112,7 +119,10 @@ fn test_real_gdrive_encrypted_sync() {
     println!("  Remote devices: {}", status.remote_devices.len());
 
     // Cleanup
-    let _ = std::fs::remove_dir_all(&sync_dir);
+    drop(engine_b);
+    drop(cortex_b);
+    drop(cortex_a);
+    owned_dir.close().unwrap();
     println!("\n🧹 Cleaned up test data from Google Drive");
     println!("✅ ALL REAL GOOGLE DRIVE TESTS PASSED!");
 }

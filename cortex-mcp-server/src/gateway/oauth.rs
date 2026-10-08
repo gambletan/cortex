@@ -1272,6 +1272,9 @@ pub(super) async fn token(State(st): State<Arc<HttpState>>, headers: HeaderMap, 
     blocking(&st, move || {
         let c = cfg(&st2);
         let paths = &st2.gw.paths;
+        // Replay detection can revoke a grant. Use the disclosure fence before the
+        // OAuth state lock, just like explicit disconnect and enrollment.
+        let Ok(_fence) = super::budget_file_lock(paths) else { return state_error() };
         let disabled = paths.is_disabled();
         let resource_ok = p.get("resource").is_none_or(|r| *r == c.resource);
         let t = now();

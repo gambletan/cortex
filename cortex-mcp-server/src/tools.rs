@@ -628,51 +628,61 @@ pub fn call_tool(cortex: &Arc<Cortex>, name: &str, args: &Value) -> Result<Strin
         "memory_ingest_batch" => tool_memory_ingest_batch(cortex, args),
         "tag_list_taxonomy" => tool_tag_list_taxonomy(cortex),
         "memory_delete" => {
-            // Forgetting a memory also stops sharing it: Muse export copies are copies by
-            // text, so find them before the original is gone.
             #[cfg(feature = "gateway")]
-            let copies: Vec<Uuid> = get_str(args, "id")
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .and_then(|id| cortex.storage().get_memory(id).ok().flatten())
-                .filter(|m| m.namespace.as_deref() != Some(crate::gateway::EXPORT_NS))
-                .map(|m| {
-                    let text = content_to_string(&m.content);
-                    crate::gateway::export_rows(cortex)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|e| content_to_string(&e.content) == text)
-                        .map(|e| e.id)
-                        .collect()
-                })
-                .unwrap_or_default();
-            #[allow(unused_mut)]
-            let mut out = tool_memory_delete(cortex, args);
-            #[cfg(feature = "gateway")]
-            if out.is_ok() && !copies.is_empty() {
+            { crate::gateway::muse_tools::with_operation_lock(cortex, || {
+                // Fence the local self-hosted gateway too. Lock order is Muse operation
+                // -> disclosure -> OAuth; cloud reconciliation uses a different tenant.
+                let _fence = cortex.db_path().map(|db| {
+                    let dir = db.parent().unwrap_or(std::path::Path::new("."));
+                    crate::gateway::budget_file_lock(&crate::gateway::Paths::for_dir(dir, None))
+                }).transpose().map_err(|e| e.to_string())?;
+                // Forgetting a memory also stops sharing it: Muse export copies are copies by
+                // text, so find them before the original is gone.
+                let id = Uuid::parse_str(get_str(args, "id").ok_or("missing 'id'")?)
+                    .map_err(|e| format!("Invalid UUID: {e}"))?;
+                let original = cortex.storage().get_memory(id).map_err(|e| e.to_string())?;
+                let copies: Vec<Uuid> = match original
+                    .filter(|m| m.namespace.as_deref() != Some(crate::gateway::EXPORT_NS)) {
+                    Some(m) => {
+                        let text = content_to_string(&m.content);
+                        crate::gateway::export_rows(cortex)?
+                            .into_iter()
+                            .filter(|e| content_to_string(&e.content) == text)
+                            .map(|e| e.id)
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+                // Preserve the original text until all copies are removed: if removal
+                // fails, retrying the same original id must still discover those copies.
                 for id in &copies {
-                    if let Err(e) = cortex.delete_memory(*id) {
-                        out = Err(format!("deleted the memory, but could not stop sharing its Muse copy: {e}"));
+                    cortex.delete_memory(*id).map_err(|e| format!(
+                        "could not stop sharing its Muse copy; the original memory was kept for retry: {e}"
+                    ))?;
+                }
+                let mut out = tool_memory_delete(cortex, args);
+                if out.is_ok() && !copies.is_empty() {
+                    if let Ok(text) = &out {
+                        let mut v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+                        v["also_unshared_from_muse"] = json!(copies.len());
+                        out = Ok(v.to_string());
                     }
                 }
+                // Deleting a shared memory must also stop Muse seeing it in Cortex Cloud — and if
+                // that can't happen right now, the caller is told, not just a log line.
                 if let Ok(text) = &out {
-                    let mut v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
-                    v["also_unshared_from_muse"] = json!(copies.len());
-                    out = Ok(v.to_string());
+                    if let Err(e) = crate::gateway::muse_tools::reconcile_locked(cortex) {
+                        let mut v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+                        v["muse_cloud"] = json!(format!(
+                            "NOT updated yet ({e}): Muse may still see this memory until the next Muse action succeeds (e.g. muse_status)"
+                        ));
+                        out = Ok(v.to_string());
+                    }
                 }
-            }
-            // Deleting a shared memory must also stop Muse seeing it in Cortex Cloud — and if
-            // that can't happen right now, the caller is told, not just a log line.
-            #[cfg(feature = "gateway")]
-            if let Ok(text) = &out {
-                if let Err(e) = crate::gateway::muse_tools::reconcile(cortex) {
-                    let mut v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
-                    v["muse_cloud"] = json!(format!(
-                        "NOT updated yet ({e}): Muse may still see this memory until the next Muse action succeeds (e.g. muse_status)"
-                    ));
-                    out = Ok(v.to_string());
-                }
-            }
-            out
+                out
+            }) }
+            #[cfg(not(feature = "gateway"))]
+            { tool_memory_delete(cortex, args) }
         }
         "memory_restore" => tool_memory_restore(cortex, args),
         "namespace_list" => tool_namespace_list(cortex),
