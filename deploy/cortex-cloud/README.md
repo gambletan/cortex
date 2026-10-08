@@ -6,11 +6,11 @@ The service holds only what users chose to share with Muse, one encrypted direct
 user. It needs one small Linux server with a public IPv4, ports 80 and 443 open, and a
 DNS name pointing at it.
 
-**studio.alvinsclub.ai (current):** one command from a clean checkout:
+**cortex.alvinsclub.ai:** one command from a clean checkout after configuring its TLS site:
 
 ```bash
 deploy/cortex-cloud/deploy.sh   # build on the server (docker), run on 127.0.0.1:8084, route the Cortex paths in nginx
-curl -s -o /dev/null -w '%{http_code}\n' https://studio.alvinsclub.ai/t/AAAAAAAAAAAAAAAAAAAAAA/mcp   # 404 = service answering
+curl -s -o /dev/null -w '%{http_code}\n' https://cortex.alvinsclub.ai/t/AAAAAAAAAAAAAAAAAAAAAA/mcp   # 404 = service answering
 ```
 
 It mirrors the other Studio services: docker container (host network, so nginx's
@@ -21,7 +21,7 @@ X-Forwarded-For is trusted), data in `~/cortex-cloud/data`, master key in
 **Any other host:** `docker build -f deploy/cortex-cloud/Dockerfile .`, or the systemd unit
 (`cortex-cloud.service`) plus `Caddyfile` for a dedicated host name.
 
-Devices use `https://studio.alvinsclub.ai` by default; set `CORTEX_CLOUD_URL` on the device
+New devices use `https://cortex.alvinsclub.ai` by default; set `CORTEX_CLOUD_URL` on the device
 to point at another deployment.
 
 **Dedicated hostname: `cortex.alvinsclub.ai`.** DNS resolving is not sufficient: nginx
@@ -42,8 +42,8 @@ issuer/resource: existing Muse connectors must reconnect. Existing local device 
 retains its previous base URL, so set `CORTEX_CLOUD_URL=https://cortex.alvinsclub.ai` for
 those devices. Keep the legacy hostname's routes available for device management during
 migration; do not redirect signed device requests, whose paths are signature-bound.
-The compiled default remains the current Studio deployment until the dedicated host
-passes TLS and end-to-end validation.
+Existing connection state may retain the old Studio management URL; its signed API
+routes remain available during migration. New connections use the dedicated hostname.
 
 **Validation.** Run the entire workspace suite:
 

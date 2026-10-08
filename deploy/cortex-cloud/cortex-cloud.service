@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 User=cortex-cloud
 Group=cortex-cloud
-Environment=CORTEX_CLOUD_BASE_URL=https://studio.alvinsclub.ai
+Environment=CORTEX_CLOUD_BASE_URL=https://cortex.alvinsclub.ai
 # Embedding model cache (written once on first start).
 Environment=FASTEMBED_CACHE_DIR=/var/lib/cortex-cloud/models
 WorkingDirectory=/var/lib/cortex-cloud

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and (re)start Cortex Cloud on studio.alvinsclub.ai (alvin@35.223.174.205), next to the
+# Build and (re)start Cortex Cloud on cortex.alvinsclub.ai (alvin@35.223.174.205), next to the
 # other Studio services. The container uses the host network and listens on 127.0.0.1:8084
 # only (so nginx's X-Forwarded-For is trusted); nginx terminates TLS and routes ONLY the
 # Cortex paths (snippet: cortex-cloud.nginx.conf). Tenant data: ~/cortex-cloud/data;
@@ -8,9 +8,9 @@ set -euo pipefail
 
 HOST="${HOST:-alvin@35.223.174.205}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_usa}"
-BASE_URL="${BASE_URL:-https://studio.alvinsclub.ai}"
+BASE_URL="${BASE_URL:-https://cortex.alvinsclub.ai}"
 LISTEN="${LISTEN:-127.0.0.1:8084}"
-SITE="${SITE:-/etc/nginx/sites-available/studio}"
+SITE="${SITE:-/etc/nginx/sites-available/cortex}"
 REMOTE_DIR="cortex-cloud"
 SSH_OPTS=(-o ConnectTimeout=30 -o ServerAliveInterval=5 -o IdentitiesOnly=yes -i "$SSH_KEY")
 SSH=(ssh "${SSH_OPTS[@]}" "$HOST")

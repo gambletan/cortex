@@ -32,7 +32,7 @@ pub const H_TS: &str = "x-cortex-ts";
 pub const H_NONCE: &str = "x-cortex-nonce";
 pub const H_SIG: &str = "x-cortex-sig";
 /// Where the hosted service lives; `CORTEX_CLOUD_URL` overrides (self-hosting, tests).
-pub const DEFAULT_CLOUD_URL: &str = "https://studio.alvinsclub.ai";
+pub const DEFAULT_CLOUD_URL: &str = "https://cortex.alvinsclub.ai";
 const PROTOCOL: &str = "cortex-cloud-v1";
 /// Error text when the service no longer knows this device's tenant (deleted or expired).
 pub const GONE: &str = "Cortex Cloud no longer has this connection";
