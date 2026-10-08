@@ -1,5 +1,9 @@
 # Deploying Cortex Cloud for Muse
 
+Verified deployment on 2026-10-07: [`461ad11` release report](RELEASE_2026-10-07.md),
+including HTTPS, renewal, production checks and rollback instructions. Later documentation
+commits do not change that recorded runtime revision.
+
 Design and threat model: [`docs/design/muse-cloud.md`](../../docs/design/muse-cloud.md).
 
 The service holds only what users chose to share with Muse, one encrypted directory per
@@ -48,12 +52,15 @@ The hook reloads nginx only when this domain renews, after checking its configur
 See [Certbot's renewal-hook documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates).
 
 Do not bypass certificate checks. Switching the service's base URL changes its OAuth
-issuer/resource: existing Muse connectors must reconnect. Existing local device state
-retains its previous base URL, so set `CORTEX_CLOUD_URL=https://cortex.alvinsclub.ai` for
-those devices. Keep the legacy hostname's routes available for device management during
-migration; do not redirect signed device requests, whose paths are signature-bound.
-Existing connection state may retain the old Studio management URL; its signed API
-routes remain available during migration. New connections use the dedicated hostname.
+issuer/resource: existing Muse connectors must reconnect with a fresh `muse_connect` link.
+Existing device state may retain the Studio management URL; those signed routes remain
+available during migration and can still obtain a new-domain enrollment link. To override
+the management endpoint, set `CORTEX_CLOUD_URL=https://cortex.alvinsclub.ai` in the device's
+MCP-server environment. Do not redirect signed device requests.
+
+The deployment script rebuilds and replaces the active container; it does not retain a
+rollback container automatically. The recorded release retained the previous container
+explicitly; see its [rollback procedure](RELEASE_2026-10-07.md#rollback).
 
 **Validation.** Run the entire workspace suite:
 
@@ -73,8 +80,11 @@ this live test is explicitly selected. The normal suite still exercises encrypte
 against local temporary folders.
 
 Operations:
-- Losing `/var/lib/cortex-cloud` loses nothing important: each device pushes its shared
-  list again on the next `muse_share` / `muse_connect`. Do not back it up.
+
+- Losing the data directory (`~/cortex-cloud/data` for Docker, `/var/lib/cortex-cloud` for
+  the systemd example) loses cloud inbox proposals, audit history and OAuth state. The
+  local archive survives; the device can re-push its export and reconnect. Tenant data
+  is not backed up, so unreviewed proposals and historical audits are not recoverable.
 - Losing `master.key` makes every tenant unreadable; users reconnect (`muse_connect`).
 - Tenants whose device hasn't called in 90 days are deleted automatically, and so are
   tenants that never pushed anything within a day of registering.

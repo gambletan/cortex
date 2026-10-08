@@ -9,22 +9,22 @@
 
 [中文](README_CN.md) | [日本語](README_JA.md) | [한국어](README_KO.md)
 
-### Memory for AI agents that never leaves your device.
+### Local memory for personal AI agents.
 
 _Private. Free. Local. — a memory engine for personal AI agents._
 
-**Your AI's memory lives on your device — your data never leaves, never costs, never spies.** Pure Rust. 3.8MB binary. No third-party servers in the data path, zero telemetry, zero cost. Syncs through your own cloud storage. (On-device semantic search downloads a ~30MB model once on first use, then runs fully offline — or go 100% offline with `CORTEX_NO_EMBEDDINGS=1`. See [Security & Privacy](#security--privacy).)
+**Your AI's memory archive lives on your device.** Pure Rust. 3.8MB binary. The local engine needs no hosted service and collects zero telemetry. Optional encrypted sync uses your own cloud storage; optional Muse sharing sends only the excerpts you approve to Cortex Cloud and Meta. (On-device semantic search downloads a ~30MB model once on first use, then runs fully offline — or go 100% offline with `CORTEX_NO_EMBEDDINGS=1`. See [Security & Privacy](#security--privacy).)
 
 ![Cortex remembering across sessions — a real, local cortex-mcp-server recording](docs/demo.gif)
 
 **What you get**
 
-- 🔒 **Private by default** — memories live in a local SQLite file, never leave your device, zero telemetry (CI-enforced).
+- 🔒 **Private by default** — memories live in a local SQLite file; sync and Muse sharing require explicit opt-in. Zero telemetry (CI-enforced).
 - 🧠 **Real memory, not a text file** — 4 tiers, multi-signal retrieval, self-correcting Bayesian beliefs, a cross-channel people graph.
 - ⚡ **Sub-millisecond** — 156µs ingest, 568µs search. ~528× faster than cloud memory APIs, with no network round-trip.
 - 🔌 **Drop-in for any agent** — one MCP server gives Claude Code / Claude Desktop (or any MCP client) persistent cross-session memory.
-- 🤝 **Use Meta Muse without handing Meta your memory**: your archive stays encrypted in *your own* drive, with the key on your devices. Muse gets only the excerpts you allow, under a daily budget, with a one-command kill switch and a local audit log. [How →](docs/muse.md)
-- ☁️ **Yours across devices** — optional end-to-end-encrypted sync through *your own* iCloud / Drive / Dropbox. No server of ours, ever.
+- 🤝 **Connect Meta Muse to chosen excerpts** — your archive stays local. The optional service at `https://cortex.alvinsclub.ai` serves only your approved export, with daily disclosure limits and revocation. The server and Meta can read shared excerpts. [Setup and privacy limits →](docs/muse.md)
+- ☁️ **Yours across devices** — optional end-to-end-encrypted sync through *your own* iCloud / Drive / Dropbox; this sync needs no Cortex server.
 
 **See it remember across sessions — ~30 seconds:**
 
@@ -45,7 +45,7 @@ LLMs start blank every session — they forget your name, your preferences, yest
 
 | | Cortex | Mem0 | OpenAI Memory |
 |---|---|---|---|
-| **Privacy** | 100% local, zero cloud | Cloud API (your data on their servers) | OpenAI servers |
+| **Privacy** | Local archive; optional Muse export to cloud | Cloud API (your data on their servers) | OpenAI servers |
 | **Latency** | **156µs** ingest, **568µs** search | ~200-500ms | ~300-800ms |
 | **Cost** | Free, forever | $99+/mo (Pro) | ChatGPT Plus ($20/mo) |
 | **Memory tiers** | 4 (Working/Episodic/Semantic/Procedural) | 1 (flat) | 1 (flat) |
@@ -220,10 +220,10 @@ println!("Applied {} remote changes", applied);
 | **Query budget** | Every retrieval is bounded (candidate cap + wall-clock cap) — query cost never scales with total store size; DoS guard and timing-side-channel bound in one |
 | **Secret handling** | Sync passphrase is never written to disk by Cortex — macOS login Keychain or env var only; missing passphrase fails safe (sync off, never plaintext) |
 | **Memory zeroization** | Sensitive data cleared from RAM on drop (`zeroize` crate) |
-| **Zero telemetry** | No analytics, no phone-home, no user data ever leaves the device — **enforced in CI** (`scripts/check-no-network-egress.sh`): the build fails if any network/telemetry crate enters `cortex-core`'s default tree, and the check also proves the `--no-default-features` binary is completely zero-network. |
+| **Zero telemetry** | No analytics or telemetry. Network dependencies for the local core are **enforced in CI** (`scripts/check-no-network-egress.sh`): the build fails if any network/telemetry crate enters `cortex-core`'s default tree, and the check also proves the `--no-default-features` binary is completely zero-network. |
 | **Embedding model fetch (one-time)** | The default `cortex-mcp-server` enables on-device semantic search, which **downloads a ~30 MB model (all-MiniLM-L6-v2) from the Hugging Face CDN on first ingest**, then runs fully offline and sends none of your data. For a 100%-offline setup: run with `CORTEX_NO_EMBEDDINGS=1` (keyword/FTS recall, zero network) or build `--no-default-features`. A one-time stderr notice is printed before any download — nothing is ever fetched silently. |
-| **Muse gateway (opt-in)** | `gateway serve` is the only component that accepts remote requests. It serves a single read-only tool over an explicit per-memory export only. Every request needs a token: OAuth (each sign-in approved locally with `gateway connect`; PKCE, rotating refresh tokens, hash-only storage) or a static bearer token. There are daily request and disclosure budgets, a kill switch, and a metadata-only audit log. The export namespace is reserved, so ordinary ingest and sync peers cannot write it. It is left out of the `-lite` build. [docs/muse.md](docs/muse.md) |
-| **No accounts** | No API key, no registration, no cloud dependency |
+| **Muse sharing (opt-in)** | Hosted Cortex Cloud serves only approved excerpts, using OAuth, signed device management, daily budgets and metadata-only audits. `muse_unshare` removes an excerpt; `muse_disconnect` deletes the cloud tenant. A self-hosted gateway is also available. Muse may retain disclosed copies; Cortex cannot erase them. [Guide](docs/muse.md) |
+| **No accounts for local use** | The local engine needs no API key, registration or cloud service. Hosted Muse sharing creates a device-managed cloud tenant without a web account. |
 
 See [SECURITY.md](SECURITY.md) for the full threat model.
 

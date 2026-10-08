@@ -1,7 +1,10 @@
 # Design: Cortex Cloud for Muse — always-on, phone-friendly, export-only (v2.6)
 
-Status: APPROVED (scope A, eng review 2026-10-06), Codex reviewed · Supersedes the tunnel paths in [`muse-oauth.md`](muse-oauth.md) as the default
-(self-hosted gateway stays for purists)
+Status: IMPLEMENTED. The dedicated-host deployment was verified on 2026-10-07 at
+`https://cortex.alvinsclub.ai`, runtime revision `461ad11`. See the
+[release report](../../deploy/cortex-cloud/RELEASE_2026-10-07.md) for validation and rollback.
+This is the default Muse connection path; the self-hosted gateway remains available.
+The v2.6 label names the design scope, not a package release number.
 
 ## Problem
 
@@ -49,7 +52,7 @@ Hardening that costs the user nothing (Codex review, revised after adversarial r
   a second call carries the code. (A prompt-injected agent can still call twice; the MCP
   client's own per-tool approval is the human gate. This makes the agent show the list.)
 - Only the enrollment hash is stored. GETs, link previews and discovery never consume it;
-  **POST Allow** consumes the enrollment and mints the code in one SQL transaction.
+  **POST Allow** consumes the enrollment and approves authorization under the tenant lock.
 - Consent page: session-bound CSRF token + **required** same-origin `Origin`, Secure/HttpOnly/SameSite cookie,
   frame-ancestors none, no-store, `Referrer-Policy: same-origin` (`no-referrer` would make browsers send `Origin: null` on the Allow POST), no third-party assets, link redacted from logs.
   The page binds client, exact redirect_uri, resource, PKCE challenge and the export
@@ -60,11 +63,11 @@ Hardening that costs the user nothing (Codex review, revised after adversarial r
 
 **Stated residual:** the link is a bearer capability. If it leaks (e.g. AI-vendor chat
 history) and an attacker uses it first, they get a read grant on the shared slice; the
-pairing code makes that visible but does not prevent it. Closing it fully would need an
+used-link warning and connection timestamp help the owner detect it but do not prevent it. Closing it fully would need an
 extra owner step, which the product rejects.
 
 Everything else is conversational: "share this with Muse too", "stop sharing X",
-"disconnect Muse" (kill switch + revoke all), "what did Muse see this week?" (audit).
+"disconnect Muse" (kill switch + revoke all), "what did Muse read today?" (status).
 Muse `remember` proposals arrive in the cloud inbox; the device pulls them and the agent
 asks in the next conversation ("Muse wants to remember X — keep it?").
 
@@ -78,29 +81,30 @@ signing are in v2.6** (not deferred).
 
 ```
                       ┌──────────────── cortex-cloud (one process) ────────────────┐
-Muse ── /mcp/<rid> ──▶│ route rid → tenant dir ─▶ Gateway (existing code, per tenant) │
-     ── /t/<rid>/… ──▶│   OAuth (existing oauth.rs, per-tenant state + issuer)       │
+Muse ── /t/<pid>/mcp ──▶│ route pid → tenant dir ─▶ Gateway (existing code, per tenant) │
+     ── /t/<pid>/… ──▶│   OAuth (existing oauth.rs, per-tenant state + issuer)       │
 device ── /api/… ────▶│ register · put export · new enrollment · delete tenant      │
-                      │ tenants/<rid>/export.db  (SQLCipher, key = HKDF(master,rid)) │
+                      │ tenants/<rid>/export.db  (SQLCipher, key = HMAC(master,rid)) │
                       │ tenants/<rid>/gateway-*.json|jsonl (budget, audit, oauth)    │
                       └─────── master key: /etc/cortex-cloud/master.key (0600) ──────┘
 ```
 
 ### Decisions from the eng review
+
 1. **Isolation by directory.** Every request resolves exactly one tenant dir from the URL
    (`rid` = 128-bit random, validated charset) and never touches another. Tests assert a
-   token from tenant A is useless on `/mcp/<B>`.
+   token from tenant A is useless on `/t/<B>/mcp`.
 2. **At rest:** each tenant's export DB is SQLCipher (already the `cortex-core` default)
    with a raw 256-bit key = HMAC-SHA256(master key, "db" ‖ rid) — raw key
    (`Cortex::open_with_raw_key`), so no per-open PBKDF cost; one read connection per
    tenant. Inbox text sealed with AES-256-GCM under HMAC(master, "inbox" ‖ rid). Master key outside the data dir. **No backups** of tenant data: the device is
    the source of truth and re-pushes.
-3. **OAuth per tenant:** issuer `https://<host>/t/<rid>` (RFC 8414 path issuer), PRM at
-   `/.well-known/oauth-protected-resource/mcp/<rid>`, so `oauth.rs` state stays per
+3. **OAuth per tenant:** issuer `https://<host>/t/<pid>` (RFC 8414 path issuer), PRM at
+   `/.well-known/oauth-protected-resource/t/<pid>/mcp`, so `oauth.rs` state stays per
    directory. Consent mode `Enrollment` replaces `gateway connect` (CLI) on the cloud: the
-   consent page shows the pairing code; POST Allow consumes the enrollment and marks the
-   pending request approved in one locked transaction. If the spike shows Muse can't handle
-   path issuers, fall back to one shared issuer with tenant bound in pending/code/grant.
+   consent page shows the export scope; POST Allow consumes the enrollment and marks the
+   pending request approved under the tenant lock. OAuth state is hash-only JSON persisted
+   by atomic rename, not a new shared multi-tenant SQL schema.
 4. **Device API, signed (Ed25519):** the device key lives in the OS keychain; every call
    carries `X-Cortex-Device: <key id>`, `X-Cortex-Timestamp`, `X-Cortex-Nonce` (128-bit) and
    `X-Cortex-Signature` over `method \n path?query \n sha256(body) \n timestamp \n nonce`.
@@ -114,30 +118,31 @@ device ── /api/… ────▶│ register · put export · new enrollme
    that never pushes within a day is reclaimed. Export pushes carry a `version` (device ms
    when the snapshot was taken) and are serialized per tenant; an older version is refused
    (409), so a slow stale push can't resurrect an unshared item. Export items ≤ 2000 chars,
-   embeddings exactly 384-dim. Endpoints: `POST /api/tenants` (create; returns rid +
-   token; rate limit per IP + global cap), `PUT /api/tenants/<rid>/export` (full snapshot:
-   text + vector, ≤ 1000 items, replaces atomically), `POST …/enroll` (new link + pairing
-   code; revokes existing grants), `GET …/inbox` + `POST …/inbox/ack` (remember items,
+   embeddings exactly 384-dim. Endpoints: `POST /api/tenants` (create; returns management id; rate limit per IP + global cap), `PUT /api/tenants/<rid>/export` (full snapshot:
+   text + vector, ≤ 1000 items, serialized with disclosure), `POST …/enroll` (new link;
+   revokes existing grants), `GET …/inbox` + `POST …/ack` (remember items,
    below), `DELETE …` (wipe the directory). Tenants idle 90 days are deleted.
-7. **`remember` (v2.6):** the existing gateway inbox, per tenant (append-only for Muse,
+5. **`remember` (v2.6):** the existing gateway inbox, per tenant (append-only for Muse,
    1000 chars, 20/day, 200 pending, never searchable). The device pulls pending items on its
    next run; the agent asks "Muse wants to remember X — keep it?"; keep = local Private memory
    + added to the export (pushed back); either way the device acks and the cloud deletes the
-   item. Inbox text is in the tenant's SQLCipher DB, not a plaintext jsonl.
-5. **Local side:** MCP tools in `cortex-mcp-server`: `muse_connect` (pick → push → link),
+   item. Inbox text is sealed with AES-256-GCM in `gateway-inbox.jsonl`.
+6. **Local side:** MCP tools in `cortex-mcp-server`: `muse_connect` (pick → push → link),
    `muse_share` / `muse_unshare` (edit export + push), `muse_disconnect` (delete tenant),
    `muse_status` (what is shared, last access from audit). Cloud URL default compiled in,
    overridable by env.
-6. **Failure:** cloud down → Muse gets an error, nothing else breaks; local Cortex never
+7. **Failure:** cloud down → Muse gets an error, nothing else breaks; local Cortex never
    depends on the cloud.
 
 ### Code quality
+
 - Refactor first, then build (no behaviour change in the first commit): split `gateway.rs`
   into the per-tenant core (disclosure, budgets, audit, inbox, OAuth) and the CLI/serve glue,
   so `cortex-cloud` links the core.
 - One `oauth.rs` for both; consent is an enum (`LocalCli` | `Enrollment`), not a copy.
 
 ### Performance
+
 - **One shared embedder** for all tenants (today each `Cortex` lazily loads its own model,
   ~90 MB each): construct once, inject into every tenant instance.
 - Tenant `Cortex` handles in a true LRU cache (cap 64; ~2 file descriptors each), at most
@@ -146,45 +151,22 @@ device ── /api/… ────▶│ register · put export · new enrollme
   can resurrect it.
 - Per-request cost stays as in the gateway (≤ 1000 rows scored, file-state reads).
 
-## Architecture (original sketch)
+## Implementation boundaries
 
-```
-laptop: cortex-mcp-server ──(device key, signed)──▶  Cortex Cloud (Rust, axum)  ◀──OAuth/MCP── Muse
-   │  export slice push (full replace, versioned)        │ SQLite (WAL), export rows AES-GCM at rest
-   │  inbox pull / ack                                   │ /mcp  /authorize /token /register /.well-known
-   │  config (budgets, off)                              │ (no web account UI: control via the device)
-   └ full archive stays local / E2E in own drive         └ Caddy in front (TLS, Let's Encrypt)
-```
+The directory-per-tenant design above supersedes the original shared-SQLite sketch.
+OAuth, budgets and metadata-only audits use tenant-local files; export rows use SQLCipher,
+and inbox text uses AES-256-GCM. The management id is stable; public ids rotate on every
+enrollment. Only the current public id resolves to the tenant.
 
-One new crate `cortex-cloud` (binary). Reuses from the gateway: OAuth logic (factored into a
-shared module parameterized by tenant + storage), `rank`/redaction/caps, budgets, audit
-format, terminal/HTML escaping. Embeddings: the device uploads each export item's vector
-(same all-MiniLM-L6-v2); the server embeds only queries, with the same model
-(`cortex-core` `embeddings` feature).
+Export snapshots are serialized with disclosures. A version watermark is persisted
+before replacement, so a crash or partial failure cannot permit an older snapshot to
+restore revoked data. Replacement is not an all-or-nothing database transaction: a
+failure can leave a partial export; retrying a newer snapshot converges.
 
-### Identity
-
-- **Device**: Ed25519 key in the OS keychain (macOS), else a 0600 file next to the local
-  database; every device API request is signed (see decision 4). No bearer device secret.
-- **Human**: no account. Control happens on the device (through the agent), which is
-  already the user's trust anchor. Consent for Muse = the enrollment link (single use,
-  30 min, 256-bit) + one tap.
-- **Muse**: OAuth 2.1 as in `muse-oauth.md` (DCR allowlist = Muse callback, PKCE, rotating
-  refresh, reuse revocation, resource-bound tokens). `/authorize` without a live enrollment
-  for that account → "ask your AI for a new Muse link". One enrollment → one grant.
-
-### Storage
-
-SQLite: `accounts`, `devices`, `enrollments`, `clients`, `pending`, `codes`, `grants`,
-`exports(account, id, ciphertext, vector, updated)`, `inbox`, `budget`, `audit`. Export text
-and inbox text encrypted with AES-256-GCM under a per-account data key, wrapped by a server
-master key (file, 0600, not in the DB or backups). Tokens/codes/secrets: SHA-256 only.
-
-### Limits (per account, same defaults as the gateway)
-
-100 requests / 30 distinct disclosures / 20 remembers per UTC day, 1000 exports, 200 inbox,
-1000 chars per item, 4 KiB response. Global: per-IP and per-account rate limits, body
-limits, timeouts, separate lane for unauthenticated endpoints.
+Defaults per tenant: 100 requests, 30 distinct disclosures and 20 remembers per UTC day;
+1000 exports (2000 characters each), 200 pending proposals (1000 characters each), and
+4 KiB recall responses. The device key uses the OS keychain on macOS, otherwise a 0600
+file next to the local database. Cloud management requires HTTPS except loopback tests.
 
 ## Copies kept by Muse (observed in the first real test)
 
@@ -216,7 +198,8 @@ Muse saved the memories it read into its own long-term memory and later answered
 calling Cortex. Revocation cannot reach that copy. Mitigations (requests, not enforcement):
 every recall result carries a do-not-retain notice and the MCP `instructions` say to query
 live; the sharing preview tells the user that Meta sees what is shared and Muse may keep a
-copy; the guide tells users to turn off Muse's own memory so Cortex stays the single source.
+copy; the guide recommends turning off Muse's own memory to reduce additional copies, without
+claiming this proves their deletion.
 
 ## Threat model (delta from the self-hosted gateway)
 
@@ -224,7 +207,7 @@ copy; the guide tells users to turn off Muse's own memory so Cortex stays the si
 |---|---|
 | Cortex Cloud operator or a server compromise reads the export slice | **Residual, stated plainly**: the slice is plaintext to the running server (Muse needs plaintext answers). It is only what the user already chose to give Meta. Encrypted at rest; master key outside the DB |
 | Server compromise reads the archive | Impossible: the archive is never sent |
-| Stolen device key pushes a poisoned export | Signed requests only push the export (no read of other data); the agent can list what the cloud holds; "disconnect Muse" revokes devices' pushes and grants |
+| Stolen device key pushes a poisoned export | Device requests manage the export, inbox and enrollment, but cannot read the full local archive; the agent can list what the cloud holds; "disconnect Muse" revokes devices' pushes and grants |
 | Enrollment link leaks before use | 30 min, single use; the user sees Muse fail and asks for a new link, which revokes the stray grant (`muse_connect` revokes all grants by default) |
 | Muse token theft | As in `muse-oauth.md` |
 | Cross-tenant leak | Every query keyed by account id from the authenticated token; tests per endpoint |
@@ -234,7 +217,7 @@ copy; the guide tells users to turn off Muse's own memory so Cortex stays the si
 OAuth clients build `/authorize` from discovery metadata, not from the pasted URL, so a
 query secret in the link (`?e=`) would not reach the consent step. Instead:
 
-- The link is the tenant's MCP URL: `https://<host>/t/<rid>/mcp`. `rid` is 128-bit random,
+- The link is the tenant's MCP URL: `https://<host>/t/<pid>/mcp`. `pid` is 128-bit random,
   shown only in the user's AI chat, and **rotates on every enrollment** (Codex review): any
   earlier link — used, expired or leaked — is dead for good (404). Two ids per tenant: the
   device manages it by a stable **management id** (never shown to Muse or the user; keys
@@ -244,28 +227,27 @@ query secret in the link (`?e=`) would not reach the consent step. Instead:
 - Device → cloud traffic must be HTTPS (loopback excepted for testing); the client refuses
   plain HTTP.
 - `muse_connect` asks the cloud (signed) to open an **enrollment window**: 30 min, one
-  grant, with a 4-digit pairing code the agent tells the user. Opening a window revokes
-  existing grants.
-- `/t/<rid>/authorize` outside a window → "Ask your AI for a new Muse link". Inside: the
-  consent page with the pairing code and **Allow** (POST, CSRF + Origin checked). Allow marks
+  grant. Opening a window revokes existing grants; there is no pairing code.
+- `/t/<pid>/authorize` outside a window → "Ask your AI for a new Muse link". Inside: the
+  consent page with the shared scope and **Allow** (POST, CSRF + Origin checked). Allow marks
   the request approved and closes the window in one locked step; the existing wait/code
   machinery then completes OAuth.
-- Discovery: issuer `https://<host>/t/<rid>`; metadata served at both the RFC 8414/9728
-  inserted forms (`/.well-known/oauth-authorization-server/t/<rid>`,
-  `/.well-known/oauth-protected-resource/t/<rid>/mcp`) and the appended forms under
-  `/t/<rid>/.well-known/...`.
+- Discovery: issuer `https://<host>/t/<pid>`; metadata served at both the RFC 8414/9728
+  inserted forms (`/.well-known/oauth-authorization-server/t/<pid>`,
+  `/.well-known/oauth-protected-resource/t/<pid>/mcp`) and the appended forms under
+  `/t/<pid>/.well-known/...`.
 
-The Muse spike still checks: which discovery URLs it fetches, DCR body, and that path
-issuers work. Fallback if they don't: one shared issuer with the tenant bound in
-pending/code/grant.
+The recorded release verified path discovery, dynamic client registration, consent,
+PKCE and resource-bound tokens using synthetic HTTPS clients. This is protocol
+verification; existing users still need to reconnect their actual Muse connector.
 
-## Multi-tenant OAuth (from `oauth.rs`)
+## Multi-tenant OAuth
 
-Tenant + export version are carried immutably through pending → code → grant → request
-context (`{tenant, grant, scope, resource}`), all in SQLite transactions with constraints
-(enrollment and code consumption, refresh rotation). DCR clients may be shared across
-tenants, so a client id is never a tenant identity. Cross-tenant and concurrent-redeem
-tests are mandatory.
+Each tenant has its own OAuth state. Pending authorization binds the redirect, PKCE
+challenge, resource and export version; the resulting grant remains resource-bound.
+State mutations take the OAuth lock; revocations also acquire the disclosure lock first.
+Client ids are not tenant identities. Acceptance tests exercise cross-tenant rejection,
+replay/reuse revocation and concurrent disclosure fencing.
 
 ## MVP cuts / must-keep
 
@@ -280,20 +262,20 @@ discipline, the plainly stated server-sees-the-slice residual.
 ```
 NEW FLOW                                   TESTS (cortex-cloud acceptance unless noted)
 muse_connect (local MCP tool) ───────────── unit: picks only confirmed ids; push payload has no
-                                             non-export rows; returns link + pairing code
+                                             non-export rows; returns personal enrollment link
 signed device API ───────────────────────── bad sig / stale ts / reused nonce (also after
                                              restart) → 401; key of tenant A on B → 401
 POST /api/tenants ───────────────────────── rate limit; global cap
-PUT export ──────────────────────────────── replaces atomically; >1000 refused; wrong token 401;
-                                             token of tenant A on tenant B 401
+PUT export ──────────────────────────────── serialized replacement; stale snapshots rejected; >1000 refused;
+                                             wrong device signature or cross-tenant key 401
 POST enroll ─────────────────────────────── revokes old grants; link single use; 30 min expiry
-discovery /mcp/<rid> ────────────────────── PRM + AS metadata per tenant; unknown rid 404
-/authorize + consent GET ────────────────── shows pairing code; GET never consumes enrollment;
+discovery /t/<pid>/mcp ────────────────────── PRM + AS metadata per tenant; unknown rid 404
+/authorize + consent GET ────────────────── shows shared scope; GET never consumes enrollment;
                                              link preview (HEAD/GET) harmless
 POST Allow ──────────────────────────────── CSRF token + Origin required; consumes enrollment
                                              atomically; concurrent Allow → one grant
 /token, refresh, /mcp ───────────────────── existing oauth acceptance suite, per tenant
-cross-tenant ────────────────────────────── grant A on /mcp/B 401; audit/budget files separate
+cross-tenant ────────────────────────────── grant A on /t/B/mcp 401; audit/budget files separate
 DELETE tenant / disconnect ──────────────── directory gone; tokens 401; rid 404
 at rest ─────────────────────────────────── export.db unreadable without key (SQLCipher)
 remember → inbox ────────────────────────── Muse append-only; caps; not searchable; device
@@ -302,9 +284,11 @@ shared embedder ─────────────────────�
 Muse spike (manual, real account) ───────── path + query preserved; discovery URL; DCR body
 ```
 
-Failure modes: SQLCipher key mismatch after master-key rotation → tenant 500 (test: clear
-error, device re-push recovers); enrollment consumed but redirect lost → user asks for a new
-link (tested); disk full on push → 507 and old export kept (atomic replace, tested).
+Failure modes: loss of the master key makes tenant data unreadable; the device must
+reconnect and re-push its export. Inbox proposals and audit history cannot be recovered.
+A lost enrollment response is handled by requesting a new link. A failed export update
+returns an error and requires a newer snapshot retry; it does not guarantee the previous
+export was kept intact.
 
 ## Not in scope (v2.6)
 
@@ -312,8 +296,9 @@ A web dashboard, backups of tenant data, billing, multi-device conflict UI (last
 non-Muse clients (same OAuth works, not marketed), E2E-encrypted export (impossible while
 Muse needs plaintext).
 
-## Open decisions for the owner
+## Deployment decisions
 
-1. Server and domain (TLS needs a domain; e.g. `muse.<our domain>`).
-2. Free for everyone at launch? (Cost is one small server.)
-3. Keep the laptop gateway as the "fully self-hosted" option (recommended: yes).
+The service uses the dedicated hostname `cortex.alvinsclub.ai`; the self-hosted gateway
+remains an option. Deployment configuration, migration and renewal are documented in the
+[operator guide](../../deploy/cortex-cloud/README.md). This document does not establish a
+billing policy or promise permanent hosted-service availability.

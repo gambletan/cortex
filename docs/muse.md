@@ -1,26 +1,17 @@
 # Cortex × Meta Muse — give Muse your memory, keep your privacy
 
-> **Preview.** Muse is US-only. Since v2.5 the gateway signs Muse in with OAuth (what Muse
-> custom connectors use), and every sign-in must be approved on your own computer. Problems?
-> [Open an issue](https://github.com/gambletan/cortex/issues).
+Your memory archive stays on your device. Optional encrypted sync stores ciphertext in
+your own cloud drive. Connecting Muse explicitly shares selected excerpts with Cortex
+Cloud and Meta; the rest of your archive is not uploaded by this integration.
 
-Muse is far more useful when it knows you: your kid's peanut allergy, that you always take
-the aisle seat, which coffee you like. Typical memory connectors for Muse keep your memory
-on a hosted service, or on a self-hosted server. Muse can then read whole memory banks, and
-an LLM processes everything you store.
-
-Cortex works the other way round: **your memory archive stays on your device, and synced
-copies are encrypted in your own cloud drive (iCloud / Google Drive / Dropbox / OneDrive)
-with a key that only your devices hold.** Muse gets only the excerpts you allow, under a
-daily budget, and you can cut it off with one command.
-
-Don't connect your whole Google Drive to Muse. That gives Meta the plaintext of every file.
-Connect Cortex instead, and Muse gets only what you put in the export.
+The hosted service is `https://cortex.alvinsclub.ai`. Custom-connector availability depends
+on your Muse account. Problems? [Open an issue](https://github.com/gambletan/cortex/issues).
 
 ## Connect in two steps (recommended)
 
 1. Tell your AI (Claude, etc. with Cortex installed): **"connect my memory to Muse"**.
-   It suggests what to share, you say which ones, and it gives you a link.
+   It previews the exact excerpts, asks for your confirmation, and gives you a personal
+   `https://cortex.alvinsclub.ai/t/<public-id>/mcp` link. Use that complete link, not the site root.
 2. On your phone, paste the link into Muse. A Cortex page opens: tap **Allow**. Done.
 
 Muse now works from your phone even when your computer is off. Later, just talk to your
@@ -30,10 +21,10 @@ remember?", "disconnect Muse".
 **How this keeps your privacy.** Only the memories you agreed to share go to Cortex
 Cloud, the always-on service that answers Muse. Those are the memories Muse (Meta) will
 see anyway. Everything else stays on your devices, and synced copies are encrypted in
-your own drive. In Cortex Cloud, your shared memories live in their own encrypted
+your own drive. In Cortex Cloud, your shared memories live in a tenant-specific encrypted
 database; Muse can read at most 30 of them a day; and "disconnect Muse" deletes
 everything there. To be precise: while it answers Muse, the Cortex Cloud server can read
-the memories you shared. If you'd rather not use any server, run the gateway yourself
+the memories you shared. If you prefer to host the service on your own machine, run the gateway yourself
 ([self-hosted setup](#self-hosted-setup)).
 
 **Turn off Muse's own memory.** Whatever Muse reads becomes visible to Meta, and Muse may
@@ -47,24 +38,28 @@ The link works once, for 30 minutes. If someone else used your link before you d
 own Muse won't connect: ask your AI to connect again, which cancels any earlier
 connection.
 
-## Why this is different
+## Existing connections: reconnect on the new domain
 
-| | Cortex gateway | Typical hosted/self-hosted memory connector |
+If your Muse connector used `studio.alvinsclub.ai`, ask your AI to run `muse_connect`
+again, then connect Muse using the new link and tap **Allow**. Reconnecting revokes earlier
+grants and invalidates the previous public link. The old device-management routes remain
+available during migration, so an existing device can request the new link without
+manually editing its saved state.
+
+## Choose hosted or self-hosted
+
+| Control | Hosted Cortex Cloud (recommended) | Self-hosted gateway |
 |---|---|---|
-| Where your memory lives | Your devices (SQLite). Synced copies are encrypted in your own drive | Vendor cloud or your server (plaintext DB) |
-| Is your memory sent to an LLM to process? | No. No LLM in the pipeline | Yes, every save is processed by an LLM provider |
-| What Muse can read | Only the memories you add to the export, one by one | Whole memory banks (scoping is per bank) |
-| Can Muse write or delete? | No. It gets one read-only tool | Usually yes (retain, bank tools) |
-| Daily cap on what leaves | Yes: requests and distinct memories per day | No |
-| Kill switch | `gateway off` takes effect on the next request | Revoke the OAuth grant |
-| Who can sign Muse in | Only you, by typing `gateway connect <code>` on your computer | Whoever completes the web login |
-| Record of what was shared | Local audit log (ids, counts, outcome; never your query or text) | Vendor-side, often an enterprise feature |
-| Preview before sharing | `gateway preview "<question>"` | — |
-| Cost | Free, MIT, no account | Usage-based pricing or your own LLM bill |
+| Availability | Works while your computer is off | Your gateway machine must stay on |
+| Data exposed to the host | Only your approved export and Muse inbox proposals | The host can access the local database |
+| Consent | Personal enrollment link and web **Allow** | Approve the displayed code on your computer |
+| Stop sharing | `muse_unshare`; `muse_disconnect` deletes the cloud tenant | `gateway revoke`; `gateway off` suspends access |
+| Read history | `muse_status`, backed by the tenant's audit log | `gateway audit`, local metadata-only log |
+| Save proposals | Append-only inbox; review with `muse_inbox` | Optional `--enable-remember`; review with `gateway inbox` |
 
-Your private memories are never put into a response. The gateway's database query only
-asks for the `muse-export` namespace, so other rows are never loaded at all. Revoking an
-item takes effect on the next request, even while the server is running.
+Both modes disclose only the `muse-export` namespace and enforce daily budgets. Approved
+exports are copies: the original memory can remain Private. Private classification does
+not prevent you from explicitly approving a separate copy for Muse.
 
 ## Self-hosted setup
 
@@ -130,9 +125,13 @@ Prefer a fixed token (scripts, other MCP clients)? Set
 `CORTEX_GATEWAY_TOKEN=$(cortex-mcp-server gateway token)` before `serve`; it works with or
 without `--oauth`. `disconnect --all` does not affect it: unset it and restart.
 
-## Let Muse save to *your* memory (`remember`, v2.4)
+## Let Muse propose memories (`remember`)
 
-You can turn off Muse's built-in memory and have Muse save to Cortex instead:
+With the hosted service, ask your AI to run `muse_inbox`. Review each proposal, then
+choose **keep** or **discard**. Keeping creates a local Private memory and a shared export
+copy; discarding removes the proposal. Muse cannot search, edit or delete inbox items.
+
+For the self-hosted gateway, enable proposals explicitly:
 
 ```bash
 cortex-mcp-server gateway serve --enable-remember     # adds the `remember` tool
@@ -151,11 +150,26 @@ cortex-mcp-server gateway reject <id>                 # or: reject --all
 - `gateway inbox` escapes control and bidi characters, so text written by Muse can't
   control your terminal or disguise what you're approving.
 
-Approving means "Muse may see this", not "this is true". Muse saw the text in the
-conversation anyway; what changes is that the long-term copy lives with you and can be
-deleted with you, not with Meta.
+Approving means "Muse may see this", not "this is true". Your approved primary memory
+is stored locally, and its export copy is available to Muse. Approval does not erase any
+copy Meta already retained.
 
 ## Day-to-day control
+
+For hosted connections, ask your AI to use:
+
+- `muse_status`: shared excerpts, connection time, today's reads and pending proposals.
+- `muse_share`: preview and confirm additional excerpts.
+- `muse_unshare`: remove ids from the status tool's `shared` list.
+- `muse_disconnect`: revoke access and delete the cloud tenant, including its inbox and audit.
+
+Check that a cloud update succeeded. If a push fails, Muse may still see the previous
+export until a later Muse action successfully reconciles it. Read counts cover retained
+audit records for **currently shared items**, per UTC day; they are not a complete lifetime
+history. Unreadable audit state is reported as `muse_read_today: null` with
+`muse_read_today_error`, rather than an empty history. Inbox errors are also explicit.
+
+For self-hosted connections only:
 
 ```bash
 cortex-mcp-server gateway off        # kill switch: every request and sign-in refused, immediately
@@ -171,26 +185,28 @@ by asking many questions. Requests over budget are refused, and nothing is discl
 ## What Meta can and cannot see
 
 **Meta can see:** what you ask Muse, and the excerpts the gateway returns (bounded by your
-export list and daily budget). Muse keeps those in its VM and conversation history.
+export list and daily budget). Meta may retain what it receives.
 
 **Meta cannot see:** everything else in your memory: the rest of the archive, your
-history, people graph, beliefs, and anything Private. These never leave your devices
-except as ciphertext in your own drive.
+history, people graph and beliefs, unless you explicitly choose to export their contents.
+Cortex does not send unselected archive contents to Muse.
 
 **Your cloud drive provider can see:** that encrypted Cortex files exist, plus their sizes,
 timestamps and your account. It cannot see the contents.
 
 ## Honest limits
 
-- What Muse receives lives in Meta's cloud (your Muse VM and conversation history) and
-  cannot be recalled. Meta may use de-identified conversations for training. **Turn that off
-  in Muse's settings.**
-- Turning off Muse's own memory doesn't prove Meta deleted anything, and doesn't stop
-  training on de-identified conversations. Use Muse's settings for that.
-- Anyone who controls the machine running the gateway can read your memory. It holds the key.
+- Cortex cannot recall responses already delivered to Meta or delete copies Meta retained.
+  Review Meta's own memory and data controls; Cortex does not enforce those policies.
+- Turning off Muse's own memory can reduce retained copies, but does not prove deletion.
+- The Cortex Cloud operator can read the shared slice and inbox proposals while serving
+  requests. Encryption at rest does not hide these from the running service.
+- Anyone controlling a self-hosted gateway machine can read its local database.
 - Redaction only catches email addresses. Treat the export list itself as your real
   control, and only export what you'd be comfortable telling Muse directly.
 - Only `cortex-mcp-server gateway` should go through the tunnel. **Never tunnel
   `cortex-http`.** It is a local admin API with no authentication.
 
-Design and threat model: [`docs/design/muse-gateway.md`](design/muse-gateway.md).
+Design and threat model: [hosted service](design/muse-cloud.md) and
+[self-hosted gateway](design/muse-gateway.md). Operators: [deployment guide](../deploy/cortex-cloud/README.md)
+and [verified release](../deploy/cortex-cloud/RELEASE_2026-10-07.md).
