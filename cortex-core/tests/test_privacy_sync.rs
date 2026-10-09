@@ -233,3 +233,131 @@ fn encrypted_settings_without_passphrase_stay_disabled() {
     }
     std::env::remove_var("CORTEX_NO_KEYCHAIN");
 }
+
+/// A demotion to Private is a local-only decision: a peer that has not yet seen the
+/// retraction must not be able to flip the local copy back to syncable. Before the fix,
+/// the demoting device kept no entity HLC for its own retraction, so the peer's stale
+/// upsert (older than the retraction) overwrote the Private memory with `Public` — the
+/// user's opt-out was silently undone and every later local edit went back on the wire.
+#[test]
+fn stale_peer_upsert_cannot_undo_private_demotion() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("cortex-sync");
+
+    let a = Cortex::in_memory().unwrap();
+    a.enable_sync(make_sync_config(&sync_dir, "dev-a")).unwrap();
+    let mem = a
+        .ingest_with_options(
+            "shared then retracted",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(PrivacyLevel::Shared { scope: "all".into() }),
+        )
+        .unwrap();
+
+    let b = Cortex::in_memory().unwrap();
+    b.enable_sync(make_sync_config(&sync_dir, "dev-b")).unwrap();
+    assert!(b.sync_pull().unwrap() >= 1);
+
+    // B touches the memory before it has seen A's retraction.
+    b.set_memory_privacy(mem.id, PrivacyLevel::Public).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // A then retracts it (strictly later than B's edit).
+    a.set_memory_privacy(mem.id, PrivacyLevel::Private).unwrap();
+
+    // A pulls B's stale upsert: the local Private decision must stand.
+    a.sync_pull().unwrap();
+    let local = a.storage().get_memory(mem.id).unwrap().expect("local copy is kept on demotion");
+    assert!(
+        !local.privacy.is_syncable(),
+        "a peer's stale upsert flipped a locally-Private memory to {:?}",
+        local.privacy
+    );
+}
+
+/// Right to delete: deleting a locally-created Shared memory must retract it from peers.
+/// Before the fix, `record_memory_event` decided "was this synced?" from the entity HLC,
+/// which is only ever set for *remote* ops — so a delete of the user's own shared memory
+/// was never recorded and every other device kept the copy indefinitely.
+#[test]
+fn deleting_own_shared_memory_propagates_to_peers() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("cortex-sync");
+
+    let a = Cortex::in_memory().unwrap();
+    a.enable_sync(make_sync_config(&sync_dir, "dev-a")).unwrap();
+    let shared = a
+        .ingest_with_options(
+            "shared then deleted",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(PrivacyLevel::Shared { scope: "all".into() }),
+        )
+        .unwrap();
+    let private = a.ingest("private then deleted", "test", None, None, None).unwrap();
+
+    let b = Cortex::in_memory().unwrap();
+    b.enable_sync(make_sync_config(&sync_dir, "dev-b")).unwrap();
+    assert!(b.sync_pull().unwrap() >= 1);
+    assert!(b.storage().get_memory(shared.id).unwrap().is_some());
+
+    let before = read_ops(&sync_dir, "dev-a").len();
+    a.delete_memory(private.id).unwrap();
+    assert_eq!(
+        read_ops(&sync_dir, "dev-a").len(),
+        before,
+        "deleting a Private memory must not touch the oplog"
+    );
+
+    a.delete_memory(shared.id).unwrap();
+    b.sync_pull().unwrap();
+    assert!(
+        b.storage().get_memory(shared.id).unwrap().is_none(),
+        "peer still holds a shared memory its owner deleted"
+    );
+}
+
+/// A peer's retraction of the shared copy must not destroy the copy this device took
+/// back as Private — and must leave no tombstone that would let a later peer upsert
+/// recreate it as syncable.
+#[test]
+fn peer_delete_does_not_remove_locally_private_copy() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("cortex-sync");
+
+    let a = Cortex::in_memory().unwrap();
+    a.enable_sync(make_sync_config(&sync_dir, "dev-a")).unwrap();
+    let b = Cortex::in_memory().unwrap();
+    b.enable_sync(make_sync_config(&sync_dir, "dev-b")).unwrap();
+
+    let mem = b
+        .ingest_with_options(
+            "created on b",
+            "test",
+            None,
+            None,
+            None,
+            None,
+            Some(PrivacyLevel::Shared { scope: "all".into() }),
+        )
+        .unwrap();
+    assert!(a.sync_pull().unwrap() >= 1);
+
+    // A keeps it but takes it off the wire; B then deletes its shared copy.
+    a.set_memory_privacy(mem.id, PrivacyLevel::Private).unwrap();
+    b.delete_memory(mem.id).unwrap();
+    a.sync_pull().unwrap();
+
+    let local = a.storage().get_memory(mem.id).unwrap();
+    assert!(
+        local.is_some_and(|m| !m.privacy.is_syncable()),
+        "peer delete removed (or re-shared) the locally-Private copy"
+    );
+}
