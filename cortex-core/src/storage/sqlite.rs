@@ -721,44 +721,7 @@ impl StorageBackend for SqliteStorage {
 
 
     fn update_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock();
-        let now = Utc::now().to_rfc3339();
-        let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
-        let content_json = serde_json::to_string(&mem.content).unwrap();
-        let id_str = mem.id.to_string();
-        let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
-        let mut stmt = conn
-            .prepare_cached(
-                "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, fact_subject=?15, fact_object=?16, pref_key=?17, source_channel=?18, source_identity_id=?19, updated_at=?20 WHERE id=?1",
-            )
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-        stmt.execute(params![
-                id_str,
-                mem.tier.as_str(),
-                content_json,
-                embedding_blob,
-                serde_json::to_string(&mem.temporal).unwrap(),
-                serde_json::to_string(&mem.source).unwrap(),
-                serde_json::to_string(&mem.salience).unwrap(),
-                serialize_privacy(&mem.privacy),
-                serialize_tags(&mem.tags),
-                serialize_metadata(&mem.metadata),
-                serialize_links(&mem.links),
-                mem.content_hash,
-                mem.namespace,
-                mem.salience.effective_score,
-                fact_subject,
-                fact_object,
-                pref_key,
-                mem.source.channel,
-                mem.source.identity_id.map(|id| id.to_string()),
-                now,
-            ])
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-
-        // FTS5 synced via trigger (memories_fts_au)
-        self.cache_put(mem);
-        Ok(())
+        self.update_memory_where(mem, false).map(|_| ())
     }
 
     fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
@@ -1688,6 +1651,81 @@ impl StorageBackend for SqliteStorage {
 }
 
 impl SqliteStorage {
+    /// `UPDATE` a memory row. With `skip_private`, a row currently stored as Private is
+    /// left untouched — the check and the write are one statement under the write lock,
+    /// so a concurrent local demotion can never be overwritten. Returns rows written.
+    fn update_memory_where(&self, mem: &MemObject, skip_private: bool) -> Result<usize, CortexError> {
+        let conn = self.write_conn.lock();
+        let now = Utc::now().to_rfc3339();
+        let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+        let content_json = serde_json::to_string(&mem.content).unwrap();
+        let id_str = mem.id.to_string();
+        let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
+        const UPDATE: &str = "UPDATE memories SET tier=?2, content_json=?3, embedding_blob=?4, temporal_json=?5, source_json=?6, salience_json=?7, privacy_json=?8, tags_json=?9, metadata_json=?10, links_json=?11, content_hash=?12, namespace=?13, salience_score=?14, fact_subject=?15, fact_object=?16, pref_key=?17, source_channel=?18, source_identity_id=?19, updated_at=?20 WHERE id=?1";
+        let sql = if skip_private {
+            format!("{UPDATE} AND privacy_json != '{DEFAULT_PRIVACY_JSON}'")
+        } else {
+            UPDATE.to_string()
+        };
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let written = stmt.execute(params![
+                id_str,
+                mem.tier.as_str(),
+                content_json,
+                embedding_blob,
+                serde_json::to_string(&mem.temporal).unwrap(),
+                serde_json::to_string(&mem.source).unwrap(),
+                serde_json::to_string(&mem.salience).unwrap(),
+                serialize_privacy(&mem.privacy),
+                serialize_tags(&mem.tags),
+                serialize_metadata(&mem.metadata),
+                serialize_links(&mem.links),
+                mem.content_hash,
+                mem.namespace,
+                mem.salience.effective_score,
+                fact_subject,
+                fact_object,
+                pref_key,
+                mem.source.channel,
+                mem.source.identity_id.map(|id| id.to_string()),
+                now,
+            ])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        // FTS5 synced via trigger (memories_fts_au)
+        if written > 0 {
+            self.cache_put(mem);
+        }
+        Ok(written)
+    }
+
+    /// Sync-merge write: update `mem` unless the local row is Private. Returns whether
+    /// the row was written. Private is a local-only decision no peer may override.
+    pub fn update_memory_unless_private(&self, mem: &MemObject) -> Result<bool, CortexError> {
+        Ok(self.update_memory_where(mem, true)? > 0)
+    }
+
+    /// Sync-merge delete: delete `id` unless the local row is Private (atomic check+delete).
+    /// Returns whether a row was deleted.
+    pub fn delete_memory_unless_private(&self, id: Uuid) -> Result<bool, CortexError> {
+        let conn = self.write_conn.lock();
+        let deleted = conn
+            .prepare_cached(&format!(
+                "DELETE FROM memories WHERE id = ?1 AND privacy_json != '{DEFAULT_PRIVACY_JSON}'"
+            ))
+            .and_then(|mut stmt| stmt.execute(params![id.to_string()]))
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // FTS5 synced via trigger (memories_fts_ad)
+        if deleted > 0 {
+            self.cache_evict(&id);
+        }
+        Ok(deleted > 0)
+    }
+
+
+
     /// Full-text search using FTS5. Returns (id, BM25 rank) pairs.
     /// Rank is normalized to 0.0–1.0 range.
     /// Filters out Private memories with adaptive privacy padding.

@@ -65,7 +65,14 @@ pub fn apply_op(
             }
 
             // Apply: upsert memory (storage operations)
-            let exists = storage.get_memory(entity_id)?.is_some();
+            let local_mem = storage.get_memory(entity_id)?;
+            // Private is a local-only decision: a peer must never overwrite (and thereby
+            // re-share) a memory this device holds as Private, e.g. a stale upsert that
+            // raced the user's demotion. Only a local `set_memory_privacy` can promote it.
+            if local_mem.as_ref().is_some_and(|m| !m.privacy.is_syncable()) {
+                return Ok(MergeResult::Skipped);
+            }
+            let exists = local_mem.is_some();
 
             if !exists {
                 if let Some(ref hash) = memory.content_hash {
@@ -78,7 +85,11 @@ pub fn apply_op(
             }
 
             if exists {
-                storage.update_memory(memory)?;
+                // Atomic re-check: a local demotion that landed after the check above must
+                // still win, so the write itself refuses Private rows.
+                if !storage.update_memory_unless_private(memory)? {
+                    return Ok(MergeResult::Skipped);
+                }
             } else {
                 storage.store_memory(memory)?;
             }
@@ -102,7 +113,12 @@ pub fn apply_op(
                 }
             }
 
-            storage.delete_memory(*id)?;
+            // A peer cannot delete a copy this device holds as Private: the user took it
+            // off the wire (the local copy is kept on demotion), so it is no longer the
+            // shared entity the peer is retracting.
+            if !storage.delete_memory_unless_private(*id)? && storage.get_memory(*id)?.is_some() {
+                return Ok(MergeResult::Skipped);
+            }
             index.remove(id);
 
             storage.with_write_conn(|c| {
@@ -436,6 +452,35 @@ mod tests {
             MemContent::Text(t) => assert_eq!(t, "v1"),
             other => panic!("unexpected content: {other:?}"),
         }
+    }
+
+    /// The merge's write must itself refuse a Private row: models a local demotion that
+    /// lands between the merge's privacy check and its write.
+    #[test]
+    fn test_unless_private_writes_are_atomic_guards() {
+        use crate::types::{MemContent, MemObject, MemObjectBuilder, MemSource, MemoryTier, PrivacyLevel};
+        let s = SqliteStorage::open_in_memory().unwrap();
+        let mut mem = MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text("x".into()), MemSource::new("t"))
+            .privacy(PrivacyLevel::Public)
+            .build();
+        s.store_memory(&mem).unwrap();
+        // Concurrent local demotion.
+        let mut demoted = mem.clone();
+        demoted.privacy = PrivacyLevel::Private;
+        s.update_memory(&demoted).unwrap();
+
+        mem.content = MemContent::Text("peer".into());
+        assert!(!s.update_memory_unless_private(&mem).unwrap());
+        assert!(!s.delete_memory_unless_private(mem.id).unwrap());
+        let stored = s.get_memory(mem.id).unwrap().unwrap();
+        assert!(!stored.privacy.is_syncable());
+        assert!(matches!(&stored.content, MemContent::Text(t) if t == "x"));
+
+        // Syncable rows are still written.
+        s.update_memory(&MemObject { privacy: PrivacyLevel::Public, ..demoted }).unwrap();
+        assert!(s.update_memory_unless_private(&mem).unwrap());
+        assert!(s.delete_memory_unless_private(mem.id).unwrap());
+        assert!(s.get_memory(mem.id).unwrap().is_none());
     }
 
     fn person_op(id: Uuid, count: u32, last_ms: i64, first_ms: i64, wall_ms: u64, device: &str) -> SyncOp {

@@ -1570,12 +1570,29 @@ impl Cortex {
 
     /// Delete a memory permanently.
     pub fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
+        // Capture privacy before the row is gone: after deletion the sync layer can no
+        // longer tell a shared memory (whose delete must reach peers) from a Private one
+        // (whose delete must never touch the wire).
+        let was_syncable = self
+            .storage
+            .get_memory(id)?
+            .is_some_and(|m| m.privacy.is_syncable());
         self.storage.delete_memory(id)?;
         self.index.remove(&id);
         self.bump_write_generation();
         let event = CortexEvent::MemoryDeleted { id };
         self.event_bus.emit(&event);
-        self.sync_record_event(&event);
+        if was_syncable {
+            let mut guard = self.sync_engine.lock();
+            if let Some(ref mut engine) = *guard {
+                if let Err(e) =
+                    engine.record_op(crate::sync::oplog::SyncPayload::MemoryDelete { id })
+                {
+                    // The local row is gone but peers still hold it: say so loudly.
+                    tracing::error!(error = %e, %id, "deleted locally but failed to record sync delete; peers keep their copy");
+                }
+            }
+        }
         Ok(())
     }
 
