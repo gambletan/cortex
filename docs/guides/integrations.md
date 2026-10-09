@@ -378,6 +378,11 @@ cargo build --release -p cortex-http
 docker run -v ~/.cortex:/data -p 3315:3315 ghcr.io/gambletan/cortex/cortex-http:latest
 ```
 
+The API has no authentication, so it only answers local clients: browser requests
+from other origins are refused (no CORS), and the `Host` must be `localhost` or an IP
+address (DNS-rebinding protection). To reach it under a host name, list it in
+`CORTEX_ALLOWED_HOSTS` (comma-separated). Never expose the port beyond a trusted network.
+
 ### Usage from Any Language
 
 ```bash
