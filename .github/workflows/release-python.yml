@@ -26,8 +26,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+            # Apple-silicon minimum; pin so the wheel tag is explicit, not host-SDK-derived.
+            macos_deployment_target: "11.0"
           - os: macos-latest
             target: x86_64-apple-darwin
+            # CRITICAL: this x86_64 wheel is CROSS-built on an Apple-silicon runner. Without an
+            # explicit floor the wheel can inherit the host's macOS-14/15 SDK and be tagged
+            # macosx_14_*_x86_64 — which pip on older Intel Macs rejects, silently falling back
+            # to the sdist and defeating the point of shipping the wheel at all. Pin to 10.12.
+            macos_deployment_target: "10.12"
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +44,9 @@ jobs:
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # Empty on the Linux leg (matrix field absent) — harmless, ignored off-macOS.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
         with:
           target: ${{ matrix.target }}
           args: --release --out dist -m cortex-python/Cargo.toml
