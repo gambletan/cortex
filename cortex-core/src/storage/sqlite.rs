@@ -127,7 +127,39 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// The database holds every memory (Private included), usually unencrypted, so it
+    /// must be owner-only. Creates a new file as 0600 — SQLite gives `-wal`/`-shm` the
+    /// main file's mode — and tightens files left group/world-readable by older releases.
+    #[cfg(unix)]
+    fn restrict_db_file_mode(path: &str) -> Result<(), CortexError> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+            return Ok(());
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let p = format!("{path}{suffix}");
+            let Ok(meta) = std::fs::metadata(&p) else { continue };
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                // Not fatal (e.g. a file owned by someone else), but never silent.
+                if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode & 0o700)) {
+                    tracing::warn!("could not restrict permissions on {p}: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn open_keyed(path: &str, key: Option<DbKey>, readers: usize) -> Result<Self, CortexError> {
+        #[cfg(unix)]
+        Self::restrict_db_file_mode(path)?;
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
         Self::apply_key(&conn, key.as_ref())?;
 

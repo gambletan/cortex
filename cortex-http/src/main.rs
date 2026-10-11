@@ -184,7 +184,12 @@ async fn main() {
     });
 
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // Owner-only: the directory holds the (usually unencrypted) memory database.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let _ = builder.create(parent);
     }
 
     info!(db = %db_path, "opening cortex database");
