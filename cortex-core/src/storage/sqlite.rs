@@ -171,7 +171,8 @@ impl SqliteStorage {
              PRAGMA temp_store=MEMORY;
              PRAGMA foreign_keys=ON;
              PRAGMA wal_autocheckpoint=1000;
-             PRAGMA busy_timeout=5000;",
+             PRAGMA busy_timeout=5000;
+             PRAGMA secure_delete=ON;",
         )
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
@@ -201,7 +202,46 @@ impl SqliteStorage {
             )),
         };
         storage.init()?;
+        // Deletes are permanent: FTS5 otherwise keeps deleted terms in index segments
+        // until a merge (secure_delete only scrubs freed b-tree pages). Needs SQLite
+        // 3.42+; on older builds scrub_after_delete falls back to an index rebuild.
+        let _ = storage
+            .write_conn
+            .lock()
+            .execute_batch("INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1);");
         Ok(storage)
+    }
+
+    /// Make a committed delete permanent on disk: purge the deleted terms from the FTS
+    /// index, then fold the WAL back into the (zero-scrubbed) database and truncate it so
+    /// the plaintext does not linger in old WAL frames. Best effort: a reader holding a
+    /// snapshot can block the checkpoint; the next delete or autocheckpoint retries.
+    fn scrub_after_delete(conn: &Connection) {
+        let fts_secure_delete = conn
+            .query_row(
+                "SELECT v FROM memories_fts_config WHERE k = 'secure-delete'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|v| v != 0);
+        if !fts_secure_delete {
+            if let Err(e) =
+                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('optimize');")
+            {
+                tracing::warn!(error = %e, "FTS scrub after delete failed");
+            }
+        }
+        for attempt in 0..3 {
+            match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)) {
+                Ok(0) => return,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "WAL scrub after delete failed");
+                    return;
+                }
+            }
+        }
+        tracing::warn!("WAL scrub after delete skipped: database busy");
     }
 
     pub fn open_in_memory() -> Result<Self, CortexError> {
@@ -764,8 +804,10 @@ impl StorageBackend for SqliteStorage {
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![id_str])
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        drop(stmt);
 
         // FTS5 synced via trigger (memories_fts_ad)
+        Self::scrub_after_delete(&conn);
         self.cache_evict(&id);
         Ok(())
     }
@@ -1646,6 +1688,9 @@ impl StorageBackend for SqliteStorage {
 
         conn.execute_batch("COMMIT;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        if count > 0 {
+            Self::scrub_after_delete(&conn);
+        }
         // Evict deleted entries from cache
         {
             let mut cache = self.mem_cache.lock();
@@ -1751,6 +1796,7 @@ impl SqliteStorage {
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         // FTS5 synced via trigger (memories_fts_ad)
         if deleted > 0 {
+            Self::scrub_after_delete(&conn);
             self.cache_evict(&id);
         }
         Ok(deleted > 0)
