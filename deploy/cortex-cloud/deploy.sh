@@ -36,6 +36,7 @@ docker build -q -f src-tree/deploy/cortex-cloud/Dockerfile -t "cortex-cloud:$sha
 docker rm -f cortex-cloud >/dev/null 2>&1 || true
 docker run -d --name cortex-cloud --restart unless-stopped --network host -e RUST_LOG=cortex_cloud=info,cortex_mcp_server=info \
   -v "$HOME/cortex-cloud/data:/data" -v "$HOME/cortex-cloud/secrets:/secrets" \
+  --memory 2g --memory-swap 2g \
   "cortex-cloud:$sha" --base-url "$base" --listen "$listen" >/dev/null
 for i in $(seq 1 60); do
   curl -fsS "http://$listen/healthz" >/dev/null 2>&1 && break
