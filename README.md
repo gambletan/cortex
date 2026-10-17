@@ -634,11 +634,12 @@ git clone https://github.com/gambletan/cortex && cortex/scripts/setup-device-syn
 # → full restore on join, passphrase saved to that device's login Keychain
 ```
 
-Or conversationally:
+Or conversationally — set `CORTEX_SYNC_PASSPHRASE` in the MCP server's environment first
+(the passphrase never passes through the assistant):
 ```
-You: "Enable sync with passphrase a1b2c3..."
+You: "Enable sync"
 
-Claude calls sync_enable(passphrase: "a1b2c3...") →
+Claude calls sync_enable() →
   connects to the same iCloud sync folder → pulls all memories.
 
 Now both devices share the same memory — and keep sharing it
@@ -658,8 +659,9 @@ automatically (background sync: 30s poll + filesystem watcher).
 cortex-mcp-server sync enable
 # Save the passphrase from the output
 
-# Device B
-cortex-mcp-server sync enable --passphrase "your-passphrase-from-device-A"
+# Device B — pass the passphrase via the environment, not argv (argv is visible via `ps`)
+read -rs CORTEX_SYNC_PASSPHRASE && export CORTEX_SYNC_PASSPHRASE
+cortex-mcp-server sync enable
 
 # Manual pull (background sync also pulls automatically)
 cortex-mcp-server sync pull
@@ -886,13 +888,14 @@ curl -X POST http://localhost:3315/v1/memories/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "preferences", "limit": 5}'
 
-# Export all data (backup to iCloud, NAS, etc.)
-curl http://localhost:3315/v1/export > ~/iCloud/cortex-backup.json
+# Export all data — PLAINTEXT, includes Private memories. Keep it local and owner-only;
+# for cross-device backup use encrypted sync instead of copying this into a cloud folder.
+(umask 077; curl http://localhost:3315/v1/export > ~/cortex-backup.json)
 
 # Import from backup
 curl -X POST http://localhost:3315/v1/import \
   -H 'Content-Type: application/json' \
-  -d @~/iCloud/cortex-backup.json
+  -d @~/cortex-backup.json
 ```
 
 ## Roadmap

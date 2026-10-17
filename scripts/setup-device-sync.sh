@@ -74,7 +74,8 @@ fi
 [ -n "$PASS" ] || die "empty passphrase"
 
 mkdir -p "$(dirname "$DB_PATH")"
-"$BIN" "$DB_PATH" sync enable --provider icloud --passphrase "$PASS"
+# Via the environment, never argv: argv is visible to every local user through `ps`.
+CORTEX_SYNC_PASSPHRASE="$PASS" "$BIN" "$DB_PATH" sync enable --provider icloud
 
 # Deny-by-default capability policy (read+write+sync) if none exists yet
 CAPS="$(dirname "$DB_PATH")/capabilities.json"

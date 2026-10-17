@@ -107,7 +107,8 @@ enum SyncAction {
         /// Cloud provider: icloud, gdrive, onedrive, dropbox (auto-detect if omitted)
         #[arg(short, long)]
         provider: Option<String>,
-        /// Encryption passphrase (generated if omitted)
+        /// Encryption passphrase. Prefer the CORTEX_SYNC_PASSPHRASE env var: a flag value
+        /// is visible to every local user via `ps`. Generated if neither is set.
         #[arg(long)]
         passphrase: Option<String>,
         /// Device name (defaults to hostname)
@@ -421,15 +422,13 @@ fn main() {
                     });
                     let device_id = uuid::Uuid::new_v4().to_string();
 
-                    let pass = passphrase.unwrap_or_else(|| {
-                        use std::fmt::Write;
-                        let bytes: [u8; 24] = std::array::from_fn(|_| rand::random());
-                        let mut s = String::with_capacity(48);
-                        for b in &bytes {
-                            let _ = write!(s, "{:02x}", b);
-                        }
-                        s
-                    });
+                    if passphrase.is_some() {
+                        eprintln!("warning: --passphrase is visible to other local users via `ps`; set CORTEX_SYNC_PASSPHRASE instead");
+                    }
+                    let (pass, generated) = resolve_sync_passphrase(
+                        passphrase,
+                        std::env::var("CORTEX_SYNC_PASSPHRASE").ok(),
+                    );
 
                     let config = SyncConfig::new(detected.sync_dir.clone(), device_id.clone(), device_name.clone())
                         .with_encryption(&pass);
@@ -446,11 +445,13 @@ fn main() {
                     println!("  Sync dir:   {}", detected.sync_dir.display());
                     println!("  Device:     {} ({})", device_name, device_id);
                     println!("  Encryption: AES-256-GCM");
-                    println!("  Passphrase: {}", pass);
                     println!("  Pulled:     {} remote changes", pulled);
-                    println!();
-                    println!("IMPORTANT: Save the passphrase above!");
-                    println!("You'll need it when setting up sync on another device.");
+                    if generated {
+                        println!("  Passphrase: {}", pass);
+                        println!();
+                        println!("IMPORTANT: Save the passphrase above!");
+                        println!("You'll need it when setting up sync on another device.");
+                    }
                 }
                 Some(SyncAction::Pull) => {
                     let applied = cortex.sync_pull().unwrap_or_else(|e| {
@@ -636,11 +637,11 @@ fn main() {
             let json = serde_json::to_string_pretty(&data).unwrap();
             match output {
                 Some(path) => {
-                    std::fs::write(&path, &json).unwrap_or_else(|e| {
+                    write_owner_only(std::path::Path::new(&path), json.as_bytes()).unwrap_or_else(|e| {
                         eprintln!("Error writing to {path}: {e}");
                         std::process::exit(1);
                     });
-                    eprintln!("Exported to {path}");
+                    eprintln!("Exported to {path} (plaintext, includes Private memories; owner-only)");
                 }
                 None => println!("{json}"),
             }
@@ -772,5 +773,95 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Write `bytes` to `path` readable by the owner only. An export is plaintext and holds
+/// every memory, Private included; it must not inherit a 022 umask (or a pre-existing
+/// file's looser mode).
+fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        let file = opts.open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        (&file).write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    opts.open(path)?.write_all(bytes)
+}
+
+/// Pick the sync passphrase: the (deprecated) flag, else a non-empty
+/// `CORTEX_SYNC_PASSPHRASE`, else a fresh random one. Returns whether it was generated.
+fn resolve_sync_passphrase(flag: Option<String>, env: Option<String>) -> (String, bool) {
+    if let Some(p) = flag.or(env).filter(|p| !p.is_empty()) {
+        return (p, false);
+    }
+    use std::fmt::Write;
+    let bytes: [u8; 24] = std::array::from_fn(|_| rand::random());
+    let mut s = String::with_capacity(48);
+    for b in &bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    (s, true)
+}
+
+#[cfg(test)]
+mod sync_passphrase_tests {
+    use super::resolve_sync_passphrase;
+
+    #[test]
+    fn env_passphrase_is_used_so_it_never_has_to_go_on_argv() {
+        let (pass, generated) = resolve_sync_passphrase(None, Some("from-env".into()));
+        assert_eq!(pass, "from-env");
+        assert!(!generated);
+    }
+
+    #[test]
+    fn flag_still_wins_for_compatibility() {
+        let (pass, generated) = resolve_sync_passphrase(Some("flag".into()), Some("env".into()));
+        assert_eq!(pass, "flag");
+        assert!(!generated);
+    }
+
+    #[test]
+    fn empty_env_falls_back_to_a_generated_passphrase() {
+        let (pass, generated) = resolve_sync_passphrase(None, Some(String::new()));
+        assert!(generated);
+        assert_eq!(pass.len(), 48);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod export_file_tests {
+    use super::write_owner_only;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn new_export_file_is_owner_only() {
+        let p = std::env::temp_dir().join(format!("cortex-export-{}.json", uuid::Uuid::new_v4()));
+        write_owner_only(&p, b"{\"private\":true}").unwrap();
+        assert_eq!(mode(&p) & 0o077, 0, "export is {:o}", mode(&p));
+        assert_eq!(std::fs::read(&p).unwrap(), b"{\"private\":true}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn existing_world_readable_export_is_tightened() {
+        let p = std::env::temp_dir().join(format!("cortex-export-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&p, b"old old old old").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_owner_only(&p, b"new").unwrap();
+        assert_eq!(mode(&p) & 0o077, 0, "export is {:o}", mode(&p));
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        let _ = std::fs::remove_file(&p);
     }
 }
